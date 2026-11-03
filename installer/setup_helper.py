@@ -216,7 +216,7 @@ def stub_build(argv, cancel_file=None):
              ("warmup", 99, "graphics ready: 0 shaders prepared in 0 s (stub)")]
     for step, pct, msg in steps:
         if fail and step == "fingerprint":
-            extra = {"reason": reason} if reason else {}
+            extra = {"reason": reason, "detail": "1 of its files differs (stub.txt)"} if reason else {}
             say("fingerprint", 0, "This isn't an unmodified retail copy of Blood Wake (stub failure): 1 file "
                 "differs from the retail disc (stub.txt).", error=True, exit=int(fail), **extra)
             return int(fail)

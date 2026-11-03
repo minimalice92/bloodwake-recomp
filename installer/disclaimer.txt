@@ -8,7 +8,7 @@ It is not affiliated with, endorsed by, sponsored by or connected to Microsoft C
 WHAT THIS SETUP CONTAINS, AND WHAT IT DOESN'T
 - It contains only this project's own work: source code, build scripts, the launcher and documentation, plus third-party open-source parts under their own licences.
 - It contains nothing from Blood Wake: no game code, no code generated from it, no executables built from it, no art, sound, music, video, text, saves or extracted files.
-- The game is built on this PC from your own copy. Setup checks your copy against published fingerprints (SHA-256 hashes, which reveal nothing about a file's contents) and refuses anything that isn't an unmodified retail copy.
+- The game is built on this PC from your own copy. Setup checks it against published fingerprints (SHA-256 hashes, which reveal nothing about a file's contents), and warns you before building any copy it doesn't recognise.
 
 YOUR RESPONSIBILITIES
 - You must own a legitimate retail copy of Blood Wake, and make the copy you build from yourself, from your own disc.
@@ -22,7 +22,7 @@ WHAT THIS PROJECT WILL NEVER DO
 - It is free: no sales, donations, ads or paid features.
 
 WHAT SETUP DOWNLOADS
-Only these, from their official sources, each checked against a pinned SHA-256 hash: Python (python.org), the Python packages capstone and pefile, and CMake if needed (pypi.org), the xboxrecomp toolkit (its GitHub archive), and, only if this PC doesn't have them, Microsoft's Build Tools for Visual Studio 2022 (microsoft.com). Nothing from the game is downloaded or sent anywhere.
+Only these, from their official sources, each checked against a pinned SHA-256 hash: Python (python.org), its packages capstone and pefile, and CMake if needed (pypi.org), the xboxrecomp toolkit (GitHub), and, if this PC has no Visual Studio 2022, Microsoft's Build Tools (microsoft.com). Nothing from the game is downloaded or sent anywhere.
 
 TAKEDOWN
 If Microsoft or the rights holders ask, the project will be taken down at once. If Blood Wake is ever re-released by Microsoft, the project will point to the official release first.

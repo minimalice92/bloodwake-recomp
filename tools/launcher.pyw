@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -66,11 +67,10 @@ except (ImportError, OSError):          # (without it, Automatic HDR never switc
     bw_hdr = None
 
 EDITION_TEXT = {
-    "original": "The game exactly as it shipped in 2001: the console's look, 30 frames a second, "
-                "4:3, and its quirks and bugs too.",
-    "remastered": "The same game, made for a modern PC: bugs fixed, widescreen, sharper picture, "
-                  "smoother frame rate and cleaner sound, with the original art. The Display, "
-                  "Graphics, Audio and Fixes tabs tune it.",
+    "original": "Exactly as it shipped in 2001: the console's look, 4:3 at 30 frames a second, "
+                "quirks and bugs included.",
+    "remastered": "The same game on a modern PC: bugs fixed, widescreen, a sharper picture, a "
+                  "smoother frame rate and cleaner sound, with the original art.",
 }
 APPLIES = {"all": "every edition", "remastered": "Remastered"}
 LATER = "Remastered"            # the editions that start from a copy of Original's saves
@@ -452,13 +452,11 @@ OLD_DEFAULTS = {("display", "mode"): ("window", "fullscreen"),
 
 # ── Smart App Control (item 4, the launcher's half) ───────────────────────
 # Setup's own help text (A1, item 4), word for word, so the two match.
-SAC_TEXT = ("Smart App Control is blocking the game. Blood Wake is built on this PC, so it "
-            "isn't code-signed, and Smart App Control, a Windows security feature that's on "
-            "here, blocks programs that aren't signed or known to Microsoft. To play, turn it "
-            "off: open Windows Security, then App & browser control > Smart App Control "
-            "settings, and choose Off. It's a setting for the whole PC, and on some versions of "
-            "Windows it can't be turned back on without reinstalling Windows, so it's your "
-            "decision.")
+SAC_TEXT = ("Smart App Control is blocking the game. The game is built on this PC, so it "
+            "isn't code-signed, and Smart App Control blocks programs that aren't. To play, "
+            "turn it off: Windows Security > App & browser control > Smart App Control "
+            "settings > Off. It's a setting for the whole PC (on some versions of Windows it "
+            "can't be turned back on without reinstalling), so it's your choice.")
 SAC_QUICK = 10          # seconds: a game that ends this soon after Play didn't really start
 
 
@@ -540,15 +538,12 @@ def screen_line(info):
     if not info:
         return None
     if info.get("source") == "none":
-        return ("This screen doesn't report HDR data (no EDID data and no calibration profile), "
-                "so Automatic HDR would play in SDR, mapped by the standard.")
+        return "This screen doesn't report its HDR range, so Automatic HDR would play in SDR."
     if not info.get("hdr_capable"):
-        return "This screen doesn't do HDR, so Automatic HDR would play in SDR."
-    where = {"edid": "from its EDID", "profile": "from its calibration profile"}.get(
-        info.get("source"), "")
+        return "This screen doesn't support HDR, so Automatic HDR would play in SDR."
     peak = _nits(info.get("peak"))
-    facts = " ".join(x for x in ("peak {:,} nits".format(int(round(peak))) if peak else "", where) if x)
-    return "Automatic HDR would play in HDR here" + (": " + facts if facts else "") + "."
+    return "Automatic HDR would play in HDR here" + (
+        " (peak {:,} nits)".format(int(round(peak))) if peak else "") + "."
 
 
 def profile_warning(info):
@@ -913,13 +908,13 @@ def install_record():
 # verified copy or none.
 COPY_TEXT = {
     "unverified": ("Unverified copy",
-                   "Setup couldn't confirm this copy is the retail disc it knows, and you chose "
-                   "to build it anyway%s. Any fix whose code differs on this copy is switched "
-                   "off; the Fixes tab says which."),
+                   "Setup didn't recognise this copy as the retail disc, and you chose to "
+                   "install it anyway%s. Fixes that don't fit this copy are off and marked on "
+                   "the Fixes tab."),
     "files differ": ("Copy's files differ",
-                     "Some of this copy's files aren't the ones the retail disc has, and you "
-                     "chose to build it anyway%s. Any fix whose code differs on this copy is "
-                     "switched off; the Fixes tab says which."),
+                     "Some of this copy's files differ from the retail disc's, and you chose "
+                     "to install it anyway%s. Fixes that don't fit this copy are off and marked "
+                     "on the Fixes tab."),
 }
 
 
@@ -1239,7 +1234,7 @@ class Progress:
 
     def __init__(self, root, title, cmd, button, done):
         self.root, self.done, self.lines, self.stopped = root, done, queue.Queue(), False
-        self.msg = ""
+        self.msg, self.title = "", title
         self.top = top = tk.Toplevel(root, background=C["panel"])
         top.title(title)
         top.transient(root)
@@ -1287,7 +1282,10 @@ class Progress:
             except ValueError:
                 continue
             self.msg = d.get("msg") or self.msg
-            self.label.configure(text=self.msg[:1].upper() + self.msg[1:])
+            shown = self.msg
+            if shown.lower().startswith(self.title.lower() + ": "):
+                shown = shown[len(self.title) + 2:]          # "3 of 6 scenes", under the title
+            self.label.configure(text=shown[:1].upper() + shown[1:])
             self.bar.configure(value=max(0, min(100, int(d.get("pct", 0)))))
         if ended:
             self.finish(self.proc.wait())
@@ -1333,9 +1331,8 @@ class KeysPanel:
         box.columnconfigure(4, weight=1)          # spare room goes past the marks
         ttk.Label(box, text="Keyboard keys", style="Head.TLabel").grid(row=0, column=0, columnspan=4,
                                                                        sticky="w")
-        note = ("Used when Keyboard as a controller is On. Click a control's keys, then press "
-                "the new key, or click the box again with a mouse button; Esc cancels. + adds "
-                "another key, and right-clicking a control's keys clears them.")
+        note = ("Click a control's keys, then press a new key or click the box with a mouse "
+                "button; Esc cancels. + adds another key, and a right click clears them.")
         if table.get("temporary"):
             note += " (This build lists the toolkit's standard keys.)"
         ttk.Label(box, text=note, style="Quiet.TLabel", wraplength=px(560)).grid(
@@ -1365,14 +1362,13 @@ class KeysPanel:
         self.sens = {}
         labels = {
             "ramp_ms": ("Steering ramp", "ms", 50,
-                        "How long a held steering key takes to reach a full turn. 0 is at once "
-                        "(as before). Keyboard only."),
+                        "How long a held steering key takes to reach a full turn; 0 is "
+                        "instant."),
             "strength_pct": ("Key strength", "%", 5,
-                             "How far a key moves the stick: 100% is all the way (as before). "
-                             "Keyboard only."),
+                             "How far a key moves the stick; 100% is all the way."),
             "deadzone_left": ("Left stick deadzone", "%", 1,
-                              "How far a controller's left stick can move before the game sees it. "
-                              "0% leaves it to the game, as before."),
+                              "How far a controller's left stick can move before the game "
+                              "notices; 0% leaves it to the game."),
             "deadzone_right": ("Right stick deadzone", "%", 1,
                                "The same for the right stick."),
         }
@@ -1410,7 +1406,7 @@ class KeysPanel:
     def slide(self, k, v, step, var, lab, unit):
         v = int(round(float(v) / step) * step)
         var.set(v)
-        extra = " (as before)" if v == self.table[k]["default"] else ""
+        extra = " (default)" if v == self.table[k]["default"] else ""
         lab.configure(text="%d %s%s" % (v, unit, extra))
 
     # ---- the key list ---------------------------------------------------------------
@@ -1419,7 +1415,8 @@ class KeysPanel:
         keys = self.keys[n]
         btn.configure(text=", ".join(key_label(k) for k in keys) if keys else "(none)")
         add.configure(state="normal" if len(keys) < KEYS_MAX else "disabled")
-        mark.configure(text="default" if same_keys(keys, self.defaults[n]) else "changed")
+        # Item 106: only a changed control is marked (20 rows of "default" were noise).
+        mark.configure(text="" if same_keys(keys, self.defaults[n]) else "changed")
 
     def set_keys(self, n, keys):
         self.keys[n] = keys[:KEYS_MAX]
@@ -1552,8 +1549,7 @@ class CheatsPanel:
         self.on = tk.BooleanVar(value=on)
         ttk.Label(frame, text="Cheats", style="Head.TLabel").pack(anchor="w")
         ttk.Label(frame, text="The game's own cheat codes, without typing them at the title "
-                              "screen. Off keeps your ticks, so a set of cheats survives being "
-                              "switched off and on again. Off when you first play.",
+                              "screen. Switching cheats off keeps your ticks for next time.",
                   style="Quiet.TLabel", wraplength=px(560)).pack(anchor="w", pady=(0, px(8)))
         sw = ttk.Checkbutton(frame, text="Cheats on", variable=self.on, command=self.refresh)
         sw.pack(anchor="w", pady=(0, px(6)))
@@ -1636,8 +1632,8 @@ class Launcher:
         Banner(root, px(84)).pack(side="top", fill="x")
         head = ttk.Frame(root, padding=(px(16), px(8), px(16), 0), style="Bg.TFrame")
         head.pack(side="top", fill="x")
-        sub = ttk.Label(head, text="Choose how to play, then press Play. Your choices are "
-                                   "remembered. Hover over anything for an explanation.",
+        sub = ttk.Label(head, text="Choose your settings and press Play. Hover over a setting "
+                                   "for details.",
                         style="Status.TLabel", wraplength=px(740))
         sub.pack(anchor="w", fill="x")
         head.bind("<Configure>", lambda e: sub.configure(wraplength=max(px(200), e.width - px(32))))
@@ -1717,7 +1713,9 @@ class Launcher:
         # (the Controls tab's key list) scrolls rather than stretching the
         # window for every tab.
         want_h = min(self.root.winfo_reqheight(), px(MAX_OPEN_H))
-        min_w, min_h = px(560), px(400)
+        # Item 106: never narrower than the tab row (at 560 pixels the tab
+        # names were cut short, at every display scaling).
+        min_w, min_h = max(px(560), self.tabs_width()), px(400)
         area = work_area()
         if area:
             x0, y0, aw, ah = area
@@ -1738,6 +1736,18 @@ class Launcher:
         else:
             self.root.geometry("%dx%d" % (want_w, min(want_h, px(680))))
         self.root.minsize(min_w, min_h)
+
+    def tabs_width(self):
+        """The tab row's natural width with the notebook's side margins: each
+        name in the tab font, plus the tab's padding (TNotebook.Tab, 10 a side)
+        and border, plus slack for the selected tab, which clam draws wider."""
+        try:
+            font = tkfont.nametofont("TkDefaultFont")
+            n = self.nb.index("end")
+            row = sum(font.measure(self.nb.tab(i, "text")) + px(20) + 2 for i in range(n))
+        except tk.TclError:
+            return 0
+        return row + 2 * px(12) + px(8)
 
     def refit(self, area):
         x0, y0, aw, ah = area
@@ -1844,7 +1854,7 @@ class Launcher:
             self.vars["edition.preset"] = (st, var)
             self.widgets["edition.preset"] = (lab, box, note)
         ttk.Label(frame, text="\nEach edition keeps its own saved games. The first time you play "
-                             "%s, it starts with a copy of your Original saves." % LATER,
+                             "%s, it starts with a copy of your Original saved games." % LATER,
                   wraplength=px(540), style="Quiet.TLabel").pack(anchor="w")
 
     def build_tab(self, frame, tab):
@@ -1887,8 +1897,8 @@ class Launcher:
         self.nb.add(page, text="Advanced")
         self.pages.append(page)
         frame = page.body
-        ttk.Label(frame, text="Extra switches, one per line as NAME=value (for testing; the "
-                             "usual choices are on the other tabs). Leave empty if unsure.",
+        ttk.Label(frame, text="Extra switches for testing, one NAME=value per line. Leave this "
+                             "empty if unsure.",
                   wraplength=px(560)).pack(anchor="w")
         self.adv = tk.Text(frame, height=10, width=70, font=("Consolas", 9), background=C["input"],
                            foreground=C["text"], insertbackground=C["text"], relief="flat",
@@ -1903,23 +1913,21 @@ class Launcher:
         self.warm_btn = ttk.Button(acts, text="Prepare graphics (about 2 minutes)",
                                    command=self.prepare_graphics)
         self.warm_btn.pack(side="left")
-        Tip(self.warm_btn, "Plays a few short scenes of the game, hidden and silent, so every "
-                           "shader your settings need is ready before you play (the same step "
-                           "Setup ends with). Worth doing after changing anti-aliasing, sharp "
-                           "text, smooth HUD edges or texture restoration: otherwise the new "
-                           "shaders are made during play, once each, as small hitches.")
+        Tip(self.warm_btn, "Plays a few short scenes, hidden and silent, so the game doesn't "
+                           "stutter the first time it draws something new. Worth doing after "
+                           "changing anti-aliasing, sharp text, smooth HUD edges or texture "
+                           "restoration.")
         if bw_warmup is None or not os.path.isfile(WARMUP):
             self.warm_btn.configure(state="disabled")
         safe = ttk.Button(acts, text="Start in safe mode", command=self.start_safe)
         safe.pack(side="left", padx=(px(8), 0))
-        Tip(safe, "Starts the Original edition in a window with nothing extra: no visual "
-                  "upgrades, HDR or frame-rate change, no keyboard controls and none of the "
-                  "switches above. For when the game won't start; your settings are kept.")
+        Tip(safe, "For when the game won't start: plays Original in a window with nothing "
+                  "extra, not even the switches above. Your settings are kept.")
         report = ttk.Button(acts, text="Make a bug report", command=self.bug_report)
         report.pack(side="left", padx=(px(8), 0))
-        Tip(report, "Puts one zip on your desktop with the game's log, your settings and a "
-                    "short summary of this PC, to send to whoever is helping you if you want "
-                    "to. Nothing from the game's disc goes in it.")
+        Tip(report, "Saves a zip to your desktop with the game's log, your settings and a "
+                    "summary of this PC, for whoever is helping you. Nothing from the game "
+                    "goes in it.")
         btns = ttk.Frame(frame)
         btns.pack(fill="x")
         ttk.Button(btns, text="Open the settings folder",
@@ -1948,6 +1956,7 @@ class Launcher:
             note.configure(text=un if un else "" if ok else "(%s only)" % APPLIES[st["editions"]])
         if self.cheats_panel:
             self.cheats_panel.refresh()             # the not-in-Original cheat
+        self.update_screen_line()                   # item 106: none in Original
 
     def defaults(self):
         for key, (st, var) in self.vars.items():
@@ -1991,6 +2000,9 @@ class Launcher:
             return
         line = screen_line(getattr(self, "screen", None))
         cap = profile_warning(getattr(self, "screen", None))
+        if "edition" in self.vars and self.edition() == "original":
+            line = cap = None           # item 106: Automatic HDR is greyed in Original
+
         lab.configure(text=line or "")
         warn.configure(text=("! " + cap) if cap else "")
         for w, text in ((lab, line), (warn, cap)):
@@ -2114,13 +2126,13 @@ class Launcher:
         def done(code, msg, stopped):
             self.busy = False
             if stopped:
-                self.status.configure(text="Preparing graphics was stopped; the game makes the "
-                                           "rest as it needs them.")
+                self.status.configure(text="Preparing graphics stopped; the game prepares the "
+                                           "rest as it plays.")
             elif code == 0 and msg.startswith("graphics ready"):
                 self.status.configure(text=msg[:1].upper() + msg[1:].split(" (")[0] + ".")
             else:
-                self.status.configure(text="Preparing graphics didn't finish; the game makes the "
-                                           "shaders as it needs them.")
+                self.status.configure(text="Preparing graphics didn't finish; the game prepares "
+                                           "the rest as it plays.")
             if then:
                 then()
 
@@ -2164,24 +2176,20 @@ class Launcher:
             return
         if self.safe_offer():
             if self.ask("Start in safe mode?",
-                        "The last two times, Blood Wake didn't reach its title screen. Safe mode "
-                        "starts the Original edition in a window, with nothing extra: no visual "
-                        "upgrades, HDR or frame-rate change, no keyboard controls and none of the "
-                        "Advanced tab's switches. Your own settings stay as they are for next "
-                        "time.\n\nIf it still won't start, Make a bug report on the Advanced tab "
-                        "gathers what's needed to find out why.",
+                        "Blood Wake didn't reach its title screen the last two times. Safe mode "
+                        "plays Original in a window with nothing extra; your settings are kept "
+                        "for next time.\n\nIf it still won't start, use Make a bug report on the "
+                        "Advanced tab.",
                         "Start in safe mode", "Start normally"):
                 self.start_game(safe=True)
                 return
         sig = self.warmup_offer()
         if sig:
             if self.ask("Prepare graphics first?",
-                        "You changed a setting that changes how the game draws (anti-aliasing, "
-                        "sharp text, smooth HUD edges or texture restoration). Preparing graphics "
-                        "now plays a few short scenes, hidden and silent, so the game doesn't "
-                        "stutter the first time it needs the new shaders. It takes about 2 "
-                        "minutes, then the game starts.\n\nNot now starts the game straight away "
-                        "and doesn't ask again for these settings.",
+                        "Your new graphics settings change how the game draws. Preparing "
+                        "graphics now takes about 2 minutes and saves small stutters in play; "
+                        "then the game starts.\n\nNot now plays straight away and won't ask "
+                        "again for these settings.",
                         "Prepare graphics", "Not now"):
                 self.run_warmup(then=self.start_game)
                 return
@@ -2208,7 +2216,7 @@ class Launcher:
                 if path:
                     cmd += ["--settings", path]
             if scr and not self.winhdr_on(scr):
-                note = "Couldn't switch Windows HDR on: playing as Windows is set."
+                note = "Couldn't switch Windows HDR on; playing with Windows' own setting."
         self.status.configure(text="Starting in safe mode..." if safe else note or "Starting...")
         self.started = time.time()
         try:

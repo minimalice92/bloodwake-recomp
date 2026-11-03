@@ -642,20 +642,21 @@ def check_disc(a, kind, src, tk, game_dir, retail, prog):
     xgot = next((v for r, v in got.items() if r.lower() == "default.xbe"), None)
     xbe_ok = bool(xref and xgot and xgot == (xref["size"], xref["sha256"]))
     verdict = VERIFIED if ok else (FILES_DIFFER if xbe_ok else UNVERIFIED)
+    parts = []                              # which files differ, in a few words (Setup's question shows it)
+    if details["differ"]:
+        n = len(details["differ"])
+        parts.append("%d of its files differ%s (%s%s)" % (n, "s" if n == 1 else "", ", ".join(details["differ"][:3]),
+                                                           ", ..." if n > 3 else ""))
+    if details["missing"]:
+        parts.append("%d file%s missing" % (details["missing"], " is" if details["missing"] == 1 else "s are"))
     if not ok and not a.allow_unverified:
         # Only a copy whose program matches gets here (an image stops at the XBE, above).
         raise Fail(EXIT_DISC, "fingerprint", msg + " Setup can build it anyway once you've accepted "
-                   "its warning (--allow-unverified).", reason=FILES_DIFFER if xbe_ok else "program differs")
+                   "its warning (--allow-unverified).", reason=FILES_DIFFER if xbe_ok else "program differs",
+                   detail=" and ".join(parts))
     if ok:
         prog("fingerprint", 1, msg, verdict=verdict)
     elif verdict == FILES_DIFFER:
-        parts = []
-        if details["differ"]:
-            n = len(details["differ"])
-            parts.append("%d of its files differ%s (%s%s)" % (n, "s" if n == 1 else "", ", ".join(details["differ"][:3]),
-                                                               ", ..." if n > 3 else ""))
-        if details["missing"]:
-            parts.append("%d file%s missing" % (details["missing"], " is" if details["missing"] == 1 else "s are"))
         prog("fingerprint", 1, "its main program is the retail one, but %s: building it as accepted, "
              "marked \"files differ\"" % " and ".join(parts), verdict=verdict)
     else:
@@ -739,14 +740,15 @@ def run_pipeline(repo, tk, xbe, gen, work, prog):
         m = re.match(r"^\[(\w+)\] (\S.*)$", line.strip())
         if m and m.group(1) in order and m.group(1) != state["step"]:
             state["step"], state["t0"] = m.group(1), time.time()
-            prog("pipeline", frac(), "translating the game's code: %s" % state["step"])
+            prog("pipeline", frac(), "translating the game's code: part %d of %d" % (
+                order.index(state["step"]) + 1, len(order)))
 
     def tick():
-        prog("pipeline", frac(), "translating the game's code: %s (%d s)" % (
-            state["step"], time.time() - state["t0"]))
+        prog("pipeline", frac(), "translating the game's code: part %d of %d (%d s)" % (
+            order.index(state["step"]) + 1, len(order), time.time() - state["t0"]))
 
     env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONDONTWRITEBYTECODE="1")
-    prog("pipeline", 0, "translating the game's code (about 10 minutes)")
+    prog("pipeline", 0, "translating the game's code (5 to 10 minutes)")
     t0 = time.time()
     rc = run_logged(cmd, log, cwd=repo, env=env, on_line=on_line, tick=tick)
     if rc != 0 or not glob.glob(os.path.join(gen, "*.c")):
@@ -844,7 +846,7 @@ def plan_build(bdir, want):
         with open(os.path.join(bdir, BUILD_SOURCE), encoding="utf-8") as f:
             old = json.load(f)
     except (OSError, ValueError):
-        return True, "no record of what the last build was made from"
+        return True, "the last build here was another version, or didn't finish"
     if old.get("digest") != want["digest"]:
         return True, "the source changed since the last build"
     return False, "the same source as the last build"
@@ -891,9 +893,9 @@ def build(repo, tk, gen, work, cmake, jobs, prog, tools=None):
     cmd = [cmake, "--build", bdir, "--config", "Release", "--parallel", str(jobs)]
     if clean:
         cmd.append("--clean-first")
-        prog("build", 0, "%s, so everything is compiled again" % why)
+        prog("build", 0, "compiling everything again (%s)" % why)
     else:
-        prog("build", 0, "compiling (%s)" % why)
+        prog("build", 0, "compiling" if why == "a new build folder" else "compiling what changed (%s)" % why)
     if run_logged(cmd, logb, cwd=repo, on_line=on_line, tick=tick) != 0:
         raise Fail(EXIT_BUILD, "build", "The build failed. Log: %s\n%s" % (logb, tail(logb, 20)))
     exe = os.path.join(bdir, "Release", "bloodwake.exe")

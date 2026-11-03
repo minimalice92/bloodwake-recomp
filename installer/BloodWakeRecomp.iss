@@ -163,14 +163,33 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
 WelcomeLabel1=Welcome to Blood Wake Recomp
-WelcomeLabel2=This sets up Blood Wake Recomp, an unofficial fan port that runs Blood Wake (Xbox, 2001) natively on Windows.%n%nThe game is built on this PC from your own copy, so you need:%n%n-  the files from your own Blood Wake disc: a folder of them, an XISO or a full disc image%n-  about 3 GB of free space (more if Setup has to add Microsoft's C++ build tools)%n-  an internet connection, for Python, the toolkit and the build tools%n-  about 15 to 30 minutes: Setup translates the game's code and compiles it.%n%nNothing from the game is downloaded or sent anywhere.
-ConfirmUninstall=Remove %1 now, with the choices you made?
+WelcomeLabel2=Blood Wake Recomp is an unofficial fan port that runs Blood Wake (Xbox, 2001) natively on Windows. Setup builds the game on this PC from your own copy.%n%nYou need:%n%n-  your copy of Blood Wake: a disc image or a folder of the disc's files%n-  about 3 GB of free space%n-  an internet connection%n-  about 15 minutes (longer on an older PC)%n%nNothing from the game is downloaded or sent anywhere.
+ConfirmUninstall=Remove %1 now?
+ClickNext=
+; Inno's stock pages on the common path, without the title, subtitle and body repeating each other (item 106)
+WizardSelectDir=Install folder
+SelectDirDesc=Where should [name] go?
+SelectDirLabel3=Setup installs [name] in this folder, for your Windows user only.
+SelectDirBrowseLabel=Press Next, or Browse to choose another folder.
+WizardSelectTasks=Shortcuts
+SelectTasksDesc=Where do you want to start Blood Wake from?
+SelectTasksLabel2=
+WizardReady=Ready to install
+ReadyLabel1=Setup is ready to install [name] and build the game.
+ReadyLabel2a=Press Install to start, or Back to change something.
+ReadyLabel2b=Press Install to start.
+InstallingLabel=Setup is installing [name] and building the game on this PC.
+ReadyMemoDir=Install folder:
+ReadyMemoTasks=Shortcuts:
+; one message for Setup already open and for Blood Wake running (Inno fills in %1)
+SetupAppRunningError=%1 is already running.%n%nClose it, then press OK, or press Cancel to stop.
+UninstallAppRunningError=%1 is already running.%n%nClose it, then press OK, or press Cancel to stop.
 FinishedHeadingLabel=Blood Wake Recomp
 
 [Tasks]
 ; Both ticked by default; either can be unticked (item 13). Silent: /TASKS="startmenuicon,desktopicon".
-Name: "startmenuicon"; Description: "Create a &Start menu entry"; GroupDescription: "Shortcuts:"
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
+Name: "startmenuicon"; Description: "Create a &Start menu entry"
+Name: "desktopicon"; Description: "Create a &desktop shortcut"
 
 [Files]
 Source: "disclaimer.txt"; Flags: dontcopy
@@ -233,7 +252,7 @@ var
   gDisc, gDiscChecked, gDiscVerdict, gDiscEvaluated: String;
   gBuildOK, gBuildRan: Boolean;
   gBuildExit: Integer;
-  gBuildMsg, gLastMsg, gFingerprint, gBuildReason, gCancelFile: String;
+  gBuildMsg, gLastMsg, gFingerprint, gBuildReason, gBuildDetail, gCancelFile: String;
   gInBuild, gBuildCancelled: Boolean;
   gBase, gSpan: Integer;
   gVSInstalledNow: Boolean;
@@ -338,8 +357,8 @@ begin
       Result := False;
       exit;
     end;
-    if MsgBox('Close Blood Wake first: the launcher or the game is still running from ' + Dir + '.' + #13#10#13#10 + R + #13#10 +
-        'Close the game and the launcher, then press Try again. Cancel stops ' + What + '.', mbError, MB_RETRYCANCEL) <> IDRETRY then begin
+    if MsgBox('Close Blood Wake first: the launcher or the game is running from ' + Dir + '.' + #13#10#13#10 + R + #13#10 +
+        'Then press Try again.', mbError, MB_RETRYCANCEL) <> IDRETRY then begin
       Log('Stopped: Blood Wake was still running.');
       Result := False;
       exit;
@@ -484,7 +503,7 @@ begin
   if DirExists(Path) then begin
     X := AddBackslash(Path) + 'default.xbe';
     if not FileExists(X) then begin
-      Msg := 'This folder has no default.xbe. Choose the folder that holds your disc''s files: default.xbe sits at its top, next to the game''s folders.';
+      Msg := 'This folder has no default.xbe. Choose the folder that holds your disc''s files (default.xbe is at its top).';
       exit;
     end;
     Layout := 'a folder of the disc''s files';
@@ -499,7 +518,7 @@ begin
       Size := -1;
   end else if FileExists(Path) then begin
     if not ImageXbe(Path, Sha, Layout, Magic, Size) then begin
-      Msg := 'This file isn''t an Xbox disc image Setup can read: it has no Xbox file system, or no default.xbe. Choose a full disc image or an XISO of your Blood Wake disc, or a folder of its files.';
+      Msg := 'This isn''t an Xbox disc image Setup can read. Choose a full disc image or an XISO of your Blood Wake disc, or a folder of its files.';
       exit;
     end;
   end else begin
@@ -507,14 +526,14 @@ begin
     exit;
   end;
   if Magic <> 'XBEH' then begin
-    Msg := 'This copy''s default.xbe isn''t an Xbox program, so there''s nothing to build. Choose your Blood Wake disc image or a folder of its files.';
+    Msg := 'This copy''s default.xbe isn''t an Xbox program. Choose your Blood Wake disc image or a folder of its files.';
     exit;
   end;
   if (Lowercase(Sha) = XBE_SHA256) and (Size = XBE_SIZE) then begin
-    Msg := 'Recognised: Blood Wake, ' + RETAIL_LABEL + '. It''s ' + Layout + ', and its main program matches the retail one; Setup checks every other file while it copies them.';
+    Msg := 'Recognised: Blood Wake, ' + RETAIL_LABEL + ', ' + Layout + '. Setup checks every file as it copies them.';
     Result := DISC_VERIFIED;
   end else begin
-    Msg := 'Setup doesn''t recognise this copy: it may be another region, a modified copy, or damaged. You can still go on: the next page explains what that means.';
+    Msg := 'Not recognised: this may be another region, a modified copy or a damaged one. You can still go on; the next page explains.';
     Result := DISC_UNVERIFIED;
   end;
 end;
@@ -653,7 +672,7 @@ begin
   if gDisc = '' then begin
     gDiscChecked := '';
     gDiscKind := DISC_UNUSABLE;
-    DiscStatus.Caption := 'Choose your copy of Blood Wake to go on: press Browse, or type or paste where it is.';
+    DiscStatus.Caption := 'Press Browse, or type or paste where your copy is.';
     ShowMark(DISC_UNUSABLE, False);
   end else begin
     if DirExists(gDisc) then
@@ -691,7 +710,7 @@ begin
     gDiscChecked := '';
     gDiscKind := DISC_UNUSABLE;
     ShowMark(DISC_UNUSABLE, False);
-    DiscStatus.Caption := 'Setup can''t find this yet. Type or paste the full path of your disc image or folder, or press Browse.';
+    DiscStatus.Caption := 'Setup can''t find this yet. Type the full path, or press Browse.';
     UpdateDiscNext();
     exit;
   end;
@@ -759,7 +778,7 @@ begin
 
   { The disclaimer }
   DisclaimerPage := CreateCustomPage(wpWelcome, 'Before you start',
-    'Please read this. Setup continues only if it applies to you.');
+    'Setup goes on once you confirm you own the game.');
   ExtractTemporaryFile('disclaimer.txt');
   LoadStringFromFile(ExpandConstant('{tmp}\disclaimer.txt'), Text);
   Memo := TNewMemo.Create(DisclaimerPage);
@@ -788,13 +807,13 @@ begin
 
   { The disc }
   DiscPage := CreateCustomPage(DisclaimerPage.ID, 'Choose your disc',
-    'Setup builds the game from your own copy of Blood Wake.');
+    'Setup builds the game from your own copy.');
   Intro := TNewStaticText.Create(DiscPage);
   Intro.Parent := DiscPage.Surface;
   Intro.Width := DiscPage.SurfaceWidth;
   Intro.WordWrap := True;
-  Intro.Caption := 'This is the step where you choose your copy of Blood Wake. Setup can''t go on without one.' + #13#10#13#10 +
-    'Choose a disc image you made from your own disc (a full disc image or an XISO), or a folder with the disc''s files. Setup only reads it: it copies the game''s files into the install folder.';
+  Intro.Caption := 'Choose the disc image you made from your Blood Wake disc (a full disc image or an XISO), or a folder of its files. ' +
+    'Setup only reads it.';
   Intro.AdjustHeight;
   ImageRadio := TNewRadioButton.Create(DiscPage);
   ImageRadio.Parent := DiscPage.Surface;
@@ -855,7 +874,7 @@ begin
   { The warning for a copy Setup doesn't recognise (item 2). Accept goes on,
     Decline stops Setup, Back picks another copy. }
   WarnPage := CreateCustomPage(DiscPage.ID, 'This copy isn''t recognised',
-    'Read this before you go on.');
+    'You can still build it. Read this first.');
   Memo := TNewMemo.Create(WarnPage);
   Memo.Parent := WarnPage.Surface;
   Memo.Left := 0;
@@ -866,22 +885,20 @@ begin
   Memo.ReadOnly := True;
   Memo.WordWrap := True;
   Memo.Text :=
-    'Setup doesn''t recognise your copy of Blood Wake: its main program isn''t the ' + RETAIL_LABEL + ' one Setup knows. ' +
-    'It may be another region, a modified copy, or damaged. You can still build it if all of this is fine with you.' + #13#10#13#10 +
+    'Its main program isn''t the ' + RETAIL_LABEL + ' one Setup knows: it may be another region, a modified copy or a damaged one.' + #13#10#13#10 +
     'Ownership' + #13#10 +
-    'You must own the game this copy came from. Blood Wake Recomp contains nothing from the game and doesn''t provide it.' + #13#10#13#10 +
+    'You must own the game this copy came from. Blood Wake Recomp contains nothing from the game.' + #13#10#13#10 +
     'Safety' + #13#10 +
-    'A copy from an unknown source can be tampered with. Setup turns the copy''s program into a program that runs on this PC, ' +
-    'so a tampered copy could act as malware. Use only a copy you made from your own disc.' + #13#10#13#10 +
+    'Setup turns the copy''s program into one that runs on this PC, so a tampered copy could act as malware. ' +
+    'Use only a copy you made from your own disc.' + #13#10#13#10 +
     'The game' + #13#10 +
-    'Other versions or modified copies may not build, may crash, or may behave differently. Remastered''s fixes switch themselves ' +
-    'off where the code differs. Saves may not carry over between versions, and bug reports from unverified copies get best-effort help.' + #13#10#13#10 +
-    'Accept builds this copy anyway; it''s recorded as an unverified copy. Decline stops Setup without installing anything. ' +
-    'Back lets you choose another copy.';
+    'Another version may not build, may crash or may behave differently. Remastered''s fixes turn off where its code differs. ' +
+    'Saved games may not carry over, and help with problems is limited.' + #13#10#13#10 +
+    'Accept builds it, marked as an unverified copy. Decline stops Setup. Back lets you choose another copy.';
 
   { What's needed }
   DepsPage := CreateCustomPage(wpSelectDir, 'What Blood Wake needs',
-    'Setup adds what''s missing. Everything comes from its official source and is checked against a pinned SHA-256 hash.');
+    'Setup adds what''s missing, each from its official source, hash-checked.');
   DepsText := TNewStaticText.Create(DepsPage);
   DepsText.Parent := DepsPage.Surface;
   DepsText.Width := DepsPage.SurfaceWidth;
@@ -910,18 +927,17 @@ begin
   gSacOn := SmartAppControlOn();
   Log(Format('Smart App Control on: %d', [Ord(gSacOn)]));
   SacPage := CreateCustomPage(DepsPage.ID, 'Smart App Control will block the game',
-    'It''s on on this PC. Read this before you go on.');
+    'It''s on on this PC.');
   Intro := TNewStaticText.Create(SacPage);
   Intro.Parent := SacPage.Surface;
   Intro.Width := SacPage.SurfaceWidth;
   Intro.WordWrap := True;
   Intro.Caption :=
-    'Setup builds Blood Wake on this PC, so the game isn''t code-signed by anyone. Smart App Control, a Windows security feature, ' +
-    'is on here: it blocks programs that aren''t signed or known to Microsoft, so it will stop the game from starting.' + #13#10#13#10 +
-    'To play, turn it off: open Windows Security, then App & browser control > Smart App Control settings, and choose Off. ' +
-    'It''s a setting for the whole PC, and on some versions of Windows it can''t be turned back on without reinstalling Windows, ' +
-    'so it''s your decision.' + #13#10#13#10 +
-    'Continue anyway builds the game now; it starts once Smart App Control is off. Cancel stops Setup without installing anything.';
+    'The game is built on this PC, so it isn''t code-signed, and Smart App Control blocks programs that aren''t. ' +
+    'To play, turn it off: Windows Security > App & browser control > Smart App Control settings > Off. ' +
+    'It''s a setting for the whole PC (on some versions of Windows it can''t be turned back on without reinstalling), so it''s your choice.' + #13#10#13#10 +
+    'Continue builds the game now; it starts once Smart App Control is off.';
+  Intro.ShowAccelChar := False;    { "App & browser control": the & is text }
   Intro.AdjustHeight;
 end;
 
@@ -969,17 +985,17 @@ begin
   end else
     WizardForm.CancelButton.Caption := SetupMessage(msgButtonCancel);
   if CurPageID = SacPage.ID then
-    WizardForm.NextButton.Caption := 'Continue &anyway';
+    WizardForm.NextButton.Caption := '&Continue';
   if CurPageID = DepsPage.ID then
     FillDepsPage()
   else if CurPageID = wpFinished then begin
     if gBuildOK then
       WizardForm.FinishedLabel.Caption := 'Blood Wake is built and ready.' + #13#10#13#10 + gFingerprint + #13#10#13#10 +
-        StartWhere() + ' The launcher lets you pick Original (exactly as shipped) or Remastered, set up your screen and controls, and press Play.' +
+        StartWhere() + ' In the launcher, choose Original (as shipped) or Remastered, then press Play.' +
         SacNote()
     else
-      WizardForm.FinishedLabel.Caption := 'Setup installed its files, but the game wasn''t built:' + #13#10#13#10 + gBuildMsg + #13#10#13#10 +
-        'The build''s logs are in ' + ExpandConstant('{app}\work\logs') + '. Fix the problem and run Setup again: it picks up where it left off. Or remove everything from Settings > Apps.';
+      WizardForm.FinishedLabel.Caption := 'The game wasn''t built:' + #13#10#13#10 + gBuildMsg + #13#10#13#10 +
+        'Logs: ' + ExpandConstant('{app}\work\logs') + '. Run Setup again once it''s fixed, or remove Blood Wake Recomp in Settings > Apps.';
     { Inno sized the label for its own text: fit ours, and keep the launcher box below it }
     WizardForm.FinishedLabel.AdjustHeight;
     WizardForm.RunList.Top := WizardForm.FinishedLabel.Top + WizardForm.FinishedLabel.Height + ScaleY(12);
@@ -1070,9 +1086,8 @@ begin
   end;
   Log('Already installed in ' + R + '; the folder page names ' + WizardDirValue + ': asking.');
   if TaskDialogMsgBox('Blood Wake Recomp is already installed',
-      'It''s installed in ' + R + '.' + #13#10#13#10 +
-      'Setup can update that install. Two installs in different folders would share one entry in Settings > Apps and the same shortcuts, ' +
-      'so to move it, uninstall it first (Settings > Apps), then run Setup again.',
+      'It''s installed in ' + R + '. Setup can update it there.' + #13#10#13#10 +
+      'To move it, uninstall it first (Settings > Apps): two installs would share one Apps entry and the same shortcuts.',
       mbConfirmation, MB_YESNO, ['Install it there instead' + #10 + 'Updates the install in ' + R, 'Cancel Setup'], 0) = IDYES then begin
     WizardForm.DirEdit.Text := R;
     Log('Installing into the existing folder instead: ' + R);
@@ -1095,7 +1110,7 @@ begin
       exit;
     end;
     if not FolderUsable(WizardDirValue) then begin
-      Msg := 'Please pick a new or empty folder: ' + WizardDirValue + ' already has other things in it. Setup puts several folders inside the install folder, and the uninstaller removes them again, so it needs a folder of its own.';
+      Msg := 'Choose a new or empty folder: ' + WizardDirValue + ' already has other things in it, and Setup needs a folder of its own.';
       Log('Stopped at the folder page: ' + Msg);
       SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
       Result := False;
@@ -1148,7 +1163,9 @@ end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := ((PageID = WarnPage.ID) and (gDiscKind <> DISC_UNVERIFIED))
-    or ((PageID = SacPage.ID) and not gSacOn);
+    or ((PageID = SacPage.ID) and not gSacOn)
+    { item 106: with Visual Studio found there's nothing to decide; the Ready page lists the downloads }
+    or ((PageID = DepsPage.ID) and gHaveVS);
 end;
 
 { Decline on the warning page stops Setup at once: the answer was given. }
@@ -1174,12 +1191,11 @@ var
 begin
   S := 'Your copy of Blood Wake:' + NewLine + Space + gDisc + NewLine;
   if gDiscKind = DISC_VERIFIED then
-    S := S + Space + 'Recognised: Blood Wake, ' + RETAIL_LABEL + NewLine + Space + '(its main program matches the retail one)' + NewLine + NewLine
+    S := S + Space + 'Recognised: Blood Wake, ' + RETAIL_LABEL + NewLine + NewLine
   else
-    S := S + Space + 'Not recognised: you accepted the warning, so Setup builds it anyway' + NewLine + Space +
-      '(it''s recorded as an unverified copy)' + NewLine + NewLine;
+    S := S + Space + 'Not recognised: built anyway, as an unverified copy' + NewLine + NewLine;
   S := S + MemoDirInfo + NewLine + NewLine;
-  S := S + 'Setup will download:' + NewLine;
+  S := S + 'Setup downloads (official sources, hash-checked):' + NewLine;
   if NeedPython() then
     S := S + Space + 'Python {#PyVer} from python.org (33 MB)' + NewLine;
   S := S + Space + 'capstone 5.0.9 and pefile 2024.8.26 from pypi.org (1.3 MB)' + NewLine;
@@ -1192,8 +1208,8 @@ begin
     else
       S := S + Space + 'Microsoft''s Build Tools for Visual Studio 2022 {#VsVer} (about 3 GB; asks for permission)' + NewLine;
   end;
-  S := S + NewLine + 'Then it builds the game and prepares its graphics: about 20 minutes on a recent PC,' + NewLine +
-    'longer on an older one. You can use the PC meanwhile.' + NewLine;
+  S := S + NewLine + 'Then it builds the game and prepares its graphics: about 15 minutes, longer on an older PC.' + NewLine +
+    'You can use the PC meanwhile.' + NewLine;
   if MemoTasksInfo <> '' then
     S := S + NewLine + MemoTasksInfo + NewLine;
   Result := S;
@@ -1252,12 +1268,12 @@ begin
   else if Step = 'identify' then Result := 'Looking at your copy of Blood Wake...'
   else if Step = 'toolkit' then Result := 'Getting the xboxrecomp toolkit...'
   else if Step = 'unpack' then Result := 'Copying the game''s files from your copy...'
-  else if Step = 'fingerprint' then Result := 'Checking your copy against the retail fingerprints...'
-  else if Step = 'pipeline' then Result := 'Translating the game''s code (about 10 minutes)...'
-  else if Step = 'verify' then Result := 'Checking the translated code matches ours...'
-  else if Step = 'build' then Result := 'Compiling the game (Visual Studio)...'
+  else if Step = 'fingerprint' then Result := 'Checking your copy...'
+  else if Step = 'pipeline' then Result := 'Translating the game''s code (the longest step)...'
+  else if Step = 'verify' then Result := 'Checking the translated code...'
+  else if Step = 'build' then Result := 'Compiling the game...'
   else if Step = 'stage' then Result := 'Finishing...'
-  else if Step = 'warmup' then Result := 'Preparing graphics (one time)...'
+  else if Step = 'warmup' then Result := 'Preparing graphics...'
   else if Step = 'done' then Result := 'Done.'
   else Result := WizardForm.StatusLabel.Caption;
 end;
@@ -1281,6 +1297,7 @@ begin
     gBuildMsg := Msg;
     gBuildExit := StrToIntDef(JsonValue(S, 'exit'), 1);
     gBuildReason := JsonValue(S, 'reason');
+    gBuildDetail := JsonValue(S, 'detail');
   end;
   if Step = 'log' then
     exit;
@@ -1501,9 +1518,9 @@ procedure BuildCancelClick(Sender: TObject);
 begin
   if not gInBuild or gBuildCancelled then
     exit;
-  if SuppressibleMsgBox('Stop building Blood Wake?' + #13#10#13#10 +
-      'Setup stops the build and everything it started. The files Setup installed stay: run Setup again later to build the game ' +
-      '(it starts the build afresh), or remove them from Settings > Apps.', mbConfirmation, MB_YESNO, IDNO) = IDYES then begin
+  if SuppressibleTaskDialogMsgBox('Stop building Blood Wake?',
+      'The installed files stay: run Setup again later to build it, or remove Blood Wake Recomp in Settings > Apps.',
+      mbConfirmation, MB_YESNO, ['Stop the build', 'Keep building'], 0, IDNO) = IDYES then begin
     gBuildCancelled := True;
     SaveStringToFile(gCancelFile, 'cancel' + #13#10, False);
     WizardForm.CancelButton.Enabled := False;
@@ -1563,6 +1580,7 @@ begin
     gSpan := 980;
     gBuildMsg := '';
     gBuildReason := '';
+    gBuildDetail := '';
     gBuildExit := 0;
     Params := 'build --source ' + ArgQuote(ExpandConstant('{app}\source')) + ' --cancel-file ' + ArgQuote(gCancelFile) +
       ' --progress-file ' + ArgQuote(ExpandConstant('{app}\setup\progress.jsonl'));
@@ -1581,13 +1599,15 @@ begin
     if gBuildCancelled then begin
       Code := 8;
       gBuildExit := 8;
-      gBuildMsg := 'You stopped the build. Run Setup again to build the game, or remove what Setup installed from Settings > Apps.';
+      gBuildMsg := 'You stopped the build.';
     end else if (Code = 2) and (gBuildReason = 'files differ') and not gUnverifiedAccepted and not WizardSilent() then begin
-      if SuppressibleMsgBox('Your copy''s main program is the retail one, but some of its other files differ from the retail disc:' + #13#10#13#10 +
-          gBuildMsg + #13#10#13#10 +
-          'It may be a modified or damaged copy. Such a copy may crash or behave differently, and bug reports from it get best-effort help. ' +
-          'You must own the game it came from.' + #13#10#13#10 +
-          'Build it anyway? It''s recorded as a copy whose files differ.', mbConfirmation, MB_YESNO, IDNO) = IDYES then begin
+      if gBuildDetail = '' then
+        gBuildDetail := 'some of its files differ from the retail disc';
+      if SuppressibleTaskDialogMsgBox('Build this copy anyway?',
+          'Its main program matches the retail one, but ' + gBuildDetail + '.' + #13#10#13#10 +
+          'It may be a modified or damaged copy, which may crash or behave differently. You must own the game it came from. ' +
+          'It''s marked as a copy whose files differ.',
+          mbConfirmation, MB_YESNO, ['Build it anyway', 'Don''t build'], 0, IDNO) = IDYES then begin
         gUnverifiedAccepted := True;
         Log('The "files differ" warning was accepted: building again with --allow-unverified.');
         Retry := True;
@@ -1716,23 +1736,23 @@ begin
     Intro.Top := ScaleY(14);
     Intro.Width := Form.ClientWidth - ScaleX(32);
     Intro.WordWrap := True;
-    Intro.Caption := 'The game you built, its files in the install folder and the shortcuts are always removed. Choose what else goes:';
+    Intro.Caption := 'The game, its files and its shortcuts are removed. Also remove:';
     Intro.AdjustHeight;
     Y := Intro.Top + Intro.Height + ScaleY(14);
-    CSaves := AddCheck(Form, 'Keep my saves and settings (recommended)', uKeepSaves, Y);
-    CPython := AddCheck(Form, 'Remove the private Python (in the install folder)', uRemovePython, Y);
-    CGame := AddCheck(Form, 'Remove the game files copied from my disc (about 2 GB)', uRemoveGame, Y);
-    CShaders := AddCheck(Form, 'Remove the shader cache (it is rebuilt when you play)', uRemoveShaders, Y);
+    CSaves := AddCheck(Form, 'My saved games and settings', not uKeepSaves, Y);
+    CPython := AddCheck(Form, 'The private Python (in the install folder)', uRemovePython, Y);
+    CGame := AddCheck(Form, 'The game''s files copied from my disc (about 2 GB)', uRemoveGame, Y);
+    CShaders := AddCheck(Form, 'The shader cache (rebuilt when you play)', uRemoveShaders, Y);
     CVS := nil;
     if uVSOurs then begin
-      CVS := AddCheck(Form, 'Remove Microsoft''s Build Tools for Visual Studio 2022', uRemoveVS, Y);
+      CVS := AddCheck(Form, 'Microsoft''s Build Tools for Visual Studio 2022', uRemoveVS, Y);
       Warn := TNewStaticText.Create(Form);
       Warn.Parent := Form;
       Warn.Left := ScaleX(34);
       Warn.Top := Y - ScaleY(4);
       Warn.Width := Form.ClientWidth - ScaleX(50);
       Warn.WordWrap := True;
-      Warn.Caption := 'Setup installed these for you. Other programs may use them too: only remove them if you know nothing else needs them.';
+      Warn.Caption := 'Setup installed these for you. Other programs may use them too.';
       Warn.AdjustHeight;
       Y := Warn.Top + Warn.Height + ScaleY(8);
     end;
@@ -1761,7 +1781,7 @@ begin
       Result := False;
       exit;
     end;
-    uKeepSaves := CSaves.Checked;
+    uKeepSaves := not CSaves.Checked;
     uRemovePython := CPython.Checked;
     uRemoveGame := CGame.Checked;
     uRemoveShaders := CShaders.Checked;

@@ -25,6 +25,10 @@ import time
 import zlib
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+try:                       # per-monitor DPI aware: window sizes and captures in real pixels at any scaling
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except (OSError, AttributeError):
+    pass
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
 
 WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH = 0x000C, 0x000D, 0x000E
@@ -301,7 +305,7 @@ def scenario_disc_page(a, results):
         wz.set_edit("")
         wz.shot("disc_empty")
         expect(not wz.next_enabled(), "empty box: Next is greyed out", results)
-        expect(wz.has_text("Choose your copy of Blood Wake to go on"), "empty box: the status says what's needed", results)
+        expect(wz.has_text("Press Browse, or type or paste where your copy is"), "empty box: the status says what's needed", results)
         wz.set_edit(os.path.join(a.work, "no_such_folder"))
         wz.shot("disc_missing")
         expect(not wz.next_enabled(), "a path that doesn't exist: Next is greyed out", results)
@@ -324,7 +328,7 @@ def scenario_disc_page(a, results):
             expect(wz.next_enabled(), "the retail copy: Next works", results)
             expect(wz.has_text("Recognised"), "the retail copy: recognised", results)
             wz.click("Next")
-            expect(wz.has_text("Select Destination Location") or wz.has_text("Where should"),
+            expect(wz.has_text("Install folder") or wz.has_text("Where should"),
                    "the retail copy: Next leads to the folder page", results)
             wz.shot("folder_page")
     finally:
@@ -361,14 +365,14 @@ def scenario_unverified(a, results):
         expect(mark_of(wz) == "✔" and wz.next_enabled(), "verified: a tick, Next works", results)
         expect(wz.has_text("Recognised: Blood Wake, Xbox retail, North America"), "verified: 'Recognised: Blood Wake, Xbox retail, North America'", results)
         wz.click("Next")
-        expect(wz.has_text("Select Destination Location") or wz.has_text("Where should"),
+        expect(wz.has_text("Install folder") or wz.has_text("Where should"),
                "verified: no warning page, straight to the folder page", results)
         wz.click("Back")
         wz.set_edit(a.unverified)
         time.sleep(1)
         wz.shot("unverified")
         expect(mark_of(wz) == "!" and wz.next_enabled(), "unverified: a ! mark, Next works", results)
-        expect(wz.has_text("doesn't recognise this copy"), "unverified: the status says Setup doesn't recognise it", results)
+        expect(wz.has_text("Not recognised"), "unverified: the status says it isn't recognised", results)
         wz.click("Next")
         wz.shot("warning")
         expect(wz.has_text("Ownership") or any("Ownership" in t for t in wz.texts()),
@@ -376,17 +380,15 @@ def scenario_unverified(a, results):
         expect(text_of(wz.button("Accept")) == "&Accept" and text_of(wz.button("Decline")) == "&Decline",
                "the warning page's buttons are Accept and Decline", results)
         wz.click("Back")
-        expect(wz.has_text("Choose your disc") or wz.has_text("doesn't recognise this copy"), "Back returns to the disc page", results)
+        expect(wz.has_text("Choose your disc") or wz.has_text("Not recognised"), "Back returns to the disc page", results)
         expect(text_of(wz.button("Cancel")) == "Cancel", "Cancel is Cancel again off the warning page", results)
         wz.click("Next")
         wz.click("Accept")
-        expect(wz.has_text("Select Destination Location") or wz.has_text("Where should"), "Accept goes on to the folder page", results)
+        expect(wz.has_text("Install folder") or wz.has_text("Where should"), "Accept goes on to the folder page", results)
         wz.shot("after_accept")
-        wz.click("Next")                 # -> needs
-        wz.click("Next")                 # -> shortcuts
-        wz.click("Next")                 # -> ready
+        next_until(wz, "Install")        # -> shortcuts -> ready
         wz.shot("ready")
-        expect(any("Not recognised: you accepted the warning" in t for t in ready_text(wz)),
+        expect(any("Not recognised: built anyway" in t for t in ready_text(wz)),
                "the Ready page says it's an unverified copy, accepted", results)
         rc = wz.cancel()
         expect(rc == 2, "Cancel on the Ready page: exit 2 (nothing installed)", results)
@@ -579,7 +581,7 @@ def scenario_running(a, results):
             time.sleep(3)
         expect(reg_present(), "Cancel there: still installed", results)
         subprocess.Popen([a.setup, "/LOG=" + L("setup_mutex.log")])
-        h, text = find_dialog("currently running", 30, a.shots, "setup_mutex_dialog")
+        h, text = find_dialog("is already running", 30, a.shots, "setup_mutex_dialog")
         expect(h is not None, "with the game's mutex held, Setup asks to close Blood Wake at its start", results)
         if h:
             press(h, "Cancel")
@@ -617,8 +619,7 @@ def scenario_cancel(a, results):
         go_to_disc_page(wz)
         wz.set_edit(a.disc)
         time.sleep(2)
-        for _ in range(4):                      # to the folder, needs, shortcuts and Ready pages
-            wz.click("Next")
+        next_until(wz, "Install")               # the folder, shortcuts and Ready pages
         wz.shot("ready")
         wz.click("Install", 2)
         t0 = time.time()
@@ -629,9 +630,10 @@ def scenario_cancel(a, results):
         expect(enabled(wz.button("Cancel")), "Cancel is live during the build", results)
         wz.click("Cancel", 1)
         h, text = find_dialog("Stop building Blood Wake?", 10, a.shots, "cancel_confirm")
-        expect(h is not None, "Cancel asks first: 'Stop building Blood Wake?'", results)
+        expect(h is not None and "Stop the build" in text and "Keep building" in text,
+               "Cancel asks first: 'Stop building Blood Wake?' (Stop the build / Keep building)", results)
         if h:
-            press(h, "Yes")
+            press(h, "Stop the build")
         t0 = time.time()
         while time.time() - t0 < 60 and not wz.has_text("wasn't built"):
             time.sleep(1)
@@ -654,11 +656,23 @@ def scenario_cancel(a, results):
 
 
 def to_needs_page(wz, disc):
+    """To the folder page: its Next leads to what's needed (no Visual Studio), Smart
+    App Control (on), or the shortcuts (item 106: the needs page is skipped with VS)."""
     go_to_disc_page(wz)
     wz.set_edit(disc)
     time.sleep(2)
     wz.click("Next")                     # -> folder
-    wz.click("Next")                     # -> what's needed
+
+
+def next_until(wz, caption, most=6):
+    """Press Next until a button with this caption shows (e.g. Install)."""
+    for _ in range(most):
+        try:
+            wz.button(caption)
+            return True
+        except LookupError:
+            wz.click("Next", 1.2)
+    return False
 
 
 def scenario_sac(a, results):
@@ -669,7 +683,7 @@ def scenario_sac(a, results):
     try:
         to_needs_page(wz, a.disc)
         wz.click("Next")
-        expect(not wz.has_text("Smart App Control") and wz.has_text("Select Additional Tasks"),
+        expect(not wz.has_text("Smart App Control") and wz.has_text("Where do you want to start Blood Wake from?"),
                "Smart App Control off: no page, straight to the shortcuts", results)
     finally:
         wz.cancel()
@@ -678,10 +692,10 @@ def scenario_sac(a, results):
         to_needs_page(wz, a.disc)
         wz.click("Next")
         wz.shot("sac_page")
-        expect(wz.has_text("Smart App Control will block the game"), "on: the page appears after 'What Blood Wake needs'", results)
-        expect(text_of(wz.button("Continue")) == "Continue &anyway", "its buttons: Continue anyway and Cancel", results)
+        expect(wz.has_text("Smart App Control will block the game"), "on: the page appears after the folder page", results)
+        expect(text_of(wz.button("Continue")) == "&Continue", "its buttons: Continue and Cancel", results)
         wz.click("Continue")
-        expect(wz.has_text("Select Additional Tasks"), "Continue anyway goes on to the shortcuts", results)
+        expect(wz.has_text("Where do you want to start Blood Wake from?"), "Continue anyway goes on to the shortcuts", results)
         wz.click("Back")
         rc = wz.cancel()
         expect(rc == 2 and not os.path.exists(os.path.join(a.dir, "unins000.exe")),
@@ -736,9 +750,7 @@ def scenario_pages(a, results):
             time.sleep(2)
         wz.click("Next")
         wz.shot("folder")
-        wz.click("Next")
-        wz.shot("needs")
-        wz.click("Next")
+        wz.click("Next")                 # (no needs page: Visual Studio is found)
         wz.shot("smart_app_control")
         wz.click("Continue")
         wz.shot("shortcuts")
@@ -768,10 +780,10 @@ def scenario_pages(a, results):
         if wz.proc.poll() is None:
             wz.cancel()
     subprocess.Popen([os.path.join(a.dir, "unins000.exe"), "/USERDATAROOT=" + a.userdata])
-    h, _ = find_dialog("The game you built", 30, a.shots, "%02d_uninstall_options" % (wz.n + 1))
+    h, _ = find_dialog("The game, its files and its shortcuts", 30, a.shots, "%02d_uninstall_options" % (wz.n + 1))
     if h:
         press(h, "Uninstall")
-    h, _ = find_dialog("with the choices you made", 20, a.shots, "%02d_uninstall_confirm" % (wz.n + 2))
+    h, _ = find_dialog("Remove Blood Wake Recomp now", 20, a.shots, "%02d_uninstall_confirm" % (wz.n + 2))
     if h:
         press(h, "Yes")
     h, text = find_dialog("removed", 120, a.shots, "%02d_uninstall_done" % (wz.n + 3))
@@ -882,8 +894,7 @@ def real_run(a, results, stage, tag):
         go_to_disc_page(wz)
         wz.set_edit(a.disc)
         time.sleep(3)
-        for _ in range(4):
-            wz.click("Next", 1.2)
+        next_until(wz, "Install")
         wz.click("Install", 2)
         want = {"toolkit": "Getting the xboxrecomp toolkit", "compile": "Compiling the game",
                 "warmup": "Preparing graphics"}.get(stage)
@@ -898,7 +909,7 @@ def real_run(a, results, stage, tag):
             wz.click("Cancel", 1)
             h, _ = find_dialog("Stop building Blood Wake?", 10)
             if h:
-                press(h, "Yes")
+                press(h, "Stop the build")
             done = wait_text(wz, "wasn't built", 120)
             wz.shot(tag + "_finished")
             expect(done and wz.has_text("You stopped the build"), "%s: stopped, and the Finished page says so" % tag, results)
@@ -950,6 +961,95 @@ def registered_location():
         return None
 
 
+def scenario_needs(a, results):
+    """Item 106: "What Blood Wake needs" only when there's something to decide (no
+    Visual Studio): then it shows, with the Build Tools box ticked, and goes on
+    to the shortcuts. With Visual Studio found it's skipped (the sac scenario)."""
+    wz = Wizard(a.setup, ["/LOG=" + os.path.join(a.shots, "needs.log"), "/DIR=" + a.dir, "/SIMULATENOVS"], a.shots)
+    try:
+        to_needs_page(wz, a.disc)
+        wz.click("Next", 1.2)
+        wz.shot("needs_without_vs")
+        expect(wz.has_text("What Blood Wake needs") and wz.is_checked("Install Microsoft"),
+               "no Visual Studio: the needs page shows, the Build Tools box ticked", results)
+        wz.click("Next", 1.2)
+        expect(wz.has_text("Where do you want to start Blood Wake from?"), "...and goes on to the shortcuts", results)
+        next_until(wz, "Install")
+        wz.shot("ready_without_vs")
+        expect(any("Build Tools" in t for t in ready_text(wz)), "the Ready page lists the Build Tools", results)
+    finally:
+        rc = wz.cancel()
+        expect(rc == 2 and not os.path.exists(os.path.join(a.dir, "unins000.exe")), "Cancel: nothing installed (exit %s)" % rc, results)
+
+
+def scenario_walk(a, results):
+    """Item 106: every changed page, captured without installing anything (for a
+    look at another display scaling). Two passes: an unverified copy with no
+    Visual Studio and Smart App Control on (the warning, needs and Smart App
+    Control pages), then the recognised copy (the plain path, to Ready)."""
+    for tag, extra, disc in (("odd", ["/SIMULATENOVS", "/VSPLANONLY", "/SIMULATESAC"], a.unverified),
+                             ("plain", [], a.disc)):
+        wz = Wizard(a.setup, ["/LOG=" + os.path.join(a.shots, tag + ".log"), "/DIR=" + a.dir] + extra, a.shots)
+        try:
+            time.sleep(1)
+            if tag == "plain":
+                wz.shot("welcome")
+            wz.click("Next")
+            wz.check("I own Blood Wake")
+            if tag == "plain":
+                wz.shot("disclaimer")
+            wz.click("Next")
+            wz.set_edit(disc)
+            time.sleep(2)
+            wz.shot(tag + "_disc")
+            for _ in range(8):
+                try:
+                    wz.button("Install")
+                    break
+                except LookupError:
+                    pass
+                wz.click("Next" if wz.has_text("Choose your disc") or wz.has_text("Install folder") or wz.has_text("Shortcuts") or wz.has_text("needs") else
+                         ("Accept" if wz.has_text("isn't recognised") else "Continue" if wz.has_text("Smart App Control") else "Next"), 1.5)
+                wz.shot(tag + "_page")
+            expect(wz.has_text("Ready to install"), "%s: reached the Ready page" % tag, results)
+        finally:
+            wz.cancel()
+
+
+def scenario_files_differ(a, results):
+    """Item 106: the "files differ" question (stub: the first build reports it), with
+    answer buttons; "Build it anyway" builds again and finishes."""
+    os.makedirs(a.userdata, exist_ok=True)
+    os.environ.update(BW_SETUP_STUB_FAIL="2", BW_SETUP_STUB_REASON="files differ", BW_SETUP_STUB_SECONDS="5")
+    wz = Wizard(a.setup, ["/LOG=" + os.path.join(a.shots, "setup.log"), "/DIR=" + a.dir, "/STUBBUILD", "/TASKS="], a.shots)
+    try:
+        go_to_disc_page(wz)
+        wz.set_edit(a.disc)
+        time.sleep(2)
+        next_until(wz, "Install")
+        wz.click("Install", 2)
+        h, text = find_dialog("Build this copy anyway?", 240, a.shots, "files_differ_question")
+        expect(h is not None and "Build it anyway" in text and "Don't build" in text,
+               "the build finds differing files: 'Build this copy anyway?' (Build it anyway / Don't build)", results)
+        expect(h is not None and "1 of its files differs (stub.txt)" in text and "--allow-unverified" not in text,
+               "the question names the differing file, without the build's own refusal text", results)
+        if h:
+            press(h, "Build it anyway")
+        expect(wait_text(wz, "built and ready", 120), "Build it anyway: the second build finishes", results)
+        wz.shot("files_differ_finished")
+        wz.click("Finish", 2)
+    finally:
+        for k in ("BW_SETUP_STUB_FAIL", "BW_SETUP_STUB_REASON", "BW_SETUP_STUB_SECONDS"):
+            os.environ.pop(k, None)
+        if wz.proc.poll() is None:
+            wz.cancel()
+    for pid in helpers_left(os.path.normpath(a.dir)):     # a launcher the Finish page opened
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+    if reg_present():
+        silent_uninstall(a, os.path.join(a.shots, "uninstall.log"))
+    expect(not reg_present(), "cleaned up: uninstalled", results)
+
+
 def scenario_two_folders(a, results):
     """Item 98: one install per Windows user. Installed in A, Setup defaults to A;
     another folder B is refused (update A instead, or cancel); a silent /DIR=B
@@ -979,7 +1079,7 @@ def scenario_two_folders(a, results):
             press(h, choice)
             if choice.startswith("Install"):
                 time.sleep(1.5)
-                expect(wz.has_text("What Blood Wake needs"), "'Install it there instead' goes on", results)
+                expect(wz.has_text("Where do you want to start Blood Wake from?"), "'Install it there instead' goes on", results)
                 wz.click("Back", 1.5)
                 expect(norm(text_of(wz.edit())) == norm(A), "...with the folder set to A", results)
             else:
@@ -1021,7 +1121,9 @@ def scenario_two_folders(a, results):
 SCENARIOS = {"disc-page": scenario_disc_page, "unverified": scenario_unverified, "buildtools": scenario_buildtools,
              "install-cycle": scenario_install_cycle, "running": scenario_running,
              "cancel": scenario_cancel, "sac": scenario_sac, "pages": scenario_pages,
-             "browse": scenario_browse, "real": scenario_real, "two-folders": scenario_two_folders}
+             "browse": scenario_browse, "real": scenario_real, "two-folders": scenario_two_folders,
+             "needs": scenario_needs, "walk": scenario_walk,
+             "files-differ": scenario_files_differ}
 
 
 def main(argv=None):

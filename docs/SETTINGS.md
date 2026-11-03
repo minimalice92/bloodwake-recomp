@@ -8,7 +8,7 @@ Every choice in the launcher, tab by tab. The launcher saves them in `%LOCALAPPD
 
 ### Edition
 
-Original is the game exactly as it shipped in 2001, bugs and all. Remastered fixes its bugs and plays it on a modern PC: widescreen, sharper picture, higher frame rate, better sound, with the original art. Each edition keeps its own saves.
+Original plays exactly as it shipped in 2001, bugs and all. Remastered is the same game with its bugs fixed and a modern picture, frame rate and sound, using the original art. Each edition keeps its own saved games.
 
 Applies to: Original and Remastered. Default: **Original (as shipped)**.
 
@@ -19,7 +19,7 @@ Applies to: Original and Remastered. Default: **Original (as shipped)**.
 
 ### Preset
 
-Sets the Display and Graphics tabs in one go; you can still change any setting afterwards (the preset then shows Custom). A preset never changes HDR or OLED care: they depend on your screen.
+Sets the quality settings on the Display and Graphics tabs in one go. Change any of them afterwards and it shows Custom.
 
 Applies to: Remastered. Default: **Best Quality**.
 
@@ -32,9 +32,9 @@ Applies to: Remastered. Default: **Best Quality**.
 
 ## Display
 
-### Window
+### Display mode
 
-Play in a window, or fill the whole screen without a border (Alt+Enter or F11 switches while you play).
+Play in a window or fill the screen. Alt+Enter or F11 switches while you play.
 
 Applies to: Original and Remastered. Default: **Fullscreen (borderless)**.
 
@@ -45,7 +45,7 @@ Applies to: Original and Remastered. Default: **Fullscreen (borderless)**.
 
 ### Window size
 
-How big the window opens, in steps of the console's 480-line picture. It shrinks itself to fit the screen.
+How big the window opens. It never opens larger than your screen.
 
 Applies to: Original and Remastered. Default: **Large (960 lines)**.
 
@@ -57,7 +57,7 @@ Applies to: Original and Remastered. Default: **Large (960 lines)**.
 
 ### Picture shape
 
-Widescreen shows more of the world at the sides, as a modern game does; nothing is stretched. Match my display picks your monitor's shape (21:9 on an ultrawide). 4:3 is the console's shape.
+Widescreen shows more of the world at the sides, with nothing stretched. Match my display uses your screen's shape; 4:3 is the console's.
 
 Applies to: Remastered. Default: **Match my display**.
 
@@ -70,7 +70,7 @@ Applies to: Remastered. Default: **Match my display**.
 
 ### HUD position
 
-In widescreen, put the radar and the status panel in the corners of the screen, or keep the whole HUD in the middle, where the console had it.
+In widescreen, puts the radar and status panel in the screen's corners, or keeps the whole HUD in the middle as on the console.
 
 Applies to: Remastered. Default: **Screen corners**.
 
@@ -81,7 +81,7 @@ Applies to: Remastered. Default: **Screen corners**.
 
 ### Rendering resolution
 
-How sharp the game is drawn. Native draws at your screen's or window's own resolution (sharpest); lower settings are kinder to a slower graphics card. 480p is the console's own resolution.
+How sharp the game is drawn. Native matches your screen or window (sharpest); lower is easier on a slower graphics card.
 
 Applies to: Remastered. Default: **Native (match the screen)**.
 
@@ -96,7 +96,7 @@ Applies to: Remastered. Default: **Native (match the screen)**.
 
 ### Frame rate cap
 
-The most frames a second the game draws. The console ran missions at 30. Higher rates draw extra frames between the game's own steps, so it looks smoother while playing at the same speed. Match my display follows your screen's refresh rate, which on a very fast monitor means hundreds of frames a second: 120 or 144 is plenty and keeps the PC cooler and quieter.
+The most frames a second the game draws; it plays at the same speed at any rate. Match my display follows your screen's refresh rate, but 120 or 144 is plenty and keeps the PC cooler and quieter.
 
 Applies to: Remastered. Default: **Match my display**.
 
@@ -111,7 +111,7 @@ Applies to: Remastered. Default: **Match my display**.
 
 ### Vertical sync
 
-Wait for the screen before showing each frame: no tearing on screens without variable refresh (G-Sync/FreeSync), a little more delay.
+Stops tearing on screens without G-Sync or FreeSync, at the cost of a little delay.
 
 Applies to: Remastered. Default: **Off**.
 
@@ -137,7 +137,7 @@ Applies to: Remastered. Default: **4x**.
 
 ### Texture filtering
 
-Keeps textures sharp when seen at an angle, like the water and the cliffs far away.
+Keeps textures sharp at an angle, such as distant water and cliffs.
 
 Applies to: Remastered. Default: **16x**.
 
@@ -162,7 +162,7 @@ Applies to: Remastered. Default: **Far (2x)**.
 
 ### Ambient occlusion
 
-Soft shadows where things meet (under ledges, around boats). Adds depth; off in Balanced and Original because the original didn't have it.
+Soft shadows where things meet, such as under ledges and around boats. Not part of the original look.
 
 Applies to: Remastered. Default: **Off**.
 
@@ -173,7 +173,7 @@ Applies to: Remastered. Default: **Off**.
 
 ### Bloom
 
-A soft glow around the brightest highlights (sun, explosions). Off in Balanced and Original: it adds light the original didn't have.
+A soft glow around the brightest highlights, such as the sun and explosions. Not part of the original look.
 
 Applies to: Remastered. Default: **Off**.
 
@@ -184,7 +184,7 @@ Applies to: Remastered. Default: **Off**.
 
 ### Sharpening
 
-Crisper textures. Off in Balanced and Original: it changes the look a little.
+Crisper textures. It changes the original look a little.
 
 Applies to: Remastered. Default: **Off**.
 
@@ -195,7 +195,7 @@ Applies to: Remastered. Default: **Off**.
 
 ### Edge smoothing (FXAA)
 
-An extra smoothing pass for edges anti-aliasing misses (foliage, wires). Softens text a little.
+Smooths edges that anti-aliasing misses, such as foliage and wires. Softens text a little.
 
 Applies to: Remastered. Default: **Off**.
 
@@ -206,7 +206,7 @@ Applies to: Remastered. Default: **Off**.
 
 ### Split-screen detail
 
-In 2-, 3- and 4-player split screen the console drew the sea coarser, and with 3 or 4 players it froze the boats' gunners, turrets and props. Balanced brings back the animations and gives every view the same sea as one player. Balanced gives 3 or 4 players the sea the game draws for 2, for slower PCs (with 4 players about 15% faster than Full).
+In split screen the console drew a coarser sea and, with 3 or 4 players, froze the boats' gunners, turrets and props. Full brings back the animations and the one-player sea in every view; Balanced gives 3 or 4 players the two-player sea, for slower PCs.
 
 Applies to: Remastered. Default: **Full**.
 
@@ -218,7 +218,7 @@ Applies to: Remastered. Default: **Full**.
 
 ### Smooth gradients
 
-Draws with more colour precision: no banding in dark skies, fog and smoke, same look.
+Removes banding in dark skies, fog and smoke without changing the look.
 
 Applies to: Remastered. Default: **On**.
 
@@ -240,7 +240,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Smooth HUD edges
 
-Draws the edges of the HUD's shapes (the radar's compass ring, weapon icons) smooth and round at high resolution, instead of a beaded edge with dark specks.
+Smooth, round edges on the HUD's shapes, such as the radar ring and weapon icons, instead of beaded edges with dark specks.
 
 Applies to: Remastered. Default: **On**.
 
@@ -251,7 +251,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Texture restoration
 
-Texture restoration: close-up textures redrawn more cleanly from the original art; nothing added. Boats, cliffs and buildings seen up close lose the blocky compression steps; from a distance they look exactly as before, and the sea, spray and the HUD are untouched. The menu photos and logo movies are cleaned the same way.
+Cleans the blocky compression out of close-up textures (boats, cliffs, buildings, the menu photos), working only from the original art. Distant views, the sea and the HUD look as before.
 
 Applies to: Remastered. Default: **On**.
 
@@ -262,7 +262,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Automatic HDR
 
-Plays in HDR on screens that support it: Blood Wake switches Windows HDR on while you play and back afterwards, and maps the picture from the screen's own data by the ITU's standards. Off by default.
+Plays in HDR on a screen that supports it. Windows HDR is switched on while you play and put back as it was afterwards.
 
 Applies to: Remastered. Default: **Off**.
 
@@ -273,7 +273,7 @@ Applies to: Remastered. Default: **Off**.
 
 ### Colour
 
-Wide stretches the game's colours onto the P3 colour range of wide-gamut screens: more vivid reds, greens and blues; white and greys don't change. Only on a screen in HDR mode. Accurate shows the colours exactly as made.
+In HDR, Wide makes reds, greens and blues more vivid on a wide-colour screen; whites and greys stay the same. Accurate shows the colours exactly as made.
 
 Applies to: Remastered. Default: **Accurate (BT.709)**.
 
@@ -284,7 +284,7 @@ Applies to: Remastered. Default: **Accurate (BT.709)**.
 
 ### OLED care
 
-Slowly dims parts of the picture that don't change for a long time (the HUD, a paused menu), to spare an OLED screen.
+Slowly dims parts of the picture that stay still for a long time, such as the HUD or a paused menu, to protect an OLED screen from burn-in.
 
 Applies to: Remastered. Default: **Off**.
 
@@ -297,7 +297,7 @@ Applies to: Remastered. Default: **Off**.
 
 ### Sound processor
 
-Accurate runs the Xbox's own sound chip programs (echo, 3D sound) as the console did. Simple skips them, for a slow PC. Applies to every edition.
+Accurate plays the console's own echo and 3D sound effects. Simple skips them, for a slow PC.
 
 Applies to: Original and Remastered. Default: **Accurate (as the console)**.
 
@@ -308,7 +308,7 @@ Applies to: Original and Remastered. Default: **Accurate (as the console)**.
 
 ### High-quality resampling
 
-Cleaner, brighter sound when the game changes a sound's pitch (engines, speed).
+Cleaner sound when the game changes a sound's pitch, such as engines speeding up.
 
 Applies to: Remastered. Default: **On**.
 
@@ -319,7 +319,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Louder output
 
-The game mixes quietly; this lifts the whole mix a little, with a limiter so nothing clips. The balance between music, effects and voices stays the same.
+Lifts the game's quiet mix a little without clipping; music, effects and voices keep their balance.
 
 Applies to: Remastered. Default: **On**.
 
@@ -330,7 +330,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Surround sound (5.1)
 
-With 5.1 or 7.1 speakers (or a surround headset), the game's surround mix comes out of all of them. Stereo setups are not affected.
+With 5.1 or 7.1 speakers or a surround headset, the game's surround mix uses all of them. Stereo is unaffected.
 
 Applies to: Remastered. Default: **On**.
 
@@ -352,9 +352,9 @@ Applies to: Remastered. Default: **On**.
 
 ## Fixes
 
-### Mission 10 can always be won
+### Mission 10 second strike force
 
-Sink the first strike force before it reaches Kerang and the second one waits off the map forever, so the mission can never end. On, the second force comes as scripted.
+If you sink the first strike force before it reaches Kerang, the second one never arrives and the mission can't end. On, it arrives as scripted.
 
 Applies to: Remastered. Default: **On**.
 
@@ -365,7 +365,7 @@ Applies to: Remastered. Default: **On**.
 
 ### AI target rules
 
-Seventeen of the AI's target rules were written so they could never match, so in missions 9, 10, 14, 24, 26 and 27 some enemies ignored the targets the designers gave them (in mission 10 the strike force never went for Kerang's batteries). On, they work as written, and those fights play a little differently.
+Some enemies in missions 9, 10, 14, 24, 26 and 27 ignored the targets the designers gave them, because 17 of the AI's rules could never match. On, the rules work as written and those fights play a little differently.
 
 Applies to: Remastered. Default: **On**.
 
@@ -376,7 +376,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Autocannon hit sound
 
-One autocannon hit in three was silent: its third recording was never made. On, those hits play one of the other two.
+One autocannon hit in three was silent because its recording was never made. On, those hits play one of the other two.
 
 Applies to: Remastered. Default: **On**.
 
@@ -387,7 +387,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Hull impact sounds
 
-Hull smacks, splashes and plunges checked the wrong sound before playing, so some were dropped and some restarted over themselves.
+Hull smacks, splashes and plunges checked the wrong sound before playing, so some were dropped and some restarted over themselves. On, each plays as intended.
 
 Applies to: Remastered. Default: **On**.
 
@@ -398,7 +398,7 @@ Applies to: Remastered. Default: **On**.
 
 ### AI mood swing
 
-The AI's slow 20-minute swing between cautious and aggressive was miscalculated into random noise several times a second. On, it swings slowly as written.
+The AI was meant to swing slowly between cautious and aggressive over 20 minutes, but a miscalculation made it flicker several times a second. On, it swings as written.
 
 Applies to: Remastered. Default: **On**.
 
@@ -409,7 +409,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Dreadnought shield-hit sound
 
-A sound the original never played because its name was misspelt.
+On, plays a shield-hit sound the original never played because its name was misspelt.
 
 Applies to: Remastered. Default: **On**.
 
@@ -420,7 +420,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Boat landing splash
 
-The splash sound for landing after a jump never played: every landing plunged. On, light landings splash and heavy ones (a second or more in the air, or nose first) plunge; little hops still slap the water as before.
+Every landing after a jump made the heavy plunge sound. On, light landings splash and only long or nose-first ones plunge; little hops still slap the water.
 
 Applies to: Remastered. Default: **On**.
 
@@ -431,7 +431,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Mission 17 health crate
 
-The health crate comes back every second, forever: the only endless crate in the story missions. On, it appears once like the mission's other crates (on by default: the maintainer's call).
+The health crate comes back every second, forever, unlike every other crate in the story missions. On, it appears once.
 
 Applies to: Remastered. Default: **On**.
 
@@ -442,7 +442,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Mission 21 patrol boat
 
-After the destroyer sinks, the patrol boat SeahawkE keeps coming back forever: the only one of 100 respawning squads that does. On, it comes back once like the others (on by default: the maintainer's call).
+After the destroyer sinks, the patrol boat SeahawkE keeps coming back forever, unlike every other respawning squad. On, it comes back once.
 
 Applies to: Remastered. Default: **On**.
 
@@ -453,7 +453,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Missing voice lines
 
-In missions 2, 7, 8, 10, 14 and 19 some radio calls (the out-of-bounds warnings, the friendly-fire calls, one taunt) showed their subtitle in silence: the mission's copy of the recording was left empty. On, they play the same recording the other missions use.
+Some radio calls in missions 2, 7, 8, 10, 14 and 19 showed their subtitle in silence because the mission's recording was empty. On, they play the recording the other missions use.
 
 Applies to: Remastered. Default: **On**.
 
@@ -464,7 +464,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Mission 20 map edge
 
-In the south-east corner you can slip past the end of the out-of-bounds line and sail off the map. On, leaving there fails the mission like the rest of that edge (on by default: the maintainer's call; off leaves the corner open to explore).
+In the south-east corner you can slip past the out-of-bounds line and sail off the map. On, leaving there fails the mission as on the rest of that edge; Off keeps the corner open to explore.
 
 Applies to: Remastered. Default: **On**.
 
@@ -475,7 +475,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Mission 23 missing textures
 
-Two textures in mission 23 were never shipped, so the grates in the hallway's ceiling show as plain black holes and the rods on the arena's banners are flat white. On, they use the closest match from the game's own textures: a riveted girder lattice for the grates, and pitted copper for the rods. (Advanced: BW_M23_GRATE and BW_M23_BRASS pick other textures by name.)
+Two textures in mission 23 were never shipped, so the hallway's ceiling grates show as black holes and the arena banners' rods as flat white. On, the closest textures from the game stand in: a riveted girder lattice and pitted copper.
 
 Applies to: Remastered. Default: **On**.
 
@@ -486,7 +486,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Battle Mode boat water sounds
 
-In Battle Mode the boats made no splash, slap or spray sounds on the water: those recordings were only packed with the story missions. On, battles use the same water sounds the story missions play.
+In Battle Mode the boats made no splash, slap or spray sounds, because those recordings shipped only with the story missions. On, battles use them too.
 
 Applies to: Remastered. Default: **On**.
 
@@ -497,7 +497,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Mission 14 shield cutscene
 
-Grab the shield before blowing up the ammo depots and its cutscene played much later, showing the empty spot where the shield had been. On, it plays when you grab the shield.
+If you grabbed the shield before blowing up the ammo depots, its cutscene played much later and showed the empty spot where it had been. On, it plays when you grab it.
 
 Applies to: Remastered. Default: **On**.
 
@@ -508,7 +508,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Mission 27 "You hit the Dragon!"
 
-The radio call for turning the Dragon's Claw back into the Dragon with your shield was recorded but never played: the game listened for a weapon that nothing reports. On, the first shield blast that hits the Dragon plays it.
+The radio call for hitting the Dragon with your shield's blast was recorded but never played. On, your first shield blast that hits it plays the call.
 
 Applies to: Remastered. Default: **On**.
 
@@ -519,7 +519,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Distant wake foam
 
-The game builds the far-away versions of the boat-wake foam from a mask it reads in the wrong order, so distant foam uses a scrambled pattern (almost certainly a slip; the sea's colour, waves and sky are not affected). Fixed reads it in the order the code intended; Smooth averages it instead. The difference is very small: try it in a stormy mission and decide.
+Distant boat-wake foam used a scrambled pattern because the game read its mask in the wrong order. Fixed reads it in the intended order; Smooth averages it. The difference is small: try it in a stormy mission.
 
 Applies to: Remastered. Default: **Fixed**.
 
@@ -531,7 +531,7 @@ Applies to: Remastered. Default: **Fixed**.
 
 ### Distant-water line
 
-Where waves overlap each other in the distance, the game puts the sky's reflection on the water twice, which draws a thin dark line along the wave at night. On, the reflection goes on once; nothing else about the sea changes.
+Overlapping distant waves got the sky's reflection twice, which draws a thin dark line along them at night. On, the reflection is drawn once.
 
 Applies to: Remastered. Default: **On**.
 
@@ -542,7 +542,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Game Demos → Quit Game
 
-The main menu's Game Demos sign starts the console's demo disc, which a PC can't run (it only goes back to the title). On, the sign reads Quit Game and closes the game, as closing the window does.
+On a PC the main menu's Game Demos sign only goes back to the title. On, it reads Quit Game and closes the game.
 
 Applies to: Remastered. Default: **On**.
 
@@ -553,7 +553,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Mouse in the menus
 
-Use the mouse in the game's menus: in the main menu and the options menu, point at an item to highlight it and click to choose it; everywhere in the menus a right click goes back and the wheel moves up and down. The pointer hides while you play.
+Point and click in the main and options menus; anywhere in the menus, a right click goes back and the wheel moves up and down. The pointer hides while you play.
 
 Applies to: Remastered. Default: **On**.
 
@@ -566,7 +566,7 @@ Applies to: Remastered. Default: **On**.
 
 ### Keyboard as a controller
 
-Lets the keyboard act as controller 1 together with any pad: a connected controller keeps working as well. Keys only count while the game's window has the focus.
+The keyboard acts as controller 1, alongside any connected controller. Keys only work while the game's window is active.
 
 Applies to: Original and Remastered. Default: **On**.
 
