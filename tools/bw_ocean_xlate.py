@@ -431,6 +431,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--gen', default=os.path.join(os.path.dirname(__file__), '..', 'src', 'recomp', 'gen'))
     ap.add_argument('--out', default=None)
+    ap.add_argument('--stamp', default=None,
+                    help='a file touched after every run, for the build to tell it is up to date')
     a = ap.parse_args()
     gen = os.path.normpath(a.gen)
     out_path = a.out or os.path.join(gen, 'bw_ocean_native.inc')
@@ -472,7 +474,13 @@ def main():
     if old != text:
         with open(out_path, 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
-    print('bw_ocean_xlate: %d functions -> %s' % (len(FUNCS), out_path))
+    if a.stamp:
+        # The build's up-to-date mark, touched on every run. The output itself is
+        # rewritten only when it changes, so bw_ocean_native.c recompiles only then.
+        with open(a.stamp, 'w', encoding='utf-8') as f:
+            f.write('written' if old != text else 'unchanged')
+    print('bw_ocean_xlate: %d functions -> %s (%s)' % (len(FUNCS), out_path,
+                                                      'written' if old != text else 'unchanged'))
     return 0
 
 

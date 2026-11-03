@@ -42,6 +42,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+#include <wchar.h>
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
@@ -89,32 +91,48 @@ extern ptrdiff_t g_xbox_mem_offset;
  */
 #define YOUR_GAME_ENTRY_POINT   0x000DE15F  /* XBE entry point VA */
 #define YOUR_GAME_XBE_PATH      "game\\disc\\default.xbe"
+#define YOUR_GAME_XBE_PATH_W    L"game\\disc\\default.xbe"
 #define YOUR_GAME_DIR            "game\\disc"
 
 /* BW_GAME_DIR=<folder>: the disc folder from anywhere, so a run can work in
  * its own folder (tools/bw_run.py --own-cwd): everything the port writes to
  * its working folder (bw_relaunch.bin, the indirect-call dumps, the kernel
- * log) then lands there, and two runs no longer share those files. */
-static const char *bw_game_dir(void)
+ * log) then lands there, and two runs no longer share those files.
+ *
+ * Read wide from the process block, and handed to the toolkit as UTF-8 (which
+ * xbox_path_init decodes): the CRT's narrow copy is in the ANSI code page,
+ * which mangles a folder named like "Zoë" and loses a Cyrillic one (0.2.5
+ * item 53). */
+static const wchar_t *bw_game_dir_w(void)
 {
-    const char *e = getenv("BW_GAME_DIR");
-    return e && *e ? e : YOUR_GAME_DIR;
+    static wchar_t dir[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"BW_GAME_DIR", dir, MAX_PATH);
+    return n && n < MAX_PATH ? dir : NULL;
 }
 
-static const char *bw_game_xbe(void)
+static const char *bw_game_dir(void)
 {
-    static char path[MAX_PATH];
-    const char *e = getenv("BW_GAME_DIR");
-    if (!e || !*e)
-        return YOUR_GAME_XBE_PATH;
-    _snprintf(path, sizeof path, "%s\\default.xbe", e);
-    path[sizeof path - 1] = 0;
+    static char dir[3 * MAX_PATH];
+    const wchar_t *w = bw_game_dir_w();
+    if (!w || !WideCharToMultiByte(CP_UTF8, 0, w, -1, dir, sizeof dir, NULL, NULL))
+        return YOUR_GAME_DIR;
+    return dir;
+}
+
+static const wchar_t *bw_game_xbe(void)
+{
+    static wchar_t path[MAX_PATH];
+    const wchar_t *e = bw_game_dir_w();
+    if (!e)
+        return YOUR_GAME_XBE_PATH_W;
+    _snwprintf(path, MAX_PATH, L"%ls\\default.xbe", e);
+    path[MAX_PATH - 1] = 0;
     return path;
 }
 
 /* ── Forward declarations ──────────────────────────────────── */
 
-static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
+static BOOL load_xbe(const wchar_t *path, void **out_data, size_t *out_size);
 
 /* ── Blood Wake run control (M0.7) ─────────────────────────────
  *
@@ -142,6 +160,8 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
 #include "bw_edition.h"                            /* BW_EDITION: D-007/D-015 */
 #include "bw_widescreen.h"                         /* Remastered widescreen */
 #include "bw_settings.h"                           /* the launcher's settings file */
+#include "bw_keys.h"                               /* settings.ini [keys] (0.2.5 item 76) */
+#include "bw_hookcheck.h"                          /* item 62: the code each hook attaches to */
 extern void xbox_missing_summary(const char *why);  /* kernel_missing.h */
 extern int  apu_wav_close_nowait(int wait_ms);      /* apu_wav.h */
 extern void bw_unimpl_summary(void);                /* recomp_manual.c */
@@ -249,6 +269,63 @@ static void bw_run_control_init(void)
             "off"
 #endif
             );
+}
+
+/* ── "Reached the title", for the play host (0.2.5 item 60) ────────────
+ *
+ * The host (bw_host.c) records in start_state.ini whether each start got as
+ * far as the title, so the launcher can offer a safe start after two that
+ * didn't (docs/025/CONTRACTS.md, 4). It hands each boot an inheritable event
+ * (BW_HOST_TITLE_EVENT); this thread sets it once the game is up:
+ *
+ *   - the front end's state, the dword at 0x001C8180, leaves 0: 0 is the
+ *     startup movies, and IntroMovies_Update (0x57880) writes 2, the title,
+ *     when they end or are skipped (seen in the code, and in run
+ *     20261103-013816-r6-gpu-c1fe: 0 until 33.4 s, then 2); menu boots
+ *     after a mission start in another state;
+ *   - or the player list (0x001CEE58 + 0xC0, as bw_state.c reads it) counts
+ *     1 to 4: a gameplay boot (a launched mission, battle or the attract
+ *     demo; 1 at 1.3 s in the same run's second stage).
+ *
+ * Read-only, every 100 ms, and only under the host: test runs never start
+ * it, so it can't touch an A/B. */
+static HANDLE s_title_event;
+
+static DWORD WINAPI bw_title_watch(LPVOID arg)
+{
+    const volatile uint32_t *fe =
+        (const volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x001C8180u);
+    const volatile uint32_t *players =
+        (const volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x001CEE58u + 0xC0u);
+    ULONGLONG t0 = GetTickCount64();
+    (void)arg;
+    for (;;) {
+        uint32_t s = *fe, p = *players;
+        if (s != 0 || (p >= 1 && p <= 4)) {
+            fprintf(stderr, "[BW] start-up done after %.1f s: %s (front-end state %u, players %u)\n",
+                    (double)(GetTickCount64() - t0) / 1000.0,
+                    s ? "the title or a menu is up" : "gameplay is running", s, p);
+            fflush(stderr);
+            SetEvent(s_title_event);
+            return 0;
+        }
+        Sleep(100);
+    }
+}
+
+static void bw_title_watch_start(void)
+{
+    char v[32];
+    DWORD n = GetEnvironmentVariableA("BW_HOST_TITLE_EVENT", v, sizeof v);
+    HANDLE h;
+    if (!n || n >= sizeof v || !g_xbox_mem_offset)
+        return;
+    s_title_event = (HANDLE)(uintptr_t)_strtoui64(v, NULL, 10);
+    if (!s_title_event)
+        return;
+    h = CreateThread(NULL, 0, bw_title_watch, NULL, 0, NULL);
+    if (h)
+        CloseHandle(h);
 }
 
 /* Recompiled entry point (generated by recomp pipeline) */
@@ -466,6 +543,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    {
+        /* 0.2.5 item 97: --screen-info[=<x>,<y>], the screen under the point
+         * (else the primary) as one JSON object for the launcher (bw_hdr.c) */
+        extern int bw_hdr_screen_info(const char *arg);
+        const char *si = strstr(GetCommandLineA(), "--screen-info");
+        if (si)
+            return bw_hdr_screen_info(si[13] == '=' ? si + 14 : NULL);
+    }
+    if (bw_keys_schema_main())    /* --keys-schema: the default key table (bw_keys.c) */
+        return 0;
     /* The launcher asks for the settings table (tools/launcher.pyw). The exe
      * enters here (WinMain), whatever main() below says, so the process's
      * own command line is checked. */
@@ -515,6 +602,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             return 1;
         }
     }
+    bw_keys_apply();          /* settings.ini [keys]: bindings, ramp, deadzones */
     bw_profile_init();
     {
         extern void bw_fl_init(void);   /* P2b: BW_FRAMELOG test aid (bw_framelog.c) */
@@ -538,6 +626,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
+    /* Item 62: every place the port attaches by address still holds the
+     * retail program's code; a fix whose code differs stays off this boot.
+     * Before the IMAGE fixes and before any guest thread. */
+    bw_hookcheck_run(xbe_data, xbe_size);
 
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
@@ -573,6 +665,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         extern void bw_debugflags_start(void);
         bw_debugflags_start();             /* BW_DEBUG_BYTES: developers' debug switches, tests only */
     }
+    bw_title_watch_start();                /* play host only: tell it when the title is up */
     /* Edition data fixes (IMAGE kind): none in Original, which only counts
      * the image bytes that differ from the XBE (0 expected) and logs it. */
     bw_edition_apply_image_fixes(xbe_data, xbe_size);
@@ -617,6 +710,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
     printf("Initializing kernel bridge...\n");
     xbox_kernel_bridge_init();
+    {
+        /* TK-8 (0.2.5 item 61): xbox_kernel_init's older thunk layer writes
+         * "N kernel imports are unresolved - game may crash!" to
+         * xbox_kernel.log, counting its static list's empty slots (ordinal
+         * 0) and one ordinal it lacks. The game never calls through that
+         * table: every import goes through the bridge just set up, which
+         * prints its own count to the game's log. Rewording the line itself
+         * would mean carrying kernel_thunks.c, whose export table this
+         * project leaves alone, so the facts go in beside it instead. */
+        uint32_t tb = 0, tc = 0;
+        xbox_kernel_get_thunk_address(&tb, &tc);
+        xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
+                 "Blood Wake: the 'unresolved' lines above are the older thunk layer's static "
+                 "list (mostly empty slots); the game's %u kernel imports (table at 0x%08X) all "
+                 "go through the kernel bridge, which logs its own count to the game's log "
+                 "('Kernel thunk bridge: n/n resolved'). Not a fault (TK-8).", tc, tb);
+    }
 
     /* Blood Wake: the game relaunches itself (run 20261025-222206-r2-pixels,
      * ANALYSIS "First runs"). A console reboots into the title with the
@@ -629,23 +739,67 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * +0x400 the 3072 bytes of launch data. */
     int bw_gameplay_boot = 0;   /* launch data SPLASH mode 1 (below) */
     {
-        const char *lf = getenv("BW_LAUNCH_DATA_FILE");
-        if (lf && *lf) {
-            FILE *f = fopen(lf, "rb");
-            char magic[4] = {0}, path[261] = {0}, dev[520] = {0};
+        /* The whole file is read and checked before any of it is used: a
+         * file cut short (a full disk, a copy interrupted) used to install a
+         * half-read page (0.2.5 item 54). Now it is ignored with a log line,
+         * and the boot starts at the title as a cold boot does. Wide path:
+         * the host passes a full path, which carries the user's folder name
+         * (item 53). */
+        wchar_t lfw[MAX_PATH];
+        DWORD lfn = GetEnvironmentVariableW(L"BW_LAUNCH_DATA_FILE", lfw, MAX_PATH);
+        if (lfn && lfn < MAX_PATH) {
+            static uint8_t buf[16 + 260 + 3072 + 1];   /* the largest file, and one byte more */
+            char lf[3 * MAX_PATH], path[261] = {0}, dev[520] = {0};
+            const char *why = NULL;
+            size_t got = 0, want = 0;
             uint32_t ver = 0, plen = 0, dlen = 0, page = 0;
             uint8_t *mem = (uint8_t *)g_xbox_mem_offset;
-            int ok = f && fread(magic, 1, 4, f) == 4 && !memcmp(magic, "BWRL", 4)
-                     && fread(&ver, 4, 1, f) == 1 && ver == 1
-                     && fread(&plen, 4, 1, f) == 1 && plen < sizeof(path)
-                     && fread(path, 1, plen, f) == plen
-                     && fread(&dlen, 4, 1, f) == 1 && (dlen == 0 || dlen == 3072);
-            if (ok)
+            FILE *f = _wfopen(lfw, L"rb");
+            if (!WideCharToMultiByte(CP_UTF8, 0, lfw, -1, lf, sizeof lf, NULL, NULL))
+                lf[0] = 0;
+            if (!f)
+                why = "could not be opened";
+            else {
+                got = fread(buf, 1, sizeof buf, f);
+                fclose(f);
+                if (got < 16 || memcmp(buf, "BWRL", 4))
+                    why = "is not a launch file (no BWRL header)";
+                else {
+                    memcpy(&ver, buf + 4, 4);
+                    memcpy(&plen, buf + 8, 4);
+                    if (ver != 1)
+                        why = "has an unknown version";
+                    else if (plen >= sizeof path)
+                        why = "has a path longer than 260 bytes";
+                    else if (got < 16 + (size_t)plen)
+                        why = "is cut short";
+                    else {
+                        memcpy(&dlen, buf + 12 + plen, 4);
+                        want = 16 + (size_t)plen + dlen;
+                        if (dlen != 0 && dlen != 3072)
+                            why = "has a launch data length other than 0 or 3072";
+                        else if (got < want)
+                            why = "is cut short";
+                        else if (got > want)
+                            why = "is longer than its header says";
+                    }
+                }
+            }
+            if (!why) {
                 page = xbox_HeapAlloc(0x1000, 0x1000);
-            if (ok && page) {
+                if (!page)
+                    why = "could not be placed (no guest memory for the page)";
+            }
+            if (why) {
+                fprintf(stderr, "[BW] WARNING: the launch file %s %s (%u bytes read, %u expected); "
+                        "ignored, so this boot starts at the title\n", lf, why,
+                        (unsigned)got, (unsigned)want);
+                fflush(stderr);
+            } else {
+                memcpy(path, buf + 12, plen);
                 memset(mem + page, 0, 0x1000);
-                if (dlen && fread(mem + page + 0x400, 1, dlen, f) != dlen)
-                    ok = 0;
+                if (dlen)
+                    memcpy(mem + page + 0x400, buf + 16 + plen, dlen);
                 if (!_strnicmp(path, "D:\\", 3))
                     snprintf(dev, sizeof dev, "\\Device\\CdRom0;%s", path + 3);
                 else
@@ -659,11 +813,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                         *(uint32_t *)(mem + page + 0x400), *(uint32_t *)(mem + page + 0x404),
                         *(uint32_t *)(mem + page + 0x408));
             }
-            if (!ok || !page)
-                bw_fail("BW_LAUNCH_DATA_FILE could not be read or placed");
-            if (f)
-                fclose(f);
-            {
+            if (page) {
                 /* Launch data "SPLASH", then a dword: 1 boots gameplay
                  * (missions, battles, the attract demo; the level name at
                  * offset 600: "01".."28", "sm_...", "attract_01"), 0 the
@@ -678,7 +828,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 const char *e = getenv("BW_GAMEPLAY_30");
                 int gameplay = dlen && !memcmp(ld, "SPLASH", 6)
                                && *(const uint32_t *)(ld + 8) == 1;
-                bw_gameplay_boot = ok && page && gameplay;
+                bw_gameplay_boot = gameplay;
                 /* Every edition but Original: the high frame rate instead
                  * (src/bw_hifps_hooks.c, D-016): the game keeps its own 30 Hz
                  * step and the extra frames are interpolated, so the D-013
@@ -772,6 +922,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
 
+    /* BW_TEST_CRASHSTART=1: crash here, before the game's first instruction,
+     * as a crash inside the logo movies would (test switch for the play
+     * host's one retry, 0.2.5 item 51). Inert unless set. */
+    {
+        const char *e = getenv("BW_TEST_CRASHSTART");
+        if (e && e[0] == '1') {
+            fprintf(stderr, "[BW] BW_TEST_CRASHSTART=1: crashing on purpose (test switch)\n");
+            fflush(stderr);
+            *(volatile uint32_t *)(uintptr_t)8 = 0;
+        }
+    }
+
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");
     fflush(stdout);
@@ -790,11 +952,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
 /* ── XBE Loading ───────────────────────────────────────────── */
 
-static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
+static BOOL load_xbe(const wchar_t *path, void **out_data, size_t *out_size)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = _wfopen(path, L"rb");
     if (!f) {
-        fprintf(stderr, "Cannot open XBE: %s\n", path);
+        char p8[3 * MAX_PATH];
+        if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, p8, sizeof p8, NULL, NULL))
+            p8[0] = 0;
+        fprintf(stderr, "Cannot open XBE: %s (errno %d)\n", p8, errno);
         return FALSE;
     }
 

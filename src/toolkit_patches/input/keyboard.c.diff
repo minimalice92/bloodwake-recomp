@@ -1,0 +1,119 @@
+--- xboxrecomp/src/input/keyboard.c
++++ src/toolkit_patches/input/keyboard.c
+@@ -1,4 +1,15 @@
+ /*
++ * Blood Wake carried patch of xboxrecomp v0.16.0 src/input/keyboard.c (MIT
++ * License, Copyright (c) 2026 sp00nz -- see ../xboxrecomp/LICENSE). Built in
++ * place of the toolkit's copy by our CMakeLists.txt; keyboard.c.diff beside
++ * this file is the exact difference from the pinned original. Release 0.2.5,
++ * lane C3, item 76 (docs/025/C3.md): xbox_InputKeyboardConfigure
++ * (bw_input_ext.h) replaces the built-in map with the player's own bindings
++ * (src/bw_keys.c reads them from settings.ini [keys]) and adds a ramp and a
++ * strength for the steering keys. Never called: exactly the toolkit's
++ * behaviour. Suggested upstream as a toolkit change.
++ */
++/*
+  * The keyboard as a pad on port 0. See keyboard.h.
+  *
+  * A title that waits on PRESS START is unreachable on a machine with no
+@@ -18,6 +29,7 @@
+  */
+ #include "keyboard.h"
+ #include "input_map.h"
++#include "bw_input_ext.h"       /* Blood Wake: xbox_InputKeyboardConfigure */
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -161,6 +173,70 @@
+     }
+ }
+ 
++/* Blood Wake carried patch (item 76): the player's bindings, and the ramp and
++ * strength of the steering keys. Written once at start-up, before the game's
++ * first poll; read by the poll only. */
++static InputBindings s_bw_bindings;
++static volatile int  s_bw_configured;
++static int           s_bw_ramp_ms, s_bw_strength = 100;
++
++void xbox_InputKeyboardConfigure(const struct InputBindings *b, int ramp_ms, int strength_pct)
++{
++    if (ramp_ms < 0) ramp_ms = 0;
++    if (ramp_ms > 2000) ramp_ms = 2000;
++    if (strength_pct < 10) strength_pct = 10;
++    if (strength_pct > 100) strength_pct = 100;
++    s_bw_configured = 0;
++    if (b)
++        s_bw_bindings = *b;
++    s_bw_ramp_ms = ramp_ms;
++    s_bw_strength = strength_pct;
++    s_bw_configured = b ? 1 : 0;
++}
++
++#if defined(_WIN32)
++#include <windows.h>
++static double bw_now_ms(void)
++{
++    static LARGE_INTEGER f;
++    LARGE_INTEGER t;
++    if (!f.QuadPart)
++        QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&t);
++    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
++}
++#else
++#include <time.h>
++static double bw_now_ms(void)
++{
++    struct timespec ts;
++    timespec_get(&ts, TIME_UTC);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++#endif
++
++/* The steering keys (left stick left/right) after the strength and the ramp.
++ * `target` is what the keys say now (full turn, or 0). Releasing, or turning
++ * the other way, starts again from the centre at once; a held key then moves
++ * the stick towards its turn at full-turn-per-ramp_ms. */
++static SHORT bw_steer(SHORT target)
++{
++    static double value, last;
++    double now = bw_now_ms(), dt = last > 0.0 ? now - last : 0.0, t;
++    last = now;
++    t = (double)target * s_bw_strength / 100.0;
++    if (s_bw_ramp_ms <= 0 || t == 0.0 || (t > 0.0) != (value > 0.0))
++        value = s_bw_ramp_ms <= 0 ? t : 0.0;
++    if (s_bw_ramp_ms > 0 && t != 0.0) {
++        double step = 32767.0 * (dt > 100.0 ? 100.0 : dt) / s_bw_ramp_ms;
++        if (t > 0.0)
++            value = value + step > t ? t : value + step;
++        else
++            value = value - step < t ? t : value - step;
++    }
++    return (SHORT)(value >= 0.0 ? value + 0.5 : value - 0.5);
++}
++
+ void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
+ {
+     static DWORD packet;
+@@ -170,13 +246,20 @@
+     /* One snapshot of the table, so a poll sees one set of keys. */
+     for (int vk = 0; vk < INPUT_KEY_COUNT; vk++)
+         down[vk] = s_key_down[vk];
+-    xbox_InputKeyboardBindings(&b);
++    if (s_bw_configured)
++        b = s_bw_bindings;                 /* Blood Wake: the player's keys */
++    else
++        xbox_InputKeyboardBindings(&b);
+ 
+     memset(out, 0, sizeof *out);
+     /* Buttons set their bit, analog keys read 255 (a title that reads
+      * these as a pressure never sees a press if they are 1), stick keys
+      * are full deflection and opposite keys cancel. */
+     xbox_InputMap_KeysResolve(&b, down, &out->Gamepad);
++    /* Blood Wake: the steering ramp and strength; at 0 ms and 100% the stick
++     * is exactly what the keys resolved to. */
++    if (s_bw_configured && (s_bw_ramp_ms > 0 || s_bw_strength < 100))
++        out->Gamepad.sThumbLX = bw_steer(out->Gamepad.sThumbLX);
+ 
+     /* The title's input layer looks for button edges, so the packet number
+      * has to move whenever the state does or a press is never noticed. */

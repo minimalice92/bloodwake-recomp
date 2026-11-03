@@ -42,21 +42,25 @@
  *      only in that test (seen: a static walk of its 116 callees, and of the
  *      audio thread, the only other game thread running in play, finds no
  *      other read of it; tmp/T3_work/calltree.py).
- * 2. OCEAN_MIPALPHA_FIX (test switch, off by default, no launcher entry):
+ * 2. OCEAN_MIPALPHA_FIX (an original bug fixed: on by default in Remastered
+ *    since 2026-10-27, the maintainer's call; launcher Fixes, "Distant wake
+ *    foam": As shipped / Fixed / Smooth):
  *    Ocean_MergeFrameAlpha 0x38210 (the tail of Ocean_Init) writes each wake
  *    mask into the alpha of its ocean frame for levels 0-6, walking the
  *    swizzled level-0 mask with a stride and row skip written for a linear
  *    image, so levels 1-6 get a scrambled mask (seen in the code; docs/remaster
- *    texture_matching.md section 2). With the switch the body runs unchanged,
+ *    texture_matching.md section 2). With the fix the body runs unchanged,
  *    then levels 1-6 of each frame's alpha are written again from its own
  *    level-0 alpha (which the body left correct), properly down-sampled:
- *      BW_OCEAN_MIPALPHA_FIX=1 (or BW_FIX=+OCEAN_MIPALPHA_FIX): the texel at
- *          the top-left of each block, the developers' own sampling (the
+ *      BW_OCEAN_MIPALPHA_FIX=1 (the default while the fix is on): the texel
+ *          at the top-left of each block, the developers' own sampling (the
  *          stride and row skip read every 2^L-th texel of every 2^L-th row of
  *          a linear image), done in swizzled order;
- *      BW_OCEAN_MIPALPHA_FIX=2: the average of each block (a box filter; ours).
- *    A look test, not a fix: Original keeps the scramble, and so
- *    does Remastered unless the switch is set.
+ *      BW_OCEAN_MIPALPHA_FIX=2: the average of each block (a box filter; ours);
+ *      BW_OCEAN_MIPALPHA_FIX=0: off, the shipped mips (as BW_FIX=-OCEAN_MIPALPHA_FIX).
+ *    Unset (or any other value) follows the registry. The registry is the
+ *    master switch: with the fix off (BW_FIX, or the hook check) no value
+ *    turns it on. Original keeps the scramble.
  *
  * SPLIT_FULL_DETAIL's sea, BW_SPLIT_WATER (the launcher's "Split-screen
  * sea"): full (default since the native ocean, P2a: the one-player sea in
@@ -85,14 +89,7 @@
 #include <string.h>
 
 #include "bw_edition.h"
-
-typedef void (*recomp_func_t)(void);
-extern recomp_func_t recomp_lookup(uint32_t xbox_va);
-extern ptrdiff_t g_xbox_mem_offset;
-/* The guest registers are thread-local in the runtime (TOOLKIT_ISSUES TK-7). */
-extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern __declspec(thread) uint32_t g_ebx, g_esi, g_edi, g_ebp;
-extern __declspec(thread) uint32_t g_seh_ebp, g_eflags;
+#include "bw_guestcall.h"   /* the guest registers, recomp_lookup, calling the game (item 71) */
 
 #define V_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define V_MEM16(va) (*(volatile uint16_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
@@ -312,46 +309,15 @@ void sub_00026090(void)
 #define WATER_FRAMES      30u
 #define WATER_REC         0x38u
 
-typedef struct {
-    uint32_t eax, ecx, edx, ebx, esi, edi, ebp, seh_ebp, eflags;
-} v_regs_t;
+/* Calling a game function: bw_guestcall.h (shared with bw_fix_hooks.c;
+ * item 71). */
+typedef bw_gregs_t v_regs_t;
+#define v_save    bw_gregs_save
+#define v_restore bw_gregs_restore
 
-static void v_save(v_regs_t *r)
-{
-    r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx; r->ebx = g_ebx;
-    r->esi = g_esi; r->edi = g_edi; r->ebp = g_ebp; r->seh_ebp = g_seh_ebp;
-    r->eflags = g_eflags;
-}
-
-static void v_restore(const v_regs_t *r)
-{
-    g_eax = r->eax; g_ecx = r->ecx; g_edx = r->edx; g_ebx = r->ebx;
-    g_esi = r->esi; g_edi = r->edi; g_ebp = r->ebp; g_seh_ebp = r->seh_ebp;
-    g_eflags = r->eflags;
-}
-
-/* Call a game function (as bw_fix_hooks.c's f_call): push the arguments and a
- * return address nobody reads, set ecx, run the body, put esp back. */
 static uint32_t v_call(uint32_t va, uint32_t this_ptr, int nargs, const uint32_t *args)
 {
-    recomp_func_t fn = recomp_lookup(va);
-    uint32_t sp0 = g_esp;
-    int i;
-    if (!fn) {
-        fprintf(stderr, "[T3] no translated function at 0x%08X\n", va);
-        fflush(stderr);
-        return 0;
-    }
-    for (i = nargs - 1; i >= 0; i--) {
-        g_esp -= 4;
-        V_MEM32(g_esp) = args[i];
-    }
-    g_esp -= 4;
-    V_MEM32(g_esp) = 0;
-    g_ecx = this_ptr;
-    fn();
-    g_esp = sp0;
-    return g_eax;
+    return bw_guest_call("[T3]", va, this_ptr, nargs, args);
 }
 
 /* pBits of one level, or 0. The D3DLOCKED_RECT goes on the guest stack below
@@ -498,14 +464,19 @@ static void mipalpha_rebuild(int mode)
     fflush(stderr);
 }
 
+/* 0 off, 1 the developers' sampling, 2 the box average (see the header).
+ * Item 66 (MR2 #6): an explicit 0 used to fall back to the registry, so
+ * "=0" still gave the fixed mips; and 1 or 2 turned it on even with the fix
+ * off. */
 static int mipalpha_mode(void)
 {
     static int s = -1;
     if (s < 0) {
-        int m = env_int("BW_OCEAN_MIPALPHA_FIX", 0);
-        if (m != 1 && m != 2)
-            m = bw_fix_enabled(BW_FIX_OCEAN_MIPALPHA_FIX) ? 1 : 0;
-        s = bw_edition_at_least(BW_ED_REMASTERED) ? m : 0;
+        int m = env_int("BW_OCEAN_MIPALPHA_FIX", -1);
+        if (m != 0 && m != 1 && m != 2)
+            m = 1;
+        s = bw_edition_at_least(BW_ED_REMASTERED) && bw_fix_enabled(BW_FIX_OCEAN_MIPALPHA_FIX)
+            ? m : 0;
     }
     return s;
 }

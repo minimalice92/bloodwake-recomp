@@ -34,7 +34,15 @@ void bw_settings_apply(void);
 /* The table as JSON (bloodwake.exe --settings-schema), for the launcher. */
 void bw_settings_print_schema(FILE *f);
 
-/* The settings file's path (BW_SETTINGS or the default); NULL for none. */
+/* The settings file's path (BW_SETTINGS or the default); NULL for none.
+ * In UTF-8 (item 18), so a user name like "Zoë" or one outside the ANSI code
+ * page survives: open it with bw_settings_path_w(), or convert it to wide
+ * first, never with the ANSI fopen. Logs can print it as it is. */
 const char *bw_settings_path(void);
+
+/* The same path, wide (for _wfopen, CreateFileW and the like); NULL for
+ * none. Its folder also holds start_state.ini (docs/025/CONTRACTS.md, 4). */
+#include <wchar.h>
+const wchar_t *bw_settings_path_w(void);
 
 #endif

@@ -1,4 +1,11 @@
 /*
+ * Blood Wake carried patch of xboxrecomp v0.16.0 src/usb/usb_gamepad.c (MIT
+ * License, Copyright (c) 2026 sp00nz -- see ../xboxrecomp/LICENSE); the .diff
+ * beside this file is the exact change. Two additions: '!' live pad lines
+ * (tools/bw_autopilot2.py), and bw_pad_pulse (release 0.2.5, item 79: the
+ * menus' mouse presses a player's own pad for a moment; bw_input_ext.h).
+ */
+/*
  * usb_gamepad.c -- an Xbox controller, as the console's USB stack expects it.
  *
  * Descriptors and the input report, from the USB 2.0 specification for the
@@ -220,6 +227,7 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
 /* The host's own pad, through the layer that already maps one to XInput.
  * A real controller plugged into the PC drives this emulated one. */
 #include "../input/xinput_xbox.h"
+#include "../input/bw_input_ext.h"   /* Blood Wake: bw_pad_pulse */
 
 /*
  * The Xbox report is 20 bytes and fixed:
@@ -583,6 +591,46 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+/* Blood Wake carried patch (0.2.5 item 79): a short press on a pad, for the
+ * menus' mouse on the screens that read a player's own pad rather than the
+ * front end's merged one (boat select; src/bw_menu_hooks.c). For `ms` from
+ * now the pad's reports also carry these digital bits, analog buttons (bit n
+ * = report byte 4 + n, fully pressed) and left-stick deflection (non-zero
+ * wins). bw_input_ext.h declares it. */
+static volatile LONG s_pulse_until[USB_GAMEPAD_MAX], s_pulse_dig[USB_GAMEPAD_MAX];
+static volatile LONG s_pulse_ana[USB_GAMEPAD_MAX], s_pulse_lx[USB_GAMEPAD_MAX], s_pulse_ly[USB_GAMEPAD_MAX];
+
+void bw_pad_pulse(int pad, int lx, int ly, unsigned digital, unsigned analog, unsigned ms)
+{
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    InterlockedExchange(&s_pulse_dig[pad], (LONG)digital);
+    InterlockedExchange(&s_pulse_ana[pad], (LONG)analog);
+    InterlockedExchange(&s_pulse_lx[pad], lx);
+    InterlockedExchange(&s_pulse_ly[pad], ly);
+    InterlockedExchange(&s_pulse_until[pad], (LONG)(GetTickCount() + ms));
+}
+
+static void pad_pulse_apply(int pad, uint8_t *out)
+{
+    int j;
+    int16_t ax;
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX || (LONG)(GetTickCount() - (DWORD)s_pulse_until[pad]) >= 0)
+        return;
+    out[2] |= (uint8_t)s_pulse_dig[pad];
+    for (j = 0; j < 8; j++)
+        if (s_pulse_ana[pad] & (1 << j))
+            out[4 + j] = 0xFF;
+    if (s_pulse_lx[pad]) {
+        ax = (int16_t)s_pulse_lx[pad];
+        memcpy(&out[12], &ax, 2);
+    }
+    if (s_pulse_ly[pad]) {
+        ax = (int16_t)s_pulse_ly[pad];
+        memcpy(&out[14], &ax, 2);
+    }
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -638,6 +686,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        pad_pulse_apply(pad, out);          /* Blood Wake (item 79) */
         return 20;
     }
 
@@ -655,5 +704,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    pad_pulse_apply(pad, out);              /* Blood Wake (item 79) */
     return 20;
 }

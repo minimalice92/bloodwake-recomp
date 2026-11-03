@@ -8,8 +8,10 @@
  * Blood Wake carried patch (D-016 Remastered surround, docs/day1/D2.md part
  * 3): the source voice carries 6 channels (5.1: FL FR FC LFE BL BR) when
  * bw_surround_output_wanted() says so for the device found; otherwise it is
- * as before (2 channels into a 2-channel mastering voice). The original file
- * is xboxrecomp/src/apu/apu_xaudio2.c (sha256 guarded in CMakeLists.txt).
+ * as before (2 channels into a 2-channel mastering voice). And (0.2.5 item
+ * 68) a lost or changed audio device is rebuilt on the default one: see
+ * xa2_check_device. The original file is xboxrecomp/src/apu/apu_xaudio2.c
+ * (sha256 guarded in CMakeLists.txt).
  */
 
 #include <stdint.h>
@@ -25,6 +27,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <xaudio2.h>
+#include <mmdeviceapi.h>     /* Blood Wake (item 68): the default-device notice */
 
 #pragma comment(lib, "xaudio2.lib")
 #pragma comment(lib, "ole32.lib")
@@ -76,32 +79,122 @@ static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 
-int xa2_init(void)
+/* ---- Blood Wake (0.2.5 item 68): a lost or changed audio device ----------
+ *
+ * Unplugging headphones, a Bluetooth headset switching off, or a new default
+ * device left the game silent until its next reboot: XAudio2 reports a
+ * critical error and its voice stops consuming, and the APU then paced by
+ * the host clock and dropped every period (apu_core.c, "A device that stops
+ * consuming for good"). Now the engine's OnCriticalError and Windows'
+ * default-device notice (IMMNotificationClient, render/console) only set a
+ * flag; the APU frame thread, which makes every other xa2_* call, sees it at
+ * its next submit and rebuilds XAudio2 and its voices on the default device,
+ * with the channel layout the game was told at boot (the game can't be told
+ * a new one mid-boot; XAudio2 maps 5.1 or stereo onto any device). The DSPs,
+ * voices and mix state are the APU's and are untouched; what was queued on
+ * the old device (at most XA2_NUM_BUFS buffers) is lost. If no device is
+ * there, it tries again when Windows announces a new default device (or
+ * every 5 s), silently in between.
+ *
+ * Test switches (any edition; never in a preset):
+ *   BW_TEST_AUDIO_LOST=<ms>[,<ms>...]  at those times after init, behave as if
+ *       the device were lost: the voice stops consuming and the flag is set,
+ *       as OnCriticalError would
+ *   BW_AUDIO_REBUILD=0  no rebuild (the old behaviour, for comparing) */
+static volatile LONG g_xa2_lost;       /* 0, or why: 1 critical error, 2 new default device, 3 test */
+static volatile LONG g_xa2_lost_hr;
+static uint64_t  g_xa2_played_base;   /* samples the voices before the last rebuild played */
+static unsigned  g_xa2_rebuilds;
+static ULONGLONG g_xa2_t0, g_xa2_retry_at, g_xa2_rebuilt_at;
+static int       g_xa2_waiting;       /* no device after a loss: retrying */
+static unsigned  g_xa2_quiet_events;  /* default-device notices while waiting */
+
+static void STDMETHODCALLTYPE ecb_pass_start(IXAudio2EngineCallback *t) { (void)t; }
+static void STDMETHODCALLTYPE ecb_pass_end(IXAudio2EngineCallback *t) { (void)t; }
+static void STDMETHODCALLTYPE ecb_critical(IXAudio2EngineCallback *t, HRESULT err)
+{
+    (void)t;
+    InterlockedExchange(&g_xa2_lost_hr, (LONG)err);
+    InterlockedExchange(&g_xa2_lost, 1);
+}
+static IXAudio2EngineCallbackVtbl s_ecb_vtbl = { ecb_pass_start, ecb_pass_end, ecb_critical };
+static IXAudio2EngineCallback s_ecb = { &s_ecb_vtbl };
+
+static const GUID k_iid_unknown = { 0x00000000, 0x0000, 0x0000,
+                                    { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+static const GUID k_clsid_mmde  = { 0xBCDE0395, 0xE52F, 0x467C,
+                                    { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+static const GUID k_iid_mmde    = { 0xA95664D2, 0x9614, 0x4F35,
+                                    { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+static const GUID k_iid_mmnc    = { 0x7991EEC9, 0x7E89, 0x4D85,
+                                    { 0x83, 0x90, 0x6C, 0x70, 0x3C, 0xEC, 0x60, 0xC0 } };
+
+static HRESULT STDMETHODCALLTYPE nc_qi(IMMNotificationClient *t, REFIID riid, void **ppv)
+{
+    if (IsEqualGUID(riid, &k_iid_unknown) || IsEqualGUID(riid, &k_iid_mmnc)) {
+        *ppv = t;
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE nc_addref(IMMNotificationClient *t) { (void)t; return 1; }
+static ULONG STDMETHODCALLTYPE nc_release(IMMNotificationClient *t) { (void)t; return 1; }
+static HRESULT STDMETHODCALLTYPE nc_state(IMMNotificationClient *t, LPCWSTR id, DWORD s)
+{ (void)t; (void)id; (void)s; return S_OK; }
+static HRESULT STDMETHODCALLTYPE nc_added(IMMNotificationClient *t, LPCWSTR id)
+{ (void)t; (void)id; return S_OK; }
+static HRESULT STDMETHODCALLTYPE nc_removed(IMMNotificationClient *t, LPCWSTR id)
+{ (void)t; (void)id; return S_OK; }
+static HRESULT STDMETHODCALLTYPE nc_default(IMMNotificationClient *t, EDataFlow flow, ERole role,
+                                            LPCWSTR id)
+{
+    (void)t; (void)id;
+    if (flow == eRender && role == eConsole)
+        InterlockedCompareExchange(&g_xa2_lost, 2, 0);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE nc_prop(IMMNotificationClient *t, LPCWSTR id, const PROPERTYKEY k)
+{ (void)t; (void)id; (void)k; return S_OK; }
+static IMMNotificationClientVtbl s_nc_vtbl = { nc_qi, nc_addref, nc_release, nc_state, nc_added,
+                                               nc_removed, nc_default, nc_prop };
+static IMMNotificationClient s_nc = { &s_nc_vtbl };
+static IMMDeviceEnumerator *s_mmde;
+
+/* Destroy the voices and the engine (the COM state stays). */
+static void xa2_release(void)
+{
+    if (g_xa2_source) {
+        IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+        IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
+        g_xa2_source->lpVtbl->DestroyVoice(g_xa2_source);
+        g_xa2_source = NULL;
+    }
+    if (g_xa2_master) {
+        g_xa2_master->lpVtbl->DestroyVoice(g_xa2_master);
+        g_xa2_master = NULL;
+    }
+    if (g_xa2) {
+        IXAudio2_Release(g_xa2);
+        g_xa2 = NULL;
+    }
+}
+
+/* The engine, a mastering voice on the default device, and the source voice,
+ * started. At boot it also decides the layout (5.1 or stereo); a rebuild
+ * keeps it. quiet: no failure lines (retries while no device is there). */
+static HRESULT xa2_open(int boot, int quiet)
 {
     HRESULT hr;
-    int com_initialized;
     WAVEFORMATEX wfx = { 0 };
-
-    if (g_xa2_initialized) return 1;
-
-    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
-                                    XA2_BUF_SAMPLES_DEFAULT,
-                                    XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
-    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
-                                 XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
-
-    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-        fprintf(stderr, "[XA2] CoInitializeEx failed: 0x%08lX\n", hr);
-        return 0;
-    }
-    com_initialized = SUCCEEDED(hr);
 
     hr = XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
     if (FAILED(hr) || !g_xa2) {
-        fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
-        goto fail;
+        if (!quiet)
+            fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
+        return FAILED(hr) ? hr : E_FAIL;
     }
+    IXAudio2_RegisterForCallbacks(g_xa2, &s_ecb);
 
     /* Blood Wake: the device's own channel count decides whether a 5.1
      * source voice is wanted; without one, a 2-channel mastering voice as
@@ -115,7 +208,8 @@ int xa2_init(void)
             g_xa2_master->lpVtbl->GetVoiceDetails(g_xa2_master, &det);
             dev_ch = (int)det.InputChannels;
         }
-        g_xa2_channels = bw_surround_output_wanted(dev_ch) ? 6 : 2;
+        if (boot)
+            g_xa2_channels = bw_surround_output_wanted(dev_ch) ? 6 : 2;
         if (g_xa2_master && (FAILED(hr) || (g_xa2_channels == 2 && dev_ch != 2))) {
             g_xa2_master->lpVtbl->DestroyVoice(g_xa2_master);
             g_xa2_master = NULL;
@@ -123,12 +217,14 @@ int xa2_init(void)
         if (!g_xa2_master)
             hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
                 2, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
-        fprintf(stderr, "[XA2] the audio device has %d channels; output: %s\n", dev_ch,
-                g_xa2_channels == 6 ? "5.1 (6 channels)" : "stereo");
+        if (boot || SUCCEEDED(hr))
+            fprintf(stderr, "[XA2] the audio device has %d channels; output: %s\n", dev_ch,
+                    g_xa2_channels == 6 ? "5.1 (6 channels)" : "stereo");
     }
     if (FAILED(hr)) {
-        fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
-        goto fail;
+        if (!quiet)
+            fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
+        return hr;
     }
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
@@ -158,14 +254,176 @@ int xa2_init(void)
             &wfx, 0, XAUDIO2_DEFAULT_FREQ_RATIO, NULL, NULL, NULL);
     }
     if (FAILED(hr)) {
-        fprintf(stderr, "[XA2] CreateSourceVoice failed: 0x%08lX\n", hr);
-        goto fail;
+        if (!quiet)
+            fprintf(stderr, "[XA2] CreateSourceVoice failed: 0x%08lX\n", hr);
+        return hr;
     }
 
     hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
     if (FAILED(hr)) {
-        fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
-        goto fail;
+        if (!quiet)
+            fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
+        return hr;
+    }
+    return S_OK;
+}
+
+/* BW_TEST_AUDIO_LOST: the next test time (ms after init) due, or 0. */
+static ULONGLONG test_lost_due(ULONGLONG since)
+{
+    static int parsed;
+    static ULONGLONG at[8];
+    static int n, next;
+    if (!parsed) {
+        const char *e = getenv("BW_TEST_AUDIO_LOST");
+        parsed = 1;
+        while (e && *e && n < 8) {
+            char *end;
+            unsigned long v = strtoul(e, &end, 10);
+            if (end == e)
+                break;
+            at[n++] = v;
+            e = end;
+            while (*e == ',' || *e == ' ')
+                e++;
+        }
+    }
+    if (next < n && since >= at[next])
+        return at[next++];
+    return 0;
+}
+
+/* The APU frame thread, before each submit: a lost or changed device is
+ * rebuilt here (see above). */
+static void xa2_check_device(void)
+{
+    ULONGLONG now = GetTickCount64(), t;
+    LONG why;
+    LARGE_INTEGER f, q0, q1;
+    HRESULT hr;
+    static const char *const k_why[] = { "", "XAudio2 reported a critical error",
+                                         "Windows has a new default audio device",
+                                         "test switch BW_TEST_AUDIO_LOST" };
+
+    if ((t = test_lost_due(now - g_xa2_t0)) != 0) {
+        if (g_xa2_source)
+            IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+        fprintf(stderr, "[XA2] test: the audio device is lost at %llu ms (the voice stops "
+                "consuming)\n", (unsigned long long)t);
+        InterlockedExchange(&g_xa2_lost, 3);
+    }
+    if (g_xa2_rebuilt_at && now - g_xa2_rebuilt_at >= 1000 && g_xa2_source) {
+        XAUDIO2_VOICE_STATE st;
+        IXAudio2SourceVoice_GetState(g_xa2_source, &st, 0);
+        fprintf(stderr, "[XA2] one second after the rebuild the new device has played %llu "
+                "samples (%.0f ms of sound)\n", (unsigned long long)st.SamplesPlayed,
+                st.SamplesPlayed / 48.0);
+        g_xa2_rebuilt_at = 0;
+    }
+    if (!g_xa2_lost && !(g_xa2_waiting && now >= g_xa2_retry_at))
+        return;
+    why = InterlockedExchange(&g_xa2_lost, 0);
+    if (why) {
+        const char *e = getenv("BW_AUDIO_REBUILD");
+        if (g_xa2_waiting && why == 2)
+            g_xa2_quiet_events++;        /* while no device: counted, said once when it's back */
+        else
+            fprintf(stderr, "[XA2] the audio device is gone or changed: %s\n", k_why[why < 4 ? why : 0]);
+        if (why == 1)
+            fprintf(stderr, "[XA2] (the error: 0x%08lX)\n", (unsigned long)g_xa2_lost_hr);
+        if (e && *e == '0') {
+            fprintf(stderr, "[XA2] no rebuild (BW_AUDIO_REBUILD=0): silent until the next boot\n");
+            return;
+        }
+    }
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q0);
+    if (g_xa2_source) {
+        XAUDIO2_VOICE_STATE st;
+        IXAudio2SourceVoice_GetState(g_xa2_source, &st, 0);
+        g_xa2_played_base += st.SamplesPlayed;
+    }
+    xa2_release();
+    {
+        static int com;
+        if (!com++) {
+            HRESULT c = CoInitializeEx(NULL, COINIT_MULTITHREADED);   /* this thread's, once */
+            (void)c;
+        }
+    }
+    hr = xa2_open(0, g_xa2_waiting);
+    g_xa2_next_buf = 0;
+    g_xa2_fill = 0;
+    g_xa2_dry = 1;                       /* the empty new voice is not an underrun */
+    if (FAILED(hr)) {
+        xa2_release();
+        QueryPerformanceCounter(&q1);
+        if (!g_xa2_waiting)
+            fprintf(stderr, "[XA2] no audio device (0x%08lX, %.1f ms to find out): the game runs "
+                    "silent and tries again when Windows has a device (or every 5 s)\n", hr,
+                    (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)f.QuadPart);
+        g_xa2_waiting = 1;
+        g_xa2_retry_at = now + 5000;     /* Windows' notice usually comes first */
+        return;
+    }
+    QueryPerformanceCounter(&q1);
+    if (g_xa2_quiet_events)
+        fprintf(stderr, "[XA2] (Windows changed its default device %u more times while there was "
+                "none)\n", g_xa2_quiet_events);
+    g_xa2_quiet_events = 0;
+    g_xa2_waiting = 0;
+    g_xa2_rebuilds++;
+    g_xa2_rebuilt_at = now;
+    fprintf(stderr, "[XA2] rebuilt on the default audio device in %.1f ms (rebuild %u; %s, as "
+            "the game was told at boot); sound goes on\n",
+            (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)f.QuadPart, g_xa2_rebuilds,
+            g_xa2_channels == 6 ? "5.1" : "stereo");
+}
+
+int xa2_init(void)
+{
+    HRESULT hr;
+    int com_initialized;
+
+    if (g_xa2_initialized) return 1;
+
+    g_xa2_buf_samples = xa2_env_int("RECOMP_AUDIO_BUF_SAMPLES",
+                                    XA2_BUF_SAMPLES_DEFAULT,
+                                    XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
+    g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
+                                 XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
+
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        fprintf(stderr, "[XA2] CoInitializeEx failed: 0x%08lX\n", hr);
+        return 0;
+    }
+    com_initialized = SUCCEEDED(hr);
+
+    hr = xa2_open(1, 0);
+    if (FAILED(hr)) {
+        /* Blood Wake (item 68): XAudio2 works but Windows has no audio
+         * device (none plugged in, or the default one just went away): start
+         * silent and wait for one, as after a loss, instead of the waveOut
+         * fallback (which has no device either) and a silent boot. */
+        if (g_xa2 && (hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                      || hr == XAUDIO2_E_DEVICE_INVALIDATED)) {
+            xa2_release();
+            g_xa2_waiting = 1;
+            g_xa2_retry_at = GetTickCount64() + 5000;
+            fprintf(stderr, "[XA2] no audio device at start (0x%08lX): the game starts silent and "
+                    "its sound comes on when Windows has a device\n", hr);
+        } else {
+            goto fail;
+        }
+    }
+
+    /* Blood Wake (item 68): hear about a new default device. Without the
+     * enumerator, only the engine's own critical error is heard. */
+    if (SUCCEEDED(CoCreateInstance(&k_clsid_mmde, NULL, CLSCTX_ALL, &k_iid_mmde, (void **)&s_mmde))
+        && FAILED(IMMDeviceEnumerator_RegisterEndpointNotificationCallback(s_mmde, &s_nc))) {
+        IMMDeviceEnumerator_Release(s_mmde);
+        s_mmde = NULL;
     }
 
     g_xa2_next_buf = 0;
@@ -173,6 +431,7 @@ int xa2_init(void)
     g_xa2_dry = 0;
     g_xa2_initialized = 1;
     g_xa2_frames_written = 0;
+    g_xa2_t0 = GetTickCount64();
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
             XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
@@ -188,20 +447,12 @@ fail:
 
 void xa2_shutdown(void)
 {
-    if (g_xa2_source) {
-        IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
-        IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
-        g_xa2_source->lpVtbl->DestroyVoice(g_xa2_source);
-        g_xa2_source = NULL;
+    if (s_mmde) {
+        IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(s_mmde, &s_nc);
+        IMMDeviceEnumerator_Release(s_mmde);
+        s_mmde = NULL;
     }
-    if (g_xa2_master) {
-        g_xa2_master->lpVtbl->DestroyVoice(g_xa2_master);
-        g_xa2_master = NULL;
-    }
-    if (g_xa2) {
-        IXAudio2_Release(g_xa2);
-        g_xa2 = NULL;
-    }
+    xa2_release();
 
     if (g_xa2_initialized)
         fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
@@ -226,7 +477,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     int idx, n, ok = 1;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!g_xa2_initialized) return 0;
+    xa2_check_device();                  /* Blood Wake (item 68) */
+    if (!g_xa2_source) return 0;
 
     while (num_samples > 0) {
         idx = g_xa2_next_buf;
@@ -313,13 +566,16 @@ unsigned xa2_underruns(void)
     return g_xa2_underruns;
 }
 
+/* Blood Wake (item 68): counted across rebuilds, so the APU's clock and its
+ * starve accounting see one device. */
 uint64_t xa2_samples_played(void)
 {
     XAUDIO2_VOICE_STATE state;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!g_xa2_initialized) return 0;
+    if (!g_xa2_source) return g_xa2_played_base;
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
-    return state.SamplesPlayed;
+    return g_xa2_played_base + state.SamplesPlayed;
 }
 
 #else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */

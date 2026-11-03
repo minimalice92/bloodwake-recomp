@@ -36,12 +36,12 @@ Applies to: Remastered. Default: **Best Quality**.
 
 Play in a window, or fill the whole screen without a border (Alt+Enter or F11 switches while you play).
 
-Applies to: Original and Remastered. Default: **Window**.
+Applies to: Original and Remastered. Default: **Fullscreen (borderless)**.
 
 | Choice | Under the hood |
 |---|---|
-| Window (default) | (no switch) |
-| Fullscreen (borderless) | `env:RECOMP_FULLSCREEN=1` |
+| Window | (no switch) |
+| Fullscreen (borderless) (default) | `env:RECOMP_FULLSCREEN=1` |
 
 ### Window size
 
@@ -260,16 +260,27 @@ Applies to: Remastered. Default: **On**.
 | On (default) | `fix:+VFX_TEX_RESTORE` |
 | Off | `fix:-VFX_TEX_RESTORE` |
 
-### HDR
+### Automatic HDR
 
-Brighter highlights on an HDR screen. Needs HDR turned on in Windows.
+Plays in HDR on screens that support it: Blood Wake switches Windows HDR on while you play and back afterwards, and maps the picture from the screen's own data by the ITU's standards. Off by default.
 
 Applies to: Remastered. Default: **Off**.
 
 | Choice | Under the hood |
 |---|---|
-| On | `fix:+VFX_HDR` |
-| Off (default) | `fix:-VFX_HDR` |
+| On | `env:BW_VFX_HDR=auto` |
+| Off (default) | `fix:-VFX_HDR;env:BW_VFX_HDR=off` |
+
+### Colour
+
+Wide stretches the game's colours onto the P3 colour range of wide-gamut screens: more vivid reds, greens and blues; white and greys don't change. Only on a screen in HDR mode. Accurate shows the colours exactly as made.
+
+Applies to: Remastered. Default: **Accurate (BT.709)**.
+
+| Choice | Under the hood |
+|---|---|
+| Accurate (BT.709) (default) | `env:BW_VFX_GAMUT=bt709` |
+| Wide (P3 stretch) | `env:BW_VFX_GAMUT=p3stretch` |
 
 ### OLED care
 
@@ -529,15 +540,37 @@ Applies to: Remastered. Default: **On**.
 | On (default) | `fix:+OCEAN_REFLECT_SINGLE` |
 | As shipped | `fix:-OCEAN_REFLECT_SINGLE` |
 
+### Game Demos → Quit Game
+
+The main menu's Game Demos sign starts the console's demo disc, which a PC can't run (it only goes back to the title). On, the sign reads Quit Game and closes the game, as closing the window does.
+
+Applies to: Remastered. Default: **On**.
+
+| Choice | Under the hood |
+|---|---|
+| On (default) | `fix:+MENU_QUIT` |
+| Off | `fix:-MENU_QUIT` |
+
+### Mouse in the menus
+
+Use the mouse in the game's menus: in the main menu and the options menu, point at an item to highlight it and click to choose it; everywhere in the menus a right click goes back and the wheel moves up and down. The pointer hides while you play.
+
+Applies to: Remastered. Default: **On**.
+
+| Choice | Under the hood |
+|---|---|
+| On (default) | `fix:+MENU_MOUSE` |
+| Off | `fix:-MENU_MOUSE` |
+
 ## Controls
 
 ### Keyboard as a controller
 
-Lets the keyboard act as controller 1 as well as any pad.
+Lets the keyboard act as controller 1 together with any pad: a connected controller keeps working as well. Keys only count while the game's window has the focus.
 
-Applies to: Original and Remastered. Default: **Off**.
+Applies to: Original and Remastered. Default: **On**.
 
 | Choice | Under the hood |
 |---|---|
-| Off (default) | (no switch) |
-| On | `env:RECOMP_KEYBOARD=1` |
+| Off | (no switch) |
+| On (default) | `env:RECOMP_KEYBOARD=1` |

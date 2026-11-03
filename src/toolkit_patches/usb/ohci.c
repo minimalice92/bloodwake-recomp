@@ -1,7 +1,10 @@
 /*
  * Blood Wake carried patch of xboxrecomp v0.16.0 src/usb/ohci.c (MIT License,
  * Copyright (c) 2026 sp00nz -- see ../xboxrecomp/LICENSE). Built in place of the
- * toolkit's copy by our CMakeLists.txt; the only change is bus_resolve (TK-13).
+ * toolkit's copy by our CMakeLists.txt. Changes: bus_resolve (TK-13); and in
+ * release 0.2.5 (lane C3, docs/025/C3.md) RECOMP_USB_PADS=auto (as many pads
+ * as Windows has controllers, counted at each boot, and a controller that
+ * connects later joins) and every motor off at boot start (items 73, 74).
  * ohci.c.diff beside this file is the exact difference from the pinned original.
  */
 /*
@@ -19,6 +22,7 @@
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
 #include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
+#include "../input/bw_input_ext.h"  /* Blood Wake: controller count, rumble off (0.2.5) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -188,6 +192,8 @@ static int s_device_hc;
  * 1-4). Which slot XAPI gives a pad is decided by its port: see OHCI_PORTS. */
 static unsigned s_ndp = OHCI_PORTS;
 static int s_npads = 1;          /* RECOMP_USB_PADS */
+static int s_auto_pads;          /* Blood Wake: RECOMP_USB_PADS=auto (item 73) */
+static unsigned s_auto_tick;
 static int s_enabled;
 static int s_trace;
 
@@ -1139,6 +1145,25 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             fflush(stderr);
         }
 
+        /* Blood Wake carried patch (0.2.5 item 73): with RECOMP_USB_PADS=auto,
+         * a controller connected after the boot started joins too: once a
+         * second the count is checked, and a new one is plugged in on the
+         * next port like the ones at the start (the game's own device-change
+         * handling then sees it arrive, as on a console). Never fewer: a
+         * controller that goes away leaves its port in place, reading
+         * nothing pressed, until one connects again. */
+        if (plugged && s_auto_pads && s_npads < USB_GAMEPAD_MAX
+            && ++s_auto_tick >= 50) {          /* ~1 s */
+            int now = xbox_InputConnectedCount();
+            s_auto_tick = 0;
+            if (now > s_npads) {
+                fprintf(stderr, "  [OHCI0] RECOMP_USB_PADS=auto: %d controllers connected now; "
+                        "%d more joining%c", now, now - s_npads, 10);
+                fflush(stderr);
+                s_npads = now;
+            }
+        }
+
         /* More pads, one at a time: each arrives after the previous one is
          * configured, on the next port, so the driver enumerates them in
          * turn and there is only ever one device at the default address.
@@ -1367,10 +1392,23 @@ void xbox_OhciInit(void)
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
         }
-        if (padspec) {
+        if (padspec && !_stricmp(padspec, "auto")) {
+            /* Blood Wake carried patch (0.2.5 item 73): as many pads as
+             * Windows has controllers now, at least one (the keyboard's), so
+             * every boot counts again; tools/play.py sets it. */
+            int n = xbox_InputConnectedCount();
+            s_auto_pads = 1;
+            s_npads = n < 1 ? 1 : (n > USB_GAMEPAD_MAX ? USB_GAMEPAD_MAX : n);
+            fprintf(stderr, "  OHCI: RECOMP_USB_PADS=auto: %d controller(s) connected, "
+                    "%d pad(s) on the bus\n", n, s_npads);
+        } else if (padspec) {
             int n = atoi(padspec);
             if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
         }
+        /* Blood Wake carried patch (0.2.5 item 74): a boot that ended with a
+         * pad rumbling (a reboot in the middle of an explosion, a crash)
+         * leaves it on; each boot starts with every motor off. */
+        xbox_InputRumbleAllOff("boot start");
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }

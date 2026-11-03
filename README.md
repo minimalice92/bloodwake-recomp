@@ -65,7 +65,7 @@ Every setting: [docs/SETTINGS.md](docs/SETTINGS.md). Both editions in full: [doc
 ## Getting started
 ### What you need
 - **Windows 10 or 11, 64-bit**, and a graphics card with DirectX 11.
-- **Your own Blood Wake disc**, copied to your PC as a folder of its files, an Xbox ISO (XISO) or a full disc image. Only the retail release in [`fingerprints/retail.json`](fingerprints/retail.json) is accepted.
+- **Your own Blood Wake disc**, copied to your PC as a folder of its files, an Xbox ISO (XISO) or a full disc image. Setup recognises the North American retail release in [`fingerprints/retail.json`](fingerprints/retail.json). Another version, or a modified copy, can be built too, after a plain warning you have to accept.
 - **A few GB of free space** for the build (the game's files alone are about 2 GB).
 - An Xbox-style controller (XInput), or the keyboard.
 
@@ -76,13 +76,13 @@ The build also uses free tools, which the installer fetches if they're missing, 
 
 1. Download `BloodWakeRecomp-Setup-<version>.exe` from [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) and run it. It installs for your Windows user only; only the step that installs Microsoft's build tools, if needed, asks for administrator rights.
 2. Accept the disclaimer, confirming you own the game and copied it from your own disc.
-3. Point it at your copy of the disc. It tells you in plain words whether the copy is recognised.
+3. Choose your copy of the disc. Setup tells you in plain words whether it recognises the copy. If it doesn't (another region, a modified copy or a damaged one), it explains what that means before you decide to go on.
 4. Pick the install folder (by default `%LOCALAPPDATA%\Programs\Blood Wake Recomp`) and the shortcuts.
 5. Let it build: translating and compiling the game takes about 15 minutes, with a progress bar, and can't be cancelled once it starts. Its last step, "Preparing graphics (one time)", plays a few short scenes hidden and silent (about 2 minutes) so your first game doesn't stutter while its graphics shaders compile.
 6. Play from the Start menu or the desktop shortcut.
 
-![The installer's shortcuts page: a Start menu shortcut is always added, a desktop shortcut is optional](docs/images/ui-installer-shortcuts.jpg)
-*The installer: a Start menu shortcut always, a desktop one if you like.*
+![The installer's shortcuts page: a Start menu entry and a desktop shortcut, each with its own box](docs/images/ui-installer-shortcuts.jpg)
+*The installer: a Start menu entry and a desktop shortcut, both ticked; untick either.*
 
 To uninstall, use Windows' **Apps** settings: it removes the build and its shortcuts, and keeps your saves and settings unless you choose otherwise.
 
@@ -109,12 +109,13 @@ Then start the launcher from the install folder. Every option, step and exit cod
 - Each edition keeps its own saves, under `%LOCALAPPDATA%\xboxrecomp\` (Remastered's in `editions\remastered`). The first time you play Remastered, it starts with a copy of your Original saves. Settings live in `%LOCALAPPDATA%\BloodWake\settings.ini`.
 
 ### Troubleshooting
-- **"not a supported unmodified retail copy" (exit code 2):** only an unmodified copy of the release in `fingerprints/retail.json` is accepted. A patched, trimmed or re-packed copy won't match: copy your disc again.
+- **"not a supported unmodified retail copy" (exit code 2):** the copy isn't the release in `fingerprints/retail.json`. A patched, trimmed or re-packed copy won't match: copy your disc again. To build it anyway, run Setup and accept its warning (or add `--allow-unverified` to `build_from_disc.py`); the build is then marked as an unverified copy.
 - **A missing dependency (exit code 3):** the message names it. Install it, or run the installer, which fetches it.
 - **The translation failed (exit code 4):** check the Python packages are exactly the pinned versions (`python -m pip install -r tools/requirements.txt`).
 - **"generated code doesn't match" (exit code 5):** usually a different version of a Python package or of the toolkit. Reinstall the pinned versions and try again.
 - **The build failed (exit code 6):** make sure Visual Studio 2022 (17.x) Build Tools with the C++ workload is installed.
 - **Disk space or a file error (exit code 7):** free some space, or pick an install folder you can write to.
+- **The game won't start after installing (Windows says it blocked an app):** Smart App Control is on. It blocks programs that aren't code-signed, and the game is built on your own PC, so it can't be. Turn it off in Windows Security > App & browser control > Smart App Control settings. It's a setting for the whole PC, so it's your call; Setup warns about it before it builds.
 - **The game is slow:** in the launcher, pick the Best Performance preset, or lower the rendering resolution or the frame rate cap.
 - **Crackling sound on a slow PC:** Audio tab, Sound processor: Simple (it skips the sound chip's echo and 3D effects).
 
@@ -170,7 +171,7 @@ Some things can't come back faithfully: a 29th mission (the E3 2001 show demo) w
 ## Staying safe
 Fan ports live in a grey area. This one is built to be clean, to sit at the very safest end of it, and to be able to show it.
 
-- **You must own the game.** The build accepts only an unmodified retail copy made from your own disc, and checks it against published SHA-256 fingerprints before it does anything else.
+- **You must own the game.** The build checks your copy against published SHA-256 fingerprints before it does anything else. It recognises an unmodified retail copy made from your own disc. Any other copy is built only after a plain warning you have to accept (a copy from an unknown source could be tampered with), and it stays marked as unverified.
 - **You build it yourself, on your own PC.** Your PC translates and compiles the game with Microsoft's own build tools; no game code or program is ever downloaded.
 - **Nothing from the game is in this repository.** No game code, generated C or executables, and no art, sound, music, video, text or extracted files. The one exception is the handful of game screenshots on this page, each listed by its fingerprint.
 - **Fingerprints, never code.** [`fingerprints/`](fingerprints/) holds SHA-256 hashes of the retail files and of the generated C, so your build proves it matches ours without the code ever being shared.

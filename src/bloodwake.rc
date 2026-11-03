@@ -1,0 +1,8 @@
+// Blood Wake Recomp: bloodwake.exe's resources.
+//
+// The icon (0.2.5 item 14) is our own art, drawn at build time by
+// tools/bw_icon.py into the build folder (CMakeLists.txt puts that folder on
+// the resource compiler's include path). It is the exe's first icon, so the
+// shortcuts (icon 0), the taskbar and Settings > Apps show it.
+
+1 ICON "bloodwake.ico"

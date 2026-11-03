@@ -207,19 +207,35 @@ def read_schema(exe, cwd):
     return json.loads(r.stdout.decode("utf-8", "replace"))
 
 
+WINDOWED = re.compile(r"(?i)^(\s*mode\s*=\s*)\S.*?(\r?\n?)$")
+FORMAT = re.compile(r"(?i)^(\s*format\s*=\s*)\S.*?(\r?\n?)$")
+
+
 def without_advanced(src, out):
     """Copy the settings file `src` to `out` without its [advanced] section: raw
     switches, any of which could show a window or change a scene. Sections are
-    found as the game finds them (bw_settings.c read_file); bytes kept as they are."""
+    found as the game finds them (bw_settings.c read_file); bytes kept as they are,
+    but for [display] mode, which always says window (item 102: a player's
+    Fullscreen must never reach a hidden scene; RECOMP_FULLSCREEN=0 in BASE_ENV
+    wins over the file anyway, this keeps the file itself saying so), and
+    [launcher] format, which always says 2, so that window is read as a choice
+    (call 85 reads a format-1 window as Fullscreen)."""
     with open(src, encoding="latin-1", newline="") as f:
         lines = f.read().splitlines(True)
-    keep, sec = [], ""
+    keep, sec, launcher = [], "", False
     for ln in lines:
         t = ln.strip()
         if t.startswith("[") and "]" in t:
             sec = t[1:t.index("]")].lower()
+            launcher = launcher or sec == "launcher"
+        if sec == "display" and WINDOWED.match(ln):
+            ln = WINDOWED.sub(lambda m: m.group(1) + "window" + m.group(2), ln)
+        if sec == "launcher" and FORMAT.match(ln):
+            ln = FORMAT.sub(lambda m: m.group(1) + "2" + m.group(2), ln)
         if sec != "advanced":
             keep.append(ln)
+    if not launcher:
+        keep.append("\n[launcher]\nformat = 2\n")
     with open(out, "w", encoding="latin-1", newline="") as f:
         f.write("; Blood Wake settings for the graphics warm-up (tools/bw_warmup.py):\n"
                 "; the player's file without [advanced]. Not the player's file.\n\n")
@@ -229,7 +245,8 @@ def without_advanced(src, out):
 
 def scene_settings(exe, out):
     """Write the settings file the scenes play with to `out`. Returns (its path,
-    or None for the game's own defaults; what it is)."""
+    or None for the game's own defaults; what it is; the game's settings list,
+    or None if it couldn't be read)."""
     schema = None
     try:
         schema = read_schema(exe, os.path.dirname(out))
@@ -240,13 +257,100 @@ def scene_settings(exe, out):
         base = local_appdata()
         player = os.path.join(base, "BloodWake", "settings.ini") if base else None
     if player and os.path.isfile(player):
-        return without_advanced(player, out), "the player's settings, without [advanced]"
+        return without_advanced(player, out), "the player's settings, without [advanced]", schema
     if schema:
         try:
-            return default_settings(schema, out), "a new launcher's settings"
+            return default_settings(schema, out), "a new launcher's settings", schema
         except (KeyError, TypeError, ValueError):
             pass
-    return None, "the game's defaults (its settings list couldn't be read)"
+    return None, "the game's defaults (its settings list couldn't be read)", schema
+
+
+def launcher_values(schema, path):
+    """Each setting's choice as tools/launcher.pyw shows it for the file at
+    `path`: the file's, if it is one of the setting's choices, else the default
+    preset's, else the setting's default. {"section.key": value}."""
+    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    cp.optionxform = str
+    try:
+        cp.read(path, encoding="utf-8")
+    except (OSError, configparser.Error, UnicodeDecodeError):
+        pass
+    pst = next((s for s in schema["settings"] if s["section"] == "edition" and s["key"] == "preset"), None)
+    first = next((p for p in schema.get("presets", []) if pst and p["value"] == pst["default"]), None)
+    first = dict(first["settings"]) if first else {}
+    out = {}
+    for st in schema["settings"]:
+        key = st["section"] + "." + st["key"]
+        val = cp.get(st["section"], st["key"], fallback=None)
+        out[key] = val if val in [o["value"] for o in st["options"]] else first.get(key, st["default"])
+    return out
+
+
+# ── What a warm-up prepared (item 21) ─────────────────────────────────────
+# The pixel shaders' text depends on a few Remastered settings (the game's
+# "shader_settings" list, src/bw_settings.c). After each warm-up its
+# settings' signature is kept in the shader cache folder (warmup.ini), so the
+# launcher can tell when a change has made shaders this cache hasn't got, and
+# offer to prepare them. A cache folder cleared by hand loses the record too.
+STAMP = "warmup.ini"
+STAMP_KEEP = 16                 # signatures kept per section, newest last
+
+
+def shader_signature(schema, values):
+    """The shader settings' choices as one line ("id=class ..."), or None if
+    the game names none. Choices that make the same shaders share a class."""
+    sets = (schema or {}).get("shader_settings")
+    if not sets:
+        return None
+    return " ".join("%s=%s" % (s["id"], (s.get("classes") or {}).get(values.get(s["id"]),
+                                                                      values.get(s["id"])))
+                    for s in sorted(sets, key=lambda s: s["id"]))
+
+
+def read_stamp(folder):
+    """{"warmed": [signature, ...], "declined": [...]} for a cache folder (empty
+    lists if there's no record)."""
+    out = {"warmed": [], "declined": []}
+    if not folder:
+        return out
+    cp = configparser.ConfigParser(interpolation=None, delimiters=("=",), strict=False)
+    try:
+        cp.read(os.path.join(folder, STAMP), encoding="utf-8")
+    except (OSError, configparser.Error, UnicodeDecodeError):
+        return out
+    for sec in out:
+        if cp.has_section(sec):
+            out[sec] = [v for _k, v in cp.items(sec) if v]
+    return out
+
+
+def add_stamp(folder, section, signature):
+    """Add `signature` to `section` ("warmed" or "declined") of the folder's
+    record, newest last; written whole, through a temporary file. Returns
+    True if it was written."""
+    if not folder or not signature:
+        return False
+    st = read_stamp(folder)
+    st[section] = ([s for s in st[section] if s != signature] + [signature])[-STAMP_KEEP:]
+    if section == "warmed":             # prepared now: no longer a declined offer
+        st["declined"] = [s for s in st["declined"] if s != signature]
+    lines = ["; Blood Wake: the settings the graphics warm-up (tools/bw_warmup.py) prepared",
+             "; shaders for in this folder, and the changes the launcher was told not to",
+             "; offer again (Not now). Newest last. Deleting this file only resets that.", ""]
+    for sec in ("warmed", "declined"):
+        lines.append("[%s]" % sec)
+        lines += ["%d = %s" % (i + 1, s) for i, s in enumerate(st[sec])]
+        lines.append("")
+    try:
+        os.makedirs(folder, exist_ok=True)
+        tmp = os.path.join(folder, STAMP + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        os.replace(tmp, os.path.join(folder, STAMP))
+        return True
+    except OSError:
+        return False
 
 
 def default_settings(schema, out):
@@ -261,9 +365,14 @@ def default_settings(schema, out):
         if not cp.has_section(st["section"]):
             cp.add_section(st["section"])
         cp.set(st["section"], st["key"], first.get(st["section"] + "." + st["key"], st["default"]))
+    if cp.has_option("display", "mode"):        # item 102: the scenes are always windowed
+        cp.set("display", "mode", "window")
+    if not cp.has_section("launcher"):          # 0.2.5's format: that window is a choice (call 85)
+        cp.add_section("launcher")
+    cp.set("launcher", "format", "2")
     with open(out, "w", encoding="utf-8") as f:
         f.write("; Blood Wake settings for the graphics warm-up (tools/bw_warmup.py):\n"
-                "; what a new launcher starts with. Not the player's file.\n\n")
+                "; what a new launcher starts with (windowed). Not the player's file.\n\n")
         cp.write(f)
     return out
 
@@ -299,6 +408,9 @@ BASE_ENV = {                            # as tools/play.py plays
     "BW_STDERR_BUFFER": "1048576",
     "BW_GPU": "d3d11", "RECOMP_DISPATCH_GATE": "1", "RECOMP_FLIP_PACING": "1",
     "RECOMP_FULLSCREEN": "0",           # never fullscreen: that would show the hidden window
+    # (it wins over the settings file's choice: bw_settings_apply keeps a
+    # switch the environment already sets; the scenes' file says window too)
+    "BW_TEST_XINPUT": "0:-0",           # item 102: no real controller read, no rumble sent
 }
 PS_LINE = re.compile(r"this run: (\d+) compiled in game \((\d+) ms\), (\d+) from the cache")
 BOOT_MARK = "\n==== warm-up boot %d (%d s left)\n"
@@ -394,13 +506,14 @@ def warmup(exe, game_dir, work, parallel=2, only=None, cache=None, prog=None):
     prog = prog or (lambda f, m: None)
     scenes = [s for s in scene_list() if not only or s["name"] in only]
     folder = cache_dir(cache)
-    out = {"results": [], "settings": None, "cache": folder, "new": None, "total": None}
+    out = {"results": [], "settings": None, "cache": folder, "new": None, "total": None,
+           "signature": None, "recorded": False}
     if not scenes:
         return out
     os.makedirs(work, exist_ok=True)
     log_dir = os.path.join(work, "logs")
     os.makedirs(log_dir, exist_ok=True)
-    settings, out["settings"] = scene_settings(exe, os.path.join(work, "warmup_settings.ini"))
+    settings, out["settings"], schema = scene_settings(exe, os.path.join(work, "warmup_settings.ini"))
     if not settings:
         prog(0, "the settings couldn't be read; the scenes use the game's defaults")
     before = cache_files(folder)
@@ -449,6 +562,19 @@ def warmup(exe, game_dir, work, parallel=2, only=None, cache=None, prog=None):
     after = cache_files(folder)
     if before is not None and after is not None:
         out["new"], out["total"] = len(after - before), len(after)
+    # Item 21: what this cache now holds shaders for, when every Remastered
+    # scene ran without a problem (a scene stopped for time still counts: its
+    # shaders so far are kept, and the scenes have room to spare).
+    if settings and schema:
+        try:
+            out["signature"] = shader_signature(schema, launcher_values(schema, settings))
+        except (KeyError, TypeError):
+            out["signature"] = None
+    rem = [r for r in results if r["edition"] != "original"]
+    clean = rem and len(rem) == sum(1 for s in scenes if s["edition"] != "original") and all(
+        not r["error"] or r["error"].startswith("ran over time") for r in rem)
+    if out["signature"] and clean and after is not None:
+        out["recorded"] = add_stamp(folder, "warmed", out["signature"])
     return out
 
 

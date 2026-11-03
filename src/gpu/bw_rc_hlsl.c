@@ -9,8 +9,11 @@
  * GPU back end draws what the CPU rasteriser draws; the comments name the
  * CPU code each part mirrors.
  *
- * Known gaps, as in the CPU path: bump-environment and dot-product stage
- * modes read zero; a cube texture is sampled as 2D (face 0).
+ * Known gaps: the bump-environment modes, and the dot-product modes other
+ * than DOTPRODUCT and DOT_RFLCT_DIFF/SPEC, read zero; a cube-map stage whose
+ * texture isn't a six-face cube samples face 0 as 2D, as the CPU path does.
+ * The CPU path (rc_stage_fetch) reads every dot-product mode as zero, so
+ * those stages are where the two differ.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -268,7 +271,17 @@ size_t bw_rc_hlsl(const BwRcKey *k, char *out, size_t cap)
         static float mix = -1.0f;
         if (mix < 0.0f) {
             const char *e = getenv("BW_VFX_HUDEDGE_MIX");
-            mix = e ? (float)atof(e) : 0.5f;   /* 0 rounder (B-spline) .. 1 crisper (Catmull-Rom) */
+            float v = e ? (float)atof(e) : 0.5f;   /* 0 rounder (B-spline) .. 1 crisper (Catmull-Rom) */
+            /* 0.2.5 item 41: in range, or every shader with it failed to
+             * compile ("nan" in the text) and was compiled again per draw */
+            if (v != v || v > 1e30f || v < -1e30f) {
+                fprintf(stderr, "[VFX] BW_VFX_HUDEDGE_MIX=%s is not a number from 0 to 1: 0.5 used\n", e);
+                v = 0.5f;
+            } else if (v < 0.0f || v > 1.0f) {
+                fprintf(stderr, "[VFX] BW_VFX_HUDEDGE_MIX=%s is outside 0..1: %.0f used\n", e, v < 0.0f ? 0.0 : 1.0);
+                v = v < 0.0f ? 0.0f : 1.0f;
+            }
+            mix = v;
         }
         put(&b,
             "  ca = lerp(ca, clamp(cr, alo, ahi), %.3f);\n"
@@ -382,10 +395,11 @@ size_t bw_rc_hlsl(const BwRcKey *k, char *out, size_t cap)
             int j, n = (mode == 0x0B) ? 2 : 1;
             put(&b, "  T[%d] = float4(0, 0, 0, 0);\n", st);
             for (j = st; j < st + n && j < 4; j++) {
-                uint32_t in = j == 1 ? 0 : (k->other_stage_input >> (j == 2 ? 16 : 20)) & 0xF;
-                uint32_t map = (k->dot_rgbmapping >> ((j - 1) * 4)) & 0xF;
-                if (j < 1)
+                uint32_t in, map;
+                if (j < 1)              /* before the shift by (j - 1) * 4 */
                     break;
+                in = j == 1 ? 0 : (k->other_stage_input >> (j == 2 ? 16 : 20)) & 0xF;
+                map = (k->dot_rgbmapping >> ((j - 1) * 4)) & 0xF;
                 if (in >= (uint32_t)j)
                     in = 0;
                 put(&b, "  dp[%d] = dot(tc[%d].xyz, dm(T[%u], %u));\n", j, j, in, map);

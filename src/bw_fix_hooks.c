@@ -40,14 +40,7 @@
 #include <math.h>
 
 #include "bw_edition.h"
-
-typedef void (*recomp_func_t)(void);
-extern recomp_func_t recomp_lookup(uint32_t xbox_va);
-extern ptrdiff_t g_xbox_mem_offset;
-/* The guest registers are thread-local in the runtime (TOOLKIT_ISSUES TK-7). */
-extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;
-extern __declspec(thread) uint32_t g_ebx, g_esi, g_edi, g_ebp;
-extern __declspec(thread) uint32_t g_seh_ebp, g_eflags;
+#include "bw_guestcall.h"   /* the guest registers, recomp_lookup, calling the game (item 71) */
 
 #define F_MEM32(va) (*(volatile uint32_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
 #define F_MEM16(va) (*(volatile uint16_t *)((uintptr_t)(uint32_t)(va) + g_xbox_mem_offset))
@@ -99,49 +92,15 @@ static int f_streq(uint32_t va, const char *s)
     }
 }
 
-/* ── Calling the game's own functions from a wrapper (as other
- * hook files do): push the arguments, push a return address nobody
- * reads, set ecx, run the body, put esp back. The caller's registers are saved
- * around calls made after the original body, so what the body returned reaches
- * the game unchanged unless a fix changes it on purpose. */
-typedef struct {
-    uint32_t eax, ecx, edx, ebx, esi, edi, ebp, seh_ebp, eflags;
-} f_regs_t;
-
-static void f_save(f_regs_t *r)
-{
-    r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx; r->ebx = g_ebx;
-    r->esi = g_esi; r->edi = g_edi; r->ebp = g_ebp; r->seh_ebp = g_seh_ebp;
-    r->eflags = g_eflags;
-}
-
-static void f_restore(const f_regs_t *r)
-{
-    g_eax = r->eax; g_ecx = r->ecx; g_edx = r->edx; g_ebx = r->ebx;
-    g_esi = r->esi; g_edi = r->edi; g_ebp = r->ebp; g_seh_ebp = r->seh_ebp;
-    g_eflags = r->eflags;
-}
+/* ── Calling the game's own functions from a wrapper: bw_guestcall.h
+ * (shared with bw_visextra_hooks.c; item 71). */
+typedef bw_gregs_t f_regs_t;
+#define f_save    bw_gregs_save
+#define f_restore bw_gregs_restore
 
 static uint32_t f_call(uint32_t va, uint32_t this_ptr, int nargs, const uint32_t *args)
 {
-    recomp_func_t fn = recomp_lookup(va);
-    uint32_t sp0 = g_esp;
-    int i;
-    if (!fn) {
-        fprintf(stderr, "[FIX] no translated function at 0x%08X\n", va);
-        fflush(stderr);
-        return 0;
-    }
-    for (i = nargs - 1; i >= 0; i--) {
-        g_esp -= 4;
-        F_MEM32(g_esp) = args[i];
-    }
-    g_esp -= 4;
-    F_MEM32(g_esp) = 0;                 /* return address: never read */
-    g_ecx = this_ptr;
-    fn();
-    g_esp = sp0;
-    return g_eax;
+    return bw_guest_call("[FIX]", va, this_ptr, nargs, args);
 }
 
 #define VA_SOUND_ISPLAYING   0x000182C0u  /* thiscall (ecx = sound), al = playing */

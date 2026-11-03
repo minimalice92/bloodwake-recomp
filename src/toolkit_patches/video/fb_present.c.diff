@@ -1,6 +1,14 @@
 --- xboxrecomp/src/video/fb_present.c
 +++ src/toolkit_patches/video/fb_present.c
-@@ -152,16 +152,63 @@
+@@ -38,6 +38,7 @@
+  * is the thing that receives the keys, so that is what has to remember
+  * them. */
+ #include "keyboard.h"   /* src/input */
++#include "../input/bw_input_ext.h"   /* Blood Wake: rumble off, focus (0.2.5 item 74) */
+ #include "gpu_present.h"
+ #include "recomp_exit_hook.h"   /* src/platform */
+ #include <stdbool.h>
+@@ -152,16 +153,63 @@
  }
  
  /* Called by the pushbuffer executor when the title flips. */
@@ -65,7 +73,7 @@
      next = (s_present_idx == 0) ? 1 : 0;
      if (!s_present[next]) {
          s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
-@@ -177,6 +224,32 @@
+@@ -177,6 +225,32 @@
  
          if (bpp == 4) {
              memcpy(dst, row, (size_t)s_fb_width * 4);
@@ -98,7 +106,7 @@
          } else if (bpp == 8) {
              /* 2x-wide anti-aliased 32-bit surface: every other pixel, as in
               * fb_convert. */
-@@ -196,6 +269,13 @@
+@@ -196,6 +270,13 @@
              memset(dst, 0, (size_t)s_fb_width * 4);
          }
      }
@@ -112,7 +120,7 @@
      /* Published only once it is whole. */
      InterlockedExchange(&s_present_idx, next);
  }
-@@ -222,6 +302,38 @@
+@@ -222,6 +303,38 @@
      InterlockedExchange(&s_frame_draws, (LONG)draws);
  }
  
@@ -151,7 +159,54 @@
  /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
   * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
   * gpu_present.c; both presenters letterbox to any size.) */
-@@ -256,7 +368,10 @@
+@@ -250,13 +363,57 @@
+     }
+ }
+ 
++static void bw_key_delay_note(void);    /* Blood Wake (item 75), below */
++
++/* Blood Wake carried patch (0.2.5 item 79): the mouse over the frame window,
++ * for the menus' mouse (src/bw_menu_hooks.c, MENU_MOUSE). Written by this
++ * window's thread, read by the game's; each value is one aligned LONG. */
++static volatile LONG s_bw_mx = -1, s_bw_my = -1, s_bw_cw, s_bw_ch;
++static volatile LONG s_bw_moves, s_bw_wheel, s_bw_wheel_rest;
++static volatile LONG s_bw_lclicks, s_bw_rclicks;
++
++/* Left and right button presses since the last call (each press counted once,
++ * however short). */
++void bw_fb_mouse_clicks_take(int *left, int *right)
++{
++    *left = (int)InterlockedExchange(&s_bw_lclicks, 0);
++    *right = (int)InterlockedExchange(&s_bw_rclicks, 0);
++}
++
++/* The cursor in client pixels and the client size; *moves counts the
++ * WM_MOUSEMOVEs so far (a caller tells a moved mouse from one at rest).
++ * 0 when the cursor isn't over the window. */
++int bw_fb_mouse(int *x, int *y, int *cw, int *ch, int *moves)
++{
++    *x = (int)s_bw_mx;
++    *y = (int)s_bw_my;
++    *cw = (int)s_bw_cw;
++    *ch = (int)s_bw_ch;
++    *moves = (int)s_bw_moves;
++    return *x >= 0 && *y >= 0 && *cw > 0 && *ch > 0;
++}
++
++/* Whole wheel notches turned since the last call: positive away from the
++ * player (up), negative towards. */
++int bw_fb_mouse_wheel_take(void)
++{
++    return (int)InterlockedExchange(&s_bw_wheel, 0);
++}
++
++/* src/bw_menu_hooks.c: 1 show the arrow over the window, 0 hide it, -1 the
++ * window's own cursor as always (Original, MENU_MOUSE off). */
++extern int bw_menu_cursor_wanted(void);
++
+ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+ {
+     /* First press only (bit 30: the key was already down), and with Alt held
       * (bit 29) for Enter; neither reaches the key table. */
      if ((m == WM_SYSKEYDOWN && w == VK_RETURN && (l & (1 << 29)) && !(l & (1 << 30)))
          || (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30)))) {
@@ -163,7 +218,193 @@
          return 0;
      }
      if (m == WM_SYSKEYDOWN && w == VK_RETURN)
-@@ -435,6 +550,19 @@
+@@ -275,6 +432,9 @@
+         InterlockedExchange(&s_fb_running, 0);
+         if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
+             fprintf(stderr, "  [FBWIN] window closed: exiting\n");
++            /* Blood Wake carried patch (0.2.5 item 74): a pad left rumbling
++             * by the last explosion stays on after the process ends. */
++            xbox_InputRumbleAllOff("window closed");
+             recomp_exit_hook_run("window");
+             fflush(stdout);
+             fflush(stderr);
+@@ -285,6 +445,8 @@
+     case WM_KEYDOWN:
+     case WM_SYSKEYDOWN:
+         xbox_InputKeySet((int)w, 1);
++        if (!(l & (1 << 30)))
++            bw_key_delay_note();        /* Blood Wake (item 75) */
+         /* A Shift, Ctrl or Alt is also its side's key, for bindings to
+          * "lshift" and the like; wParam stays the either-side one. */
+         {
+@@ -339,6 +501,10 @@
+             int vk = xbox_InputWin32MouseVk(m, (uint32_t)w, &down);
+             if (vk)
+                 xbox_InputKeySet(vk, down);
++            if (m == WM_LBUTTONDOWN)            /* Blood Wake (item 79): the menus' mouse */
++                InterlockedIncrement(&s_bw_lclicks);
++            else if (m == WM_RBUTTONDOWN)
++                InterlockedIncrement(&s_bw_rclicks);
+             if (down)
+                 SetCapture(h);
+             else if (!(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)))
+@@ -346,14 +512,155 @@
+         }
+         return m == WM_XBUTTONDOWN || m == WM_XBUTTONUP ? TRUE : 0;
+ 
++    /* Blood Wake carried patch (0.2.5 item 79): where the mouse is, and the
++     * wheel, for the menus' mouse; the cursor shown or hidden as it asks. */
++    case WM_MOUSEMOVE:
++        {
++            RECT c;
++            LONG nx = (LONG)(short)LOWORD(l), ny = (LONG)(short)HIWORD(l);
++            GetClientRect(h, &c);
++            InterlockedExchange(&s_bw_cw, c.right - c.left);
++            InterlockedExchange(&s_bw_ch, c.bottom - c.top);
++            /* Windows also sends WM_MOUSEMOVE at an unchanged position (a
++             * window appearing under a resting cursor): only a real move
++             * counts, so a resting cursor never takes the highlight back. */
++            if (nx != s_bw_mx || ny != s_bw_my)
++                InterlockedIncrement(&s_bw_moves);
++            InterlockedExchange(&s_bw_mx, nx);
++            InterlockedExchange(&s_bw_my, ny);
++            {
++                TRACKMOUSEEVENT t;
++                t.cbSize = sizeof t;
++                t.dwFlags = TME_LEAVE;
++                t.hwndTrack = h;
++                t.dwHoverTime = 0;
++                TrackMouseEvent(&t);
++            }
++        }
++        return 0;
++    case WM_MOUSELEAVE:
++        /* BW_TEST_MOUSE=1 (tests): moves posted by tools/bw_keypost.py stay
++         * put, though the real cursor is elsewhere and Windows says so. */
++        if (!getenv("BW_TEST_MOUSE")) {
++            InterlockedExchange(&s_bw_mx, -1);
++            InterlockedExchange(&s_bw_my, -1);
++        }
++        return 0;
++    case WM_MOUSEWHEEL:
++        {
++            LONG d = s_bw_wheel_rest + (LONG)(short)HIWORD(w);
++            InterlockedExchangeAdd(&s_bw_wheel, d / WHEEL_DELTA);
++            s_bw_wheel_rest = d % WHEEL_DELTA;
++        }
++        return 0;
++    case WM_SETCURSOR:
++        if (LOWORD(l) == HTCLIENT) {
++            int want = bw_menu_cursor_wanted();
++            if (want >= 0) {
++                SetCursor(want ? LoadCursorA(NULL, IDC_ARROW) : NULL);
++                return TRUE;
++            }
++        }
++        break;
++
+     /* Alt-tabbing away with a key held would leave it held for ever. */
+     case WM_KILLFOCUS:
+         xbox_InputKeysClear();
++        xbox_InputSetFocus(0);          /* Blood Wake (item 74): rumble stops */
++        return 0;
++    case WM_SETFOCUS:
++        xbox_InputSetFocus(1);          /* Blood Wake (item 74): and comes back */
+         return 0;
+     }
+     return DefWindowProcA(h, m, w, l);
+ }
+ 
++/* Blood Wake carried patch (0.2.5 item 75): the window's loop slept 16 ms a
++ * pass while the GPU back end presents (bw_fb_external_present), so a key
++ * press waited in the message queue for up to 16 ms before it reached the key
++ * table the game's pad reads. It now waits on the queue: a message wakes it
++ * at once and is handled, and it still goes round once per 16 ms for the
++ * title bar and the dumps. Messages other threads send to the window (DXGI's
++ * resize and mode changes) are answered at once too, instead of blocking the
++ * sender for up to 16 ms. BW_FB_INPUT_WAIT=0 restores the plain Sleep. */
++static int bw_input_wait(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_FB_INPUT_WAIT");
++        on = !(e && e[0] == '0');
++    }
++    return on;
++}
++
++static int fb_pump(void)
++{
++    MSG msg;
++    int n = 0;
++    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
++        TranslateMessage(&msg);
++        DispatchMessageA(&msg);
++        n++;
++    }
++    return n;
++}
++
++static void fb_wait(DWORD ms)
++{
++    LARGE_INTEGER f, t0, t;
++    if (!bw_input_wait()) {
++        Sleep(ms);
++        return;
++    }
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&t0);
++    for (;;) {
++        LONGLONG el;
++        QueryPerformanceCounter(&t);
++        el = (t.QuadPart - t0.QuadPart) * 1000 / f.QuadPart;
++        if (el >= (LONGLONG)ms || !InterlockedCompareExchange(&s_fb_running, 1, 1))
++            return;
++        if (MsgWaitForMultipleObjectsEx(0, NULL, (DWORD)(ms - el), QS_ALLINPUT,
++                                        MWMO_INPUTAVAILABLE) != WAIT_OBJECT_0)
++            return;                          /* the 16 ms are up */
++        if (!fb_pump())
++            Sleep(1);                        /* woke with nothing to read: don't spin */
++    }
++}
++
++/* Blood Wake carried patch (item 75): how long key presses waited in the
++ * window's queue before reaching the key table, from each WM_KEYDOWN's own
++ * time stamp. With BW_GPU_STATS=1 (or BW_INPUT_STATS=1), one line every 5 s
++ * that had presses. GetTickCount's 15.6 ms steps make one press's figure
++ * coarse; the mean over many is the measure. */
++static void bw_key_delay_note(void)
++{
++    static int on = -1;
++    static unsigned n, maxd;
++    static unsigned long long sum;
++    static DWORD since;
++    DWORD now = GetTickCount(), d = now - (DWORD)GetMessageTime();
++    if (on < 0)
++        on = getenv("BW_GPU_STATS") != NULL || getenv("BW_INPUT_STATS") != NULL;
++    if (!on)
++        return;
++    if (d > 10000)
++        d = 0;                              /* a stamp from before a wrap */
++    if (!n)
++        since = now;
++    n++;
++    sum += d;
++    if (d > maxd)
++        maxd = d;
++    if (now - since >= 5000) {
++        fprintf(stderr, "[INPUT] keys: %u presses in %lu s, waited in the window queue %.1f ms on average (max %u ms)\n",
++                n, (unsigned long)((now - since) / 1000), (double)sum / n, maxd);
++        n = 0;
++        sum = 0;
++        maxd = 0;
++    }
++}
++
+ /* The display formats an Xbox front buffer is actually set to. The pitch says
+  * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
+  * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
+@@ -435,6 +742,19 @@
      return 0;
  }
  
@@ -183,7 +424,7 @@
  /* GDI: the frame letterboxed into the client area, like the D3D11
   * presenter; the borders are cleared when the size changes. */
  static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
-@@ -455,6 +583,33 @@
+@@ -455,6 +775,33 @@
      } else {
          h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
      }
@@ -217,7 +458,7 @@
      SetStretchBltMode(hdc, HALFTONE);
      SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
      StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
-@@ -466,9 +621,15 @@
+@@ -466,9 +813,15 @@
   * for vsync, so returns 1 when the loop is already paced), else GDI. */
  static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
  {
@@ -233,7 +474,31 @@
      return 0;
  }
  
-@@ -506,11 +667,26 @@
+@@ -483,13 +836,21 @@
+     (void)unused;
+ 
+     {
+-        WNDCLASSA wc;
++        /* Blood Wake carried patch (0.2.5 item 14): the exe's own icon
++         * (resource 1, src/bloodwake.rc) on the title bar and the taskbar
++         * button of the standalone frame window, not Windows' generic one. */
++        WNDCLASSEXA wc;
+         memset(&wc, 0, sizeof(wc));
++        wc.cbSize        = sizeof(wc);
+         wc.lpfnWndProc   = fb_wndproc;
+         wc.hInstance     = GetModuleHandleA(NULL);
+         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+         wc.lpszClassName = "XboxRecompFramebuffer";
+-        RegisterClassA(&wc);
++        wc.hIcon         = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));
++        wc.hIconSm       = (HICON)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,
++                                             GetSystemMetrics(SM_CXSMICON),
++                                             GetSystemMetrics(SM_CYSMICON), 0);
++        RegisterClassExA(&wc);
+     }
+     {
+         /* RECOMP_WINDOW_SCALE (1-8, default 2, as in the SDL window): the
+@@ -506,11 +867,26 @@
          for (;; scale--) {
              r.left = 0; r.top = 0;
              r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
@@ -260,7 +525,7 @@
          hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                 work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
-@@ -523,9 +699,10 @@
+@@ -523,9 +899,10 @@
          return 0;
      }
      hdc = GetDC(hwnd);
@@ -272,31 +537,66 @@
              fb_toggle_fullscreen(hwnd);
      }
  
-@@ -553,7 +730,9 @@
-             TranslateMessage(&msg);
-             DispatchMessageA(&msg);
-         }
+@@ -547,13 +924,11 @@
+         gpu_present_init(hwnd, s_fb_width, s_fb_height);
+ 
+     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
+-        MSG msg;
+         int paced = 0;
+-        while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+-            TranslateMessage(&msg);
+-            DispatchMessageA(&msg);
+-        }
 -        if (s_present_idx >= 0 && s_rgb) {
++        fb_pump();
 +        if ((s_bw_external || bw_fb_nocopy()) && bw_fb_copy_needed() == 0) {
 +            /* Blood Wake: the GPU back end presents; nothing to copy here */
 +        } else if (s_present_idx >= 0 && s_rgb) {
              /* A finished frame, published by the flip. Copied into s_rgb so
               * the dump path and GDI see one consistent image even if the
               * next flip lands mid-blit. */
-@@ -608,7 +787,11 @@
-                            t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                            (long)s_frame_draws);
-                 tb[127] = 0;
+@@ -604,19 +979,42 @@
+             if (now - t0 >= 1000) {
+                 LONG f = s_flips;
+                 wchar_t tb[128];
+-                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
+-                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+-                           (long)s_frame_draws);
+-                tb[127] = 0;
 -                SetWindowTextW(hwnd, tb);
-+                if (s_bw_parent)
-+                    SendMessageTimeoutW(s_bw_parent, WM_SETTEXT, 0, (LPARAM)tb,
-+                                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, NULL);
-+                else
-+                    SetWindowTextW(hwnd, tb);
++                /* Blood Wake carried patch (0.2.5 item 96): the frame stats in
++                 * the title are for tests (BW_UNATTENDED, or BW_TITLE_STATS=1;
++                 * BW_TITLE_STATS=0 hides them there too). In play the host's
++                 * window keeps the title the host gave it ("Blood Wake",
++                 * "Blood Wake (Remastered)"), and a window of its own shows
++                 * the game's name, as before the stats reached the host. */
++                static int stats = -1;
++                static wchar_t shown[48];
++                if (stats < 0) {
++                    const char *e = getenv("BW_TITLE_STATS");
++                    stats = (e && *e) ? e[0] == '1' : getenv("BW_UNATTENDED") != NULL;
++                }
++                if (stats) {
++                    _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
++                               t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
++                               (long)s_frame_draws);
++                    tb[127] = 0;
++                    if (s_bw_parent)
++                        SendMessageTimeoutW(s_bw_parent, WM_SETTEXT, 0, (LPARAM)tb,
++                                            SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, NULL);
++                    else
++                        SetWindowTextW(hwnd, tb);
++                } else if (!s_bw_parent && wcscmp(shown, s_title)) {
++                    wcsncpy(shown, s_title, 47);
++                    shown[47] = 0;
++                    SetWindowTextW(hwnd, shown);
++                }
                  t0 = now; f0 = f;
              }
          }
-@@ -617,6 +800,7 @@
+         if (!paced)
+-            Sleep(16);                  /* D3D11's Present waited for vsync */
++            fb_wait(16);                /* Blood Wake (item 75): wakes for input */
      }
  
      gpu_present_shutdown();

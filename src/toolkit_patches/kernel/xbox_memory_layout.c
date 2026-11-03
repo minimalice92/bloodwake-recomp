@@ -3664,9 +3664,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                             XBOX_TILED_BASE, XBOX_CONTIG_BASE);
                 *via_contig = saved;
             }
+            /* Blood Wake carried patch (0.2.5 item 61): the size mapped, not
+             * the RAM size. With BW_MAP_MB=128 this said 128 MB while the view
+             * is the contiguous window's 64 MB, which misleads a bug report. */
             fprintf(stderr, "  Tiled aperture: %u MB at Xbox VA 0x%08X"
                     " (aliases the contiguous window)\n",
-                    (unsigned)(g_memory_size / (1024 * 1024)),
+                    (unsigned)(tiled_size / (1024 * 1024)),
                     XBOX_TILED_BASE);
         } else {
             fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"

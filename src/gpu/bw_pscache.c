@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #include "bw_pscache.h"
 
@@ -57,11 +58,20 @@ typedef struct {
 
 static PscEntry *s_ent;
 static unsigned s_n, s_cap;
-static char s_dir[MAX_PATH];
+/* The folder, wide for the file calls and UTF-8 for the log: it sits under
+ * the user's profile, whose name can hold any letter (0.2.5 item 53; the
+ * ANSI calls lost the cache for a Cyrillic name on English Windows). */
+static wchar_t s_dirw[MAX_PATH];
+static char s_dir[3 * MAX_PATH];
 static int s_on = -1, s_verify = -1;
 static uint64_t s_tag;
 static unsigned s_loaded, s_skipped, s_hits, s_compiled, s_stored, s_logged;
 static double s_compile_ms, s_hit_ms;
+/* 0.2.5 item 43: the vertex programs' shaders too (vs_<hash>.bin, their
+ * own compiler tag; the text is hashed after a prefix naming the target
+ * and the widescreen define, so no vertex entry ever matches a pixel one). */
+static uint64_t s_tag_vs;
+static unsigned s_vs_loaded, s_vs_hits, s_vs_stored;
 
 static uint64_t fnv64(const void *p, size_t n, uint64_t h)
 {
@@ -75,22 +85,34 @@ static uint64_t fnv64(const void *p, size_t n, uint64_t h)
 static uint64_t h_a(const void *p, size_t n) { return fnv64(p, n, 0xCBF29CE484222325ull); }
 static uint64_t h_b(const void *p, size_t n) { return fnv64(p, n, 0x84222325CBF29CE4ull) ^ (uint64_t)n << 40; }
 
-/* The compiler's identity, the target and the flags (get_rc_shader's). */
-static uint64_t make_tag(void)
+/* The compiler's identity, the target and the flags: get_rc_shader's
+ * ("ps_5_0|ps_main|O3", the same string as before 0.2.5, so the caches
+ * already on players' PCs stay valid) or the vertex programs'. */
+static uint64_t make_tag(const char *what)
 {
-    char path[MAX_PATH], buf[MAX_PATH + 128];
+    wchar_t path[MAX_PATH];
+    char buf[MAX_PATH + 128];
     WIN32_FILE_ATTRIBUTE_DATA fa;
-    HMODULE m = GetModuleHandleA("d3dcompiler_47.dll");
+    HMODULE m = GetModuleHandleW(L"d3dcompiler_47.dll");
     memset(&fa, 0, sizeof fa);
     path[0] = 0;
-    if (m && GetModuleFileNameA(m, path, sizeof path))
-        GetFileAttributesExA(path, GetFileExInfoStandard, &fa);
-    _snprintf(buf, sizeof buf, "bwps%u|ps_5_0|ps_main|O3|%lu|%lu|%lu|%lu", PSC_VERSION,
+    if (m && GetModuleFileNameW(m, path, MAX_PATH))
+        GetFileAttributesExW(path, GetFileExInfoStandard, &fa);
+    _snprintf(buf, sizeof buf, "bwps%u|%s|%lu|%lu|%lu|%lu", PSC_VERSION, what,
               (unsigned long)fa.nFileSizeLow, (unsigned long)fa.nFileSizeHigh,
               (unsigned long)fa.ftLastWriteTime.dwLowDateTime,
               (unsigned long)fa.ftLastWriteTime.dwHighDateTime);
     buf[sizeof buf - 1] = 0;
     return h_a(buf, strlen(buf));
+}
+
+/* item 43: a vertex shader's text hashed after its prefix */
+static void vs_hash(const char *src, size_t len, int ws, uint64_t *h1, uint64_t *h2)
+{
+    const char *pre = ws ? "vs_5_0|BW_WS|" : "vs_5_0|";
+    size_t pl = strlen(pre);
+    *h1 = fnv64(src, len, fnv64(pre, pl, 0xCBF29CE484222325ull));
+    *h2 = fnv64(src, len, fnv64(pre, pl, 0x84222325CBF29CE4ull)) ^ (uint64_t)len << 40;
 }
 
 static int add(uint64_t h1, uint64_t h2, uint32_t textlen, const void *blob, uint32_t size)
@@ -115,16 +137,16 @@ static int add(uint64_t h1, uint64_t h2, uint32_t textlen, const void *blob, uin
     return 1;
 }
 
-static int load_file(const char *path)
+static int load_file(const wchar_t *path, uint64_t tag)
 {
-    FILE *f = fopen(path, "rb");
+    FILE *f = _wfopen(path, L"rb");
     PscHeader h;
     void *blob = NULL;
     int ok = 0;
     if (!f)
         return 0;
     if (fread(&h, 1, sizeof h, f) == sizeof h && h.magic == PSC_MAGIC && h.version == PSC_VERSION
-            && h.tag == s_tag && h.blobsize > 0 && h.blobsize < (4u << 20)
+            && h.tag == tag && h.blobsize > 0 && h.blobsize < (4u << 20)
             && (blob = malloc(h.blobsize)) != NULL
             && fread(blob, 1, h.blobsize, f) == h.blobsize
             && fnv64(blob, h.blobsize, 0xCBF29CE484222325ull) == h.blobsum)
@@ -134,13 +156,36 @@ static int load_file(const char *path)
     return ok;
 }
 
+/* Every valid file of one kind ("ps" or "vs") with this tag, loaded. */
+static void load_dir(const char *kind, uint64_t tag, unsigned *loaded, unsigned *skipped)
+{
+    wchar_t pat[MAX_PATH + 16];
+    WIN32_FIND_DATAW fd;
+    HANDLE fh;
+    _snwprintf(pat, MAX_PATH + 16, L"%ls\\%hs_*.bin", s_dirw, kind);
+    pat[MAX_PATH + 15] = 0;
+    fh = FindFirstFileW(pat, &fd);
+    if (fh == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        wchar_t path[MAX_PATH * 2];
+        _snwprintf(path, MAX_PATH * 2, L"%ls\\%ls", s_dirw, fd.cFileName);
+        path[MAX_PATH * 2 - 1] = 0;
+        if (load_file(path, tag))
+            (*loaded)++;
+        else
+            (*skipped)++;
+    } while (FindNextFileW(fh, &fd));
+    FindClose(fh);
+}
+
 void bw_pscache_init(void)
 {
     const char *e = getenv("BW_GPU_PSCACHE");
-    char pat[MAX_PATH + 16];
-    WIN32_FIND_DATAA fd;
-    HANDLE fh;
+    wchar_t ew[MAX_PATH];
+    DWORD en = GetEnvironmentVariableW(L"BW_GPU_PSCACHE", ew, MAX_PATH);
     LARGE_INTEGER t0, t1, fq;
+    unsigned vs_skipped = 0;
     if (s_on >= 0)
         return;
     s_on = 0;
@@ -148,37 +193,28 @@ void bw_pscache_init(void)
         fprintf(stderr, "[PSCACHE] off (BW_GPU_PSCACHE=0): every pixel shader compiles\n");
         return;
     }
-    if (e && *e)
-        _snprintf(s_dir, sizeof s_dir, "%s", e);
-    else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, s_dir)))
-        strncat(s_dir, "\\xboxrecomp\\shadercache", sizeof s_dir - strlen(s_dir) - 1);
+    if (en && en < MAX_PATH)
+        _snwprintf(s_dirw, MAX_PATH, L"%ls", ew);
+    else if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, s_dirw)))
+        wcsncat(s_dirw, L"\\xboxrecomp\\shadercache", MAX_PATH - wcslen(s_dirw) - 1);
     else
         return;
-    s_dir[sizeof s_dir - 1] = 0;
-    SHCreateDirectoryExA(NULL, s_dir, NULL);
-    s_tag = make_tag();
+    s_dirw[MAX_PATH - 1] = 0;
+    if (!WideCharToMultiByte(CP_UTF8, 0, s_dirw, -1, s_dir, sizeof s_dir, NULL, NULL))
+        s_dir[0] = 0;
+    SHCreateDirectoryExW(NULL, s_dirw, NULL);
+    s_tag = make_tag("ps_5_0|ps_main|O3");
+    s_tag_vs = make_tag("vs_5_0|vs_main|O3|IEEE");     /* item 43: get_vsh's compile */
     s_on = 1;
     QueryPerformanceFrequency(&fq);
     QueryPerformanceCounter(&t0);
-    _snprintf(pat, sizeof pat, "%s\\ps_*.bin", s_dir);
-    pat[sizeof pat - 1] = 0;
-    fh = FindFirstFileA(pat, &fd);
-    if (fh != INVALID_HANDLE_VALUE) {
-        do {
-            char path[MAX_PATH * 2];
-            _snprintf(path, sizeof path, "%s\\%s", s_dir, fd.cFileName);
-            path[sizeof path - 1] = 0;
-            if (load_file(path))
-                s_loaded++;
-            else
-                s_skipped++;
-        } while (FindNextFileA(fh, &fd));
-        FindClose(fh);
-    }
+    load_dir("ps", s_tag, &s_loaded, &s_skipped);
+    load_dir("vs", s_tag_vs, &s_vs_loaded, &vs_skipped);
     QueryPerformanceCounter(&t1);
     fprintf(stderr, "[PSCACHE] %u pixel shaders loaded from %s (%u skipped: other compiler or"
                     " version, or damaged) in %.1f ms\n", s_loaded, s_dir, s_skipped,
             (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart);
+    fprintf(stderr, "[PSCACHE] %u vertex shaders loaded (%u skipped)\n", s_vs_loaded, vs_skipped);
 }
 
 int bw_pscache_verify(void)
@@ -190,56 +226,124 @@ int bw_pscache_verify(void)
     return s_verify;
 }
 
-const void *bw_pscache_find(const char *src, size_t len, size_t *size)
+static const void *find_h(uint64_t h1, uint64_t h2, uint32_t textlen, size_t *size)
 {
-    uint64_t h1, h2;
     unsigned i;
     if (s_on <= 0 || !s_n)
         return NULL;
-    h1 = h_a(src, len);
-    h2 = h_b(src, len);
     for (i = 0; i < s_n; i++)
-        if (s_ent[i].h1 == h1 && s_ent[i].h2 == h2 && s_ent[i].textlen == (uint32_t)len) {
+        if (s_ent[i].h1 == h1 && s_ent[i].h2 == h2 && s_ent[i].textlen == textlen) {
             *size = s_ent[i].size;
             return s_ent[i].blob;
         }
     return NULL;
 }
 
-void bw_pscache_store(const char *src, size_t len, const void *blob, size_t size)
+const void *bw_pscache_find(const char *src, size_t len, size_t *size)
+{
+    if (s_on <= 0 || !s_n)
+        return NULL;
+    return find_h(h_a(src, len), h_b(src, len), (uint32_t)len, size);
+}
+
+/* Keep one shader's bytes, in memory and in its file (kind "ps" or "vs").
+ * 1 when the file was written. */
+static int store_h(const char *kind, uint64_t tag, uint64_t h1, uint64_t h2, uint32_t textlen,
+                   const void *blob, size_t size)
 {
     PscHeader h;
-    char tmp[MAX_PATH * 2], fin[MAX_PATH * 2];
+    wchar_t tmp[MAX_PATH * 2], fin[MAX_PATH * 2];
     size_t have = 0;
     FILE *f;
     int ok;
     if (s_on <= 0 || !blob || !size || size >= (4u << 20))
-        return;
+        return 0;
     memset(&h, 0, sizeof h);
     h.magic = PSC_MAGIC;
     h.version = PSC_VERSION;
-    h.tag = s_tag;
-    h.h1 = h_a(src, len);
-    h.h2 = h_b(src, len);
-    h.textlen = (uint32_t)len;
+    h.tag = tag;
+    h.h1 = h1;
+    h.h2 = h2;
+    h.textlen = textlen;
     h.blobsize = (uint32_t)size;
     h.blobsum = fnv64(blob, size, 0xCBF29CE484222325ull);
-    if (bw_pscache_find(src, len, &have) == NULL)
-        add(h.h1, h.h2, h.textlen, blob, h.blobsize);
-    _snprintf(fin, sizeof fin, "%s\\ps_%016llX.bin", s_dir, (unsigned long long)h.h1);
-    _snprintf(tmp, sizeof tmp, "%s\\ps_%016llX.%lu.%lu.tmp", s_dir, (unsigned long long)h.h1,
-              (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
-    fin[sizeof fin - 1] = 0;
-    tmp[sizeof tmp - 1] = 0;
-    f = fopen(tmp, "wb");
+    {
+        const void *old = find_h(h1, h2, textlen, &have);
+        if (old == NULL)
+            add(h.h1, h.h2, h.textlen, blob, h.blobsize);
+        else if (have != size || memcmp(old, blob, size)) {
+            /* 0.2.5 item 41: bytes the driver rejected (the caller then
+             * compiles): the fresh ones replace them here and in the file
+             * below, so the next run loads good bytes. */
+            unsigned i;
+            void *copy = malloc(size);
+            for (i = 0; copy && i < s_n; i++)
+                if (s_ent[i].blob == old) {
+                    memcpy(copy, blob, size);
+                    free(s_ent[i].blob);
+                    s_ent[i].blob = copy;
+                    s_ent[i].size = h.blobsize;
+                    copy = NULL;
+                    break;
+                }
+            free(copy);
+            fprintf(stderr, "[PSCACHE] a cached %s shader (%s_%016llX) was replaced by a fresh compile\n",
+                    kind[0] == 'v' ? "vertex" : "pixel", kind, (unsigned long long)h.h1);
+        }
+    }
+    _snwprintf(fin, MAX_PATH * 2, L"%ls\\%hs_%016llX.bin", s_dirw, kind, (unsigned long long)h.h1);
+    _snwprintf(tmp, MAX_PATH * 2, L"%ls\\%hs_%016llX.%lu.%lu.tmp", s_dirw, kind,
+               (unsigned long long)h.h1, (unsigned long)GetCurrentProcessId(),
+               (unsigned long)GetTickCount());
+    fin[MAX_PATH * 2 - 1] = 0;
+    tmp[MAX_PATH * 2 - 1] = 0;
+    f = _wfopen(tmp, L"wb");
     if (!f)
-        return;
+        return 0;
     ok = fwrite(&h, 1, sizeof h, f) == sizeof h && fwrite(blob, 1, h.blobsize, f) == h.blobsize;
     ok = (fclose(f) == 0) && ok;
-    if (!ok || !MoveFileExA(tmp, fin, MOVEFILE_REPLACE_EXISTING))
-        DeleteFileA(tmp);
-    else
+    if (!ok || !MoveFileExW(tmp, fin, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp);
+        return 0;
+    }
+    return 1;
+}
+
+void bw_pscache_store(const char *src, size_t len, const void *blob, size_t size)
+{
+    if (s_on <= 0)
+        return;
+    if (store_h("ps", s_tag, h_a(src, len), h_b(src, len), (uint32_t)len, blob, size))
         s_stored++;
+}
+
+const void *bw_pscache_find_vs(const char *src, size_t len, int ws, size_t *size)
+{
+    uint64_t h1, h2;
+    const void *p;
+    if (s_on <= 0 || !s_n)
+        return NULL;
+    vs_hash(src, len, ws, &h1, &h2);
+    p = find_h(h1, h2, (uint32_t)len, size);
+    if (p)
+        s_vs_hits++;
+    return p;
+}
+
+void bw_pscache_store_vs(const char *src, size_t len, int ws, const void *blob, size_t size)
+{
+    uint64_t h1, h2;
+    if (s_on <= 0)
+        return;
+    vs_hash(src, len, ws, &h1, &h2);
+    if (store_h("vs", s_tag_vs, h1, h2, (uint32_t)len, blob, size))
+        s_vs_stored++;
+}
+
+void bw_pscache_vs_counts(unsigned *hits, unsigned *stored)
+{
+    *hits = s_vs_hits;
+    *stored = s_vs_stored;
 }
 
 void bw_pscache_note(int compiled, double ms)

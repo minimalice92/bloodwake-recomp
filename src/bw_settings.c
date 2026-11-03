@@ -21,6 +21,7 @@
 #include <string.h>
 #include "bw_edition.h"
 #include "bw_settings.h"
+#include "bw_hookcheck.h"
 
 typedef struct {
     const char *value, *label, *effect;
@@ -30,6 +31,7 @@ typedef struct {
     const char *tab, *section, *key, *label, *tip, *dflt;
     const char *editions;       /* "all", or "remastered" (and every later edition) */
     BwOpt opt[8];
+    const char *kind;           /* NULL: a list of choices; "check": a checkbox (on/off) */
 } BwSetting;
 
 #define ON_OFF(ID) { { "on", "On", "fix:+" #ID }, { "off", "Off", "fix:-" #ID } }
@@ -58,10 +60,14 @@ static const BwSetting s_set[] = {
         { "custom", "Custom", "" } } },
 
     /* ---- Display --------------------------------------------------------- */
+    /* Item 102 (the maintainer): Fullscreen (borderless) by default. A file that says
+     * mode = window (0.2.4 wrote it for everyone) stays Window: no migration
+     * (call 83). No settings file at all still means the game's own window.
+     * Never in a preset. */
     { "Display", "display", "mode", "Window",
       "Play in a window, or fill the whole screen without a border (Alt+Enter or F11 "
       "switches while you play).",
-      "window", "all",
+      "fullscreen", "all",
       { { "window", "Window", "" },
         { "fullscreen", "Fullscreen (borderless)", "env:RECOMP_FULLSCREEN=1" } } },
     { "Display", "display", "window_size", "Window size",
@@ -183,9 +189,33 @@ static const BwSetting s_set[] = {
       "compression steps; from a distance they look exactly as before, and the sea, "
       "spray and the HUD are untouched. The menu photos and logo movies are cleaned the same way.",
       "on", "remastered", ON_OFF(VFX_TEX_RESTORE) },
-    { "Graphics", "graphics", "hdr", "HDR",
-      "Brighter highlights on an HDR screen. Needs HDR turned on in Windows.",
-      "off", "remastered", ON_OFF(VFX_HDR) },
+    /* Item 100 (D-026, reversed to opt-in): one checkbox, Automatic HDR, off
+     * by default. Checked: the game's HDR from the screen's own data
+     * (BW_VFX_HDR=auto), and the launcher switches Windows HDR on for the
+     * session when the screen supports HDR and reports its data, and back
+     * afterwards (tools/launcher.pyw). Unchecked: no HDR highlights
+     * (BW_VFX_HDR=off); the game's standards mapping on a screen already in
+     * HDR mode always applies. 0.2.4's hdr = on reads as checked, off as
+     * unchecked. BW_VFX_HDR=on (forced, HDR1000 defaults) stays an engine and
+     * [advanced] switch only. Never in a preset (D-021). */
+    { "Graphics", "graphics", "hdr", "Automatic HDR",
+      "Plays in HDR on screens that support it: Blood Wake switches Windows HDR on while you "
+      "play and back afterwards, and maps the picture from the screen's own data by the ITU's "
+      "standards. Off by default.",
+      "off", "remastered",
+      { { "on", "On", "env:BW_VFX_HDR=auto" },
+        { "off", "Off", "fix:-VFX_HDR;env:BW_VFX_HDR=off" } },
+      "check" },
+    /* Item 99 (the maintainer): the game's BT.709 colours read as P3-D65 on a screen
+     * in HDR mode (bw_vfx_post.c). Never in a preset (it depends on the
+     * screen, like HDR); Accurate is the default. */
+    { "Graphics", "graphics", "gamut", "Colour",
+      "Wide stretches the game's colours onto the P3 colour range of wide-gamut screens: more "
+      "vivid reds, greens and blues; white and greys don't change. Only on a screen in HDR mode. "
+      "Accurate shows the colours exactly as made.",
+      "bt709", "remastered",
+      { { "bt709", "Accurate (BT.709)", "env:BW_VFX_GAMUT=bt709" },
+        { "p3stretch", "Wide (P3 stretch)", "env:BW_VFX_GAMUT=p3stretch" } } },
     { "Graphics", "graphics", "oled_care", "OLED care",
       "Slowly dims parts of the picture that don't change for a long time (the HUD, a "
       "paused menu), to spare an OLED screen.",
@@ -306,11 +336,29 @@ static const BwSetting s_set[] = {
       "on", "remastered",
       { { "on", "On", "fix:+OCEAN_REFLECT_SINGLE" },
         { "off", "As shipped", "fix:-OCEAN_REFLECT_SINGLE" } } },
+    /* C3's items 78 and 79 (src/bw_menu_hooks.c). The arrow is written as its
+     * UTF-8 bytes, so the source stays ASCII; js() turns it into →. */
+    { "Fixes", "fixes", "menu_quit", "Game Demos \xe2\x86\x92 Quit Game",
+      "The main menu's Game Demos sign starts the console's demo disc, which a PC can't run "
+      "(it only goes back to the title). On, the sign reads Quit Game and closes the game, "
+      "as closing the window does.",
+      "on", "remastered", ON_OFF(MENU_QUIT) },
+    { "Fixes", "fixes", "menu_mouse", "Mouse in the menus",
+      "Use the mouse in the game's menus: in the main menu and the options menu, point at an "
+      "item to highlight it and click to choose it; everywhere in the menus a right click goes "
+      "back and the wheel moves up and down. The pointer hides while you play.",
+      "on", "remastered", ON_OFF(MENU_MOUSE) },
 
     /* ---- Controls ---------------------------------------------------------------- */
+    /* Call 89: On by default (mouse-and-keyboard play without a pad); a file
+     * from before 0.2.5 with keyboard = off reads as On (see s_old_default).
+     * The keyboard answers for port 0 only and is merged on top of a pad
+     * there (toolkit_patches/input), so a connected controller keeps working.
+     * Never in a preset. */
     { "Controls", "controls", "keyboard", "Keyboard as a controller",
-      "Lets the keyboard act as controller 1 as well as any pad.",
-      "off", "all",
+      "Lets the keyboard act as controller 1 together with any pad: a connected controller "
+      "keeps working as well. Keys only count while the game's window has the focus.",
+      "on", "all",
       { { "off", "Off", "" },
         { "on", "On", "env:RECOMP_KEYBOARD=1" } } },
 };
@@ -348,22 +396,52 @@ static const struct { const char *value, *text, *choices; } s_preset[] = {
 };
 #define BW_NPRESET ((int)(sizeof s_preset / sizeof s_preset[0]))
 
+/* ---- the settings the shaders depend on (item 21) ----------------------------
+ * A choice here changes the text of the game's pixel shaders (seen: the
+ * combiner key's vfx bits, src/gpu/bw_d3d11.c "VFX (D9)" and "T1", set from
+ * bw_vfx.c), so after a change the graphics warm-up (tools/bw_warmup.py) has
+ * new shaders to prepare. All are Remastered's: Original's shaders never
+ * change. `classes` groups the choices that make the same shaders, as
+ * "value=class ...": anti-aliasing matters only on or off (alpha to
+ * coverage); its level is in no shader. Empty: every choice is its own. */
+static const struct { const char *id, *classes; } s_shader_set[] = {
+    { "graphics.antialiasing", "off=off 2=msaa 4=msaa 8=msaa" },
+    { "graphics.sharp_text", "" },
+    { "graphics.smooth_hud_edges", "" },
+    { "graphics.texture_restoration", "" },
+};
+#define BW_NSHADER ((int)(sizeof s_shader_set / sizeof s_shader_set[0]))
+
 /* ---- the file ------------------------------------------------------------- */
+
+/* Wide all the way (item 18): a user name like "Zoë", or one outside the
+ * ANSI code page, reaches the file intact. The environment is read from the
+ * process block itself, which keeps every character the launcher passed. */
+const wchar_t *bw_settings_path_w(void)
+{
+    static wchar_t path[MAX_PATH];
+    wchar_t e[MAX_PATH], base[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"BW_SETTINGS", e, MAX_PATH);
+    if (n >= MAX_PATH)
+        return NULL;                             /* too long for a path */
+    if (n) {
+        if (!_wcsicmp(e, L"none") || !wcscmp(e, L"0") || !_wcsicmp(e, L"off"))
+            return NULL;
+        _snwprintf(path, MAX_PATH, L"%ls", e);
+    } else if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+        _snwprintf(path, MAX_PATH, L"%ls\\BloodWake\\settings.ini", base);
+    else
+        return NULL;
+    path[MAX_PATH - 1] = 0;
+    return path;
+}
 
 const char *bw_settings_path(void)
 {
-    static char path[MAX_PATH];
-    const char *e = getenv("BW_SETTINGS");
-    char base[MAX_PATH];
-    if (e && *e) {
-        if (!_stricmp(e, "none") || !strcmp(e, "0") || !_stricmp(e, "off"))
-            return NULL;
-        _snprintf(path, sizeof path, "%s", e);
-    } else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
-        _snprintf(path, sizeof path, "%s\\BloodWake\\settings.ini", base);
-    else
+    static char path[MAX_PATH * 3];
+    const wchar_t *w = bw_settings_path_w();
+    if (!w || !WideCharToMultiByte(CP_UTF8, 0, w, -1, path, (int)sizeof path, NULL, NULL))
         return NULL;
-    path[sizeof path - 1] = 0;
     return path;
 }
 
@@ -380,9 +458,9 @@ static void trim(char *s)
         *--e = 0;
 }
 
-static int read_file(const char *path, BwKv *kv, int max)
+static int read_file(const wchar_t *path, BwKv *kv, int max)
 {
-    FILE *f = fopen(path, "r");
+    FILE *f = _wfopen(path, L"r");
     char line[512], sec[32] = "";
     int n = 0;
     if (!f)
@@ -427,6 +505,39 @@ static const char *find_kv(const BwKv *kv, int n, const char *sec, const char *k
     return NULL;
 }
 
+/* The launcher writes "[launcher] format = 2" from 0.2.5 on; a file without
+ * it is from 0.2.4 or before (format 1). (Item 100 reversed call 67: 0.2.4's
+ * hdr = off stays off, on stays on.) */
+#define BW_SETTINGS_FORMAT 2
+static int file_format(const BwKv *kv, int n)
+{
+    const char *v = find_kv(kv, n, "launcher", "format");
+    return v && atoi(v) > 0 ? atoi(v) : 1;
+}
+
+/* 0.2.4's launcher wrote every setting, so its defaults are in every file it
+ * saved; where 0.2.5 changed a default, a file from before 0.2.5 (format 1)
+ * that still holds the old default reads as the new one. A choice made in
+ * 0.2.5's launcher (format 2) stays; no file at all changes nothing.
+ * tools/launcher.pyw shows the file by the same table (OLD_DEFAULTS).
+ *   call 85 (the maintainer): mode = window, held back then by the
+ *     keyboard-and-mouse support and the missing Quit Game -> Fullscreen;
+ *   call 89: keyboard = off -> On (mouse-and-keyboard play without a pad). */
+static const struct { const char *section, *key, *was, *now; } s_old_default[] = {
+    { "display", "mode", "window", "fullscreen" },
+    { "controls", "keyboard", "off", "on" },
+};
+
+static const char *before_025(const BwSetting *st, const char *v, const BwKv *kv, int n)
+{
+    int i;
+    for (i = 0; i < (int)(sizeof s_old_default / sizeof s_old_default[0]); i++)
+        if (!strcmp(st->section, s_old_default[i].section) && !strcmp(st->key, s_old_default[i].key)
+            && !_stricmp(v, s_old_default[i].was))
+            return file_format(kv, n) < BW_SETTINGS_FORMAT ? s_old_default[i].now : NULL;
+    return NULL;
+}
+
 static int env_set(const char *name)
 {
     const char *v = getenv(name);
@@ -446,10 +557,34 @@ static int fix_ok_for(const char *id, bw_edition_t ed)
     return 0;
 }
 
+/* An [advanced] line's name is a switch: capitals, digits and '_', and not
+ * one the file sets another way. */
+static int adv_name_ok(const char *key)
+{
+    const char *p;
+    if (!key[0])
+        return 0;
+    for (p = key; *p; p++)
+        if (!(isupper((unsigned char)*p) || isdigit((unsigned char)*p) || *p == '_'))
+            return 0;
+    return strcmp(key, "BW_SETTINGS") && strcmp(key, "BW_EDITION") && strcmp(key, "BW_FIX");
+}
+
+/* The [advanced] line that sets switch `name` (the last one, as everywhere
+ * in the file), or -1. */
+static int adv_line(const BwKv *kv, int n, const char *name)
+{
+    int i;
+    for (i = n - 1; i >= 0; i--)
+        if (!_stricmp(kv[i].sec, "advanced") && adv_name_ok(kv[i].key) && !_stricmp(kv[i].key, name))
+            return i;
+    return -1;
+}
+
 void bw_settings_apply(void)
 {
     static BwKv kv[BW_MAXKV];
-    static char fix[2048], log[2048], kept[512];
+    static char fix[2048], log[2048], kept[512], over[512];
     const char *path = bw_settings_path(), *ev;
     bw_edition_t ed = BW_ED_ORIGINAL;
     int n, i, k, choices = 0, envs = 0;
@@ -466,12 +601,12 @@ void bw_settings_apply(void)
         fprintf(stderr, "[SET] settings %s: applied by the launching process (inherited)\n", ev);
         return;
     }
-    n = read_file(path, kv, BW_MAXKV);
+    n = read_file(bw_settings_path_w(), kv, BW_MAXKV);
     if (n < 0) {
         fprintf(stderr, "[SET] no settings file (%s): the game's defaults\n", path);
         return;
     }
-    fix[0] = log[0] = kept[0] = 0;
+    fix[0] = log[0] = kept[0] = over[0] = 0;
 
     /* The edition first: it decides which changes a token may name. */
     ev = getenv("BW_EDITION");
@@ -495,6 +630,15 @@ void bw_settings_apply(void)
         if ((!strcmp(st->editions, "remastered") && ed == BW_ED_ORIGINAL)
             )
             continue;
+        {
+            const char *now = before_025(st, v, kv, n);
+            if (now) {
+                fprintf(stderr, "[SET] %s.%s = %s in a settings file from before 0.2.5 (no "
+                        "[launcher] format line): read as %s, 0.2.5's default\n",
+                        st->section, st->key, v, now);
+                v = now;
+            }
+        }
         for (k = 0; k < 8 && st->opt[k].value; k++)
             if (!_stricmp(st->opt[k].value, v))
                 o = &st->opt[k];
@@ -521,6 +665,11 @@ void bw_settings_apply(void)
                 if (env_set(name)) {
                     strncat(kept, " ", sizeof kept - strlen(kept) - 1);
                     strncat(kept, name, sizeof kept - strlen(kept) - 1);
+                } else if (adv_line(kv, n, name) >= 0) {
+                    /* Item 19: an [advanced] line for the same switch wins
+                     * over the table's choice (it is set below). */
+                    strncat(over, " ", sizeof over - strlen(over) - 1);
+                    strncat(over, name, sizeof over - strlen(over) - 1);
                 } else {
                     _putenv_s(name, val + 1);
                     envs++;
@@ -530,20 +679,17 @@ void bw_settings_apply(void)
             }
         }
     }
-    /* [advanced]: raw switches, NAME = value, same rule. */
+    /* [advanced]: raw switches, NAME = value. The environment still wins;
+     * over the table's choices, they win (item 19). */
     for (i = 0; i < n; i++) {
-        const char *p;
-        int good = kv[i].key[0] != 0;
         if (_stricmp(kv[i].sec, "advanced"))
             continue;
-        for (p = kv[i].key; *p; p++)
-            if (!(isupper((unsigned char)*p) || isdigit((unsigned char)*p) || *p == '_'))
-                good = 0;
-        if (!good || !strcmp(kv[i].key, "BW_SETTINGS") || !strcmp(kv[i].key, "BW_EDITION")
-            || !strcmp(kv[i].key, "BW_FIX")) {
+        if (!adv_name_ok(kv[i].key)) {
             fprintf(stderr, "[SET] advanced.%s: not a switch name; ignored\n", kv[i].key);
             continue;
         }
+        if (adv_line(kv, n, kv[i].key) != i)
+            continue;                            /* a later line for it wins */
         if (env_set(kv[i].key)) {
             strncat(kept, " ", sizeof kept - strlen(kept) - 1);
             strncat(kept, kv[i].key, sizeof kept - strlen(kept) - 1);
@@ -565,27 +711,40 @@ void bw_settings_apply(void)
         merged[sizeof merged - 1] = 0;
         _putenv_s("BW_FIX", merged);
     }
-    fprintf(stderr, "[SET] settings %s: %d choices for %s; changes %s; switches set%s%s%s%s\n",
+    fprintf(stderr, "[SET] settings %s: %d choices for %s; changes %s; switches set%s%s%s%s%s%s\n",
             path, choices, bw_edition_title(ed), fix[0] ? fix : "(none)",
-            envs ? "" : " (none)", log, kept[0] ? "; kept from the environment:" : "", kept);
+            envs ? "" : " (none)", log, kept[0] ? "; kept from the environment:" : "", kept,
+            over[0] ? "; [advanced] wins over the table for:" : "", over);
     fflush(stderr);
     _putenv_s("BW_SETTINGS_APPLIED", path);
 }
 
 /* ---- the schema, for the launcher ------------------------------------------------ */
 
+/* A JSON string of s (UTF-8: the table's text, and bw_settings_path()), in
+ * plain ASCII: anything else is a \u escape (UTF-16, so a character beyond
+ * U+FFFF is a surrogate pair), so the launcher reads the same characters
+ * whatever code page it decodes with (item 18). */
 static void js(FILE *f, const char *s)
 {
+    wchar_t buf[1024], *w = buf;
+    int n = s && *s ? MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0) : 0, i;
+    if (n > (int)(sizeof buf / sizeof buf[0]))
+        w = (wchar_t *)malloc(n * sizeof *w);
+    if (n > 0 && (!w || !MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n)))
+        n = 0;
     fputc('"', f);
-    for (; s && *s; s++) {
-        if (*s == '"' || *s == '\\')
-            fputc('\\', f);
-        if ((unsigned char)*s < 0x20)
-            fprintf(f, "\\u%04x", (unsigned char)*s);
+    for (i = 0; i < n - 1; i++) {
+        if (w[i] == '"' || w[i] == '\\')
+            fprintf(f, "\\%c", (char)w[i]);
+        else if (w[i] < 0x20 || w[i] >= 0x7f)
+            fprintf(f, "\\u%04x", (unsigned)w[i]);
         else
-            fputc(*s, f);
+            fputc((char)w[i], f);
     }
     fputc('"', f);
+    if (w && w != buf)
+        free(w);
 }
 
 /* Where id starts a word of a space-separated list (the word ending there or
@@ -666,6 +825,11 @@ void bw_settings_print_schema(FILE *f)
     const char *path = bw_settings_path();
     fprintf(f, "{\n  \"file\": ");
     js(f, path ? path : "");
+    /* C3's --keys-schema is in this exe (main.c, bw_keys.c): the launcher asks
+     * for it only when the schema says so (an exe without it would boot). */
+    fprintf(f, ",\n  \"keys_schema\": true");
+    /* And B3's --screen-info (D-026): the launcher's screen line and Auto-HDR. */
+    fprintf(f, ",\n  \"screen_info\": true");
     fprintf(f, ",\n  \"tabs\": [\"Edition\", \"Display\", \"Graphics\", \"Audio\", "
                "\"Fixes\", \"Controls\"],\n  \"advanced_section\": \"advanced\",\n  \"settings\": [\n");
     for (i = 0; i < BW_NSET; i++) {
@@ -680,8 +844,21 @@ void bw_settings_print_schema(FILE *f)
         js(f, st->label);
         fprintf(f, ", \"default\": ");
         js(f, st->dflt);
+        if (st->kind) {                             /* item 100: "check" draws a checkbox */
+            fprintf(f, ", \"kind\": ");
+            js(f, st->kind);
+        }
         fprintf(f, ", \"editions\": ");
         js(f, st->editions);
+        {   /* item 62, contract 7: an option's fix whose code differs on this copy */
+            const char *un = NULL;
+            for (k = 0; k < 8 && st->opt[k].value && !un; k++)
+                un = bw_hook_unavailable(st->opt[k].effect);
+            if (un) {
+                fprintf(f, ", \"unavailable\": ");
+                js(f, un);
+            }
+        }
         fprintf(f, ",\n     \"tip\": ");
         js(f, st->tip);
         fprintf(f, ",\n     \"options\": [");
@@ -693,6 +870,27 @@ void bw_settings_print_schema(FILE *f)
             fprintf(f, "}");
         }
         fprintf(f, "]}%s\n", i + 1 < BW_NSET ? "," : "");
+    }
+    fprintf(f, "  ],\n  \"shader_settings\": [\n");
+    for (i = 0; i < BW_NSHADER; i++) {
+        char buf[256], *tok, *ctx = NULL;
+        int c = 0;
+        fprintf(f, "    {\"id\": ");
+        js(f, s_shader_set[i].id);
+        fprintf(f, ", \"classes\": {");
+        _snprintf(buf, sizeof buf, "%s", s_shader_set[i].classes);
+        buf[sizeof buf - 1] = 0;
+        for (tok = strtok_s(buf, " ", &ctx); tok; tok = strtok_s(NULL, " ", &ctx)) {
+            char *eq = strchr(tok, '=');
+            if (!eq)
+                continue;
+            *eq = 0;
+            fprintf(f, "%s", c++ ? ", " : "");
+            js(f, tok);
+            fprintf(f, ": ");
+            js(f, eq + 1);
+        }
+        fprintf(f, "}}%s\n", i + 1 < BW_NSHADER ? "," : "");
     }
     fprintf(f, "  ],\n");
     print_presets(f);

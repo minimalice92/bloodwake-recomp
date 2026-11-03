@@ -26,8 +26,9 @@
  *   VFX_FXAA        off  BW_VFX_FXAA=1
  *   VFX_SHARPEN     off  BW_VFX_SHARPEN=0..1 (0.3 when on)
  *   VFX_BLOOM       off  BW_VFX_BLOOM=0..1 (0.25 when on)
- *   VFX_HDR         off  BW_VFX_HDR=1; BW_VFX_HDR_PAPER=<nits> (200),
- *                        BW_VFX_HDR_PEAK=<nits> (800)
+ *   VFX_HDR         off  BW_VFX_HDR=1; BW_VFX_HDR_PAPER=<nits> (BT.2408 Table 4
+ *                        for the screen's EDID peak; 203 without one),
+ *                        BW_VFX_HDR_PEAK=<nits> (the EDID peak; 800 without one)
  *   VFX_OLED_CARE   off  BW_VFX_OLED_DIM=0..0.5 (0.25 when on)
  *   VFX_AO          off  BW_VFX_AO=0..1 (0.5 when on): ambient occlusion
  *   VFX_DRAW_DISTANCE on BW_VFX_LOD=<k> (default 2): mesh LODs and draw
@@ -47,6 +48,7 @@
 #define BW_VFX_INTERNAL
 #include "bw_vfx.h"
 #include "bw_vfx_int.h"
+#include "bw_gpu_failtest.h"   /* 0.2.5 item 25: BW_GPU_FAILTEST (test aid) */
 #include "bw_edition.h"
 
 #include <d3dcompiler.h>
@@ -121,9 +123,27 @@ void bw_vfx_init(void)
     s_v.fxaa = vfx_flag(BW_FIX_VFX_FXAA, "BW_VFX_FXAA", 1.0f) != 0.0f;
     s_v.sharpen = vfx_flag(BW_FIX_VFX_SHARPEN, "BW_VFX_SHARPEN", 0.3f);
     s_v.bloom = vfx_flag(BW_FIX_VFX_BLOOM, "BW_VFX_BLOOM", 0.25f);
-    s_v.hdr = vfx_flag(BW_FIX_VFX_HDR, "BW_VFX_HDR", 1.0f) != 0.0f;
+    /* 0.2.5 item 97 (D-026): HDR 0 off, 1 on, 2 auto. BW_VFX_HDR=auto|on|off
+     * (or 1/0) decides; without it the VFX_HDR fix on means on, and nothing
+     * chosen means off (item 100: HDR is opt-in, the launcher's Automatic
+     * HDR writes BW_VFX_HDR=auto; was auto). Original: off. */
+    e = getenv("BW_VFX_HDR");
+    if (e && *e) {
+        s_v.hdr = (!_stricmp(e, "auto")) ? 2 : (e[0] == 'o' || e[0] == 'O') ? ((e[1] == 'n' || e[1] == 'N') ? 1 : 0)
+                : atof(e) > 0.0 ? 1 : 0;
+    } else
+        s_v.hdr = bw_fix_enabled(BW_FIX_VFX_HDR) ? 1 : 0;
+    if (!bw_edition_at_least(BW_ED_REMASTERED))
+        s_v.hdr = 0;
+    /* 0.2.5 item 99 (the maintainer): BW_VFX_GAMUT=bt709 (default) | p3stretch, the
+     * game's BT.709 colours read as P3-D65 on a screen in HDR mode */
+    e = getenv("BW_VFX_GAMUT");
+    s_v.gamut = e && !_stricmp(e, "p3stretch");
     e = getenv("BW_VFX_HDR_PAPER");
-    s_v.hdr_paper = e && atof(e) > 0 ? (float)atof(e) : 200.0f;
+    /* 0.2.5 item 97 (D-026): with no screen data, BT.2408's Graphics White
+     * (203, its Table 4 row for a 1000-nit display); on a screen in HDR mode
+     * bw_vfx_post.c takes paper white from the table for its EDID peak */
+    s_v.hdr_paper = e && atof(e) > 0 ? (float)atof(e) : 203.0f;
     e = getenv("BW_VFX_HDR_PEAK");
     s_v.hdr_peak = e && atof(e) > 0 ? (float)atof(e) : 800.0f;
     if (s_v.hdr_peak < s_v.hdr_paper)
@@ -157,17 +177,17 @@ void bw_vfx_init(void)
     e = getenv("BW_GPU_PRESENT");
     s_v.offscreen = e && e[0] == '0';
     s_v.active = s_v.native_res || s_v.msaa > 1 || s_v.aniso > 1 || s_v.precision || s_v.text
-              || s_v.hud_edges || s_v.fxaa || s_v.sharpen > 0.0f || s_v.bloom > 0.0f || s_v.hdr || s_v.oled_dim > 0.0f || s_v.lod > 1.0f || s_v.ao > 0.0f
+              || s_v.hud_edges || s_v.fxaa || s_v.sharpen > 0.0f || s_v.bloom > 0.0f || s_v.hdr == 1 || s_v.oled_dim > 0.0f || s_v.lod > 1.0f || s_v.ao > 0.0f
               || s_v.tex_restore;
     fprintf(stderr, "[VFX] visual suite %s: native res %s%s, MSAA %ux%s, AF %ux, precision %s, text %s, HUD edges %s,"
-                    " FXAA %s, sharpen %.2f, bloom %.2f, HDR %s (paper %.0f, peak %.0f nits),"
+                    " FXAA %s, sharpen %.2f, bloom %.2f, HDR %s (paper %.0f, peak %.0f nits until the screen is read),"
                     " OLED dim %.2f, AO %.2f, draw distance x%.1f, SSAA %.2f, guest AA %s%s\n",
             s_v.active ? "on" : "off", s_v.native_res ? "on" : "off",
             s_v.scale_force > 0.0f ? " (fixed scale)" : "", s_v.msaa,
             s_v.a2c ? " + alpha to coverage" : "", s_v.aniso,
             s_v.precision ? "16-bit" : "8-bit", s_v.text ? "on" : "off",
             s_v.hud_edges ? "on" : "off", s_v.fxaa ? "on" : "off",
-            s_v.sharpen, s_v.bloom, s_v.hdr ? "on" : "off", s_v.hdr_paper, s_v.hdr_peak,
+            s_v.sharpen, s_v.bloom, s_v.hdr == 1 ? "on" : s_v.hdr == 2 ? "auto" : "off", s_v.hdr_paper, s_v.hdr_peak,
             s_v.oled_dim, s_v.ao, s_v.lod, s_v.ssaa, s_v.guest_aa ? "kept" : "native",
             s_v.offscreen ? ", off-screen output (BW_GPU_PRESENT=0)" : "");
     fprintf(stderr, "[VFX] texture restoration %s: deblock %s, enlarged x%d above painted size, menu photos %s,"
@@ -225,13 +245,50 @@ float bw_vfx_picture_aspect(void)
     return s_pic_aspect;
 }
 
+/* 0.2.5 item 32: a new output size counts only once it has held for
+ * BW_VFX_RESIZE_MS (default 250 ms). Dragging the window's edge changes it
+ * on every frame, and each change of the render scale rebuilds and re-seeds
+ * every render target: about a second each in a Best Quality drag (run
+ * 20261103-015538-r6-gpu-i30drag: 4 sizes in 5 s). The first size counts at
+ * once; meanwhile the last frame's scale is drawn into the new window size.
+ * BW_VFX_RESIZE_MS=0 counts every size at once, as before. */
+static unsigned resize_settle_ms(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("BW_VFX_RESIZE_MS");
+        v = e && *e ? atoi(e) : 250;
+        if (v < 0) v = 0;
+        if (v > 5000) v = 5000;
+        if (v != 250)
+            fprintf(stderr, "[VFX] a new output size counts after %d ms (BW_VFX_RESIZE_MS)\n", v);
+    }
+    return (unsigned)v;
+}
+
 void bw_vfx_set_output(unsigned w, unsigned h)
 {
+    static unsigned pend_w, pend_h;
+    static ULONGLONG pend_t;
     float s;
     if (!s_v.active || !w || !h)
         return;
-    if (w == s_win_w && h == s_win_h)
+    if (w == s_win_w && h == s_win_h) {
+        pend_w = pend_h = 0;            /* back to the size in use: nothing pending */
         return;
+    }
+    if (s_win_w && s_win_h && resize_settle_ms()) {
+        ULONGLONG now = GetTickCount64();
+        if (w != pend_w || h != pend_h) {
+            pend_w = w;
+            pend_h = h;
+            pend_t = now;
+            return;
+        }
+        if (now - pend_t < resize_settle_ms())
+            return;
+    }
+    pend_w = pend_h = 0;
     s_win_w = w;
     s_win_h = h;
     s = compute_scale();
@@ -288,7 +345,7 @@ DXGI_FORMAT bw_vfx_target_format(uint32_t bpp)
 {
     if (bpp == 2)
         return DXGI_FORMAT_B5G6R5_UNORM;     /* kept: its alpha always reads 1 */
-    if (s_v.active && s_v.hdr)
+    if (s_v.active && bw_vfx_hdr_highlights())     /* item 97: HDR highlights this session */
         return DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (s_v.active && s_v.precision)
         return DXGI_FORMAT_R16G16B16A16_UNORM;
@@ -376,6 +433,10 @@ static ID3D11PixelShader *mk_ps(const char *src, size_t len, const char *entry)
 {
     ID3DBlob *b = NULL, *err = NULL;
     ID3D11PixelShader *ps = NULL;
+    if (bw_gpu_failtest("vfxshader")) {          /* item 25 test aid */
+        fprintf(stderr, "[VFX] shader %s not made (BW_GPU_FAILTEST)\n", entry);
+        return NULL;
+    }
     if (FAILED(D3DCompile(src, len, "bw_vfx", NULL, NULL, entry, "ps_5_0",
                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &err))) {
         fprintf(stderr, "[VFX] shader %s failed: %s\n", entry,

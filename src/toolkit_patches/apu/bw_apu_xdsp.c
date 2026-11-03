@@ -1082,19 +1082,25 @@ int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FR
  * Called by the carried apu_xaudio2.c at init, before any audio frame. */
 #include "../../bw_edition.h"
 
-static int s_surround_out;
+static int s_surround_out, s_surround_decided;
+static const char *s_surround_why = "";
 
 int bw_surround_output_wanted(int device_channels)
 {
     const char *e = getenv("BW_AUDIO_SURROUND");
     int want = bw_fix_enabled(BW_FIX_AUDIO_SURROUND) && device_channels >= 6;
+    s_surround_why = want ? "Remastered AUDIO_SURROUND: a 6-channel audio device" : "";
     if (e && *e) {
-        if (e[0] == 'f')
+        if (e[0] == 'f') {
             want = 1;
-        else if (e[0] == 'o' || e[0] == '0')
+            s_surround_why = "BW_AUDIO_SURROUND=force";
+        } else if (e[0] == 'o' || e[0] == '0') {
             want = 0;
+            s_surround_why = "";
+        }
     }
     s_surround_out = want;
+    s_surround_decided = 1;
     if (want) {
         s_on = 0;                                 /* no frame has run yet */
         fprintf(stderr, "[APU-XDSP] 5.1 output: the game is told surround; the DSP stage stands"
@@ -1104,8 +1110,12 @@ int bw_surround_output_wanted(int device_channels)
     return want;
 }
 
-/* For src/bw_audio_hooks.c: tell the game "surround"? */
-int bw_audio_surround_wanted(void)
+/* For src/bw_audio_hooks.c: tell the game "surround"? -1 = not decided yet
+ * (XAudio2 init hasn't run: the caller must not cache the answer), 0 or 1.
+ * why, when given, gets what decided it ("" when not surround). Item 67. */
+int bw_audio_surround_wanted(const char **why)
 {
-    return s_surround_out;
+    if (why)
+        *why = s_surround_why;
+    return s_surround_decided ? s_surround_out : -1;
 }

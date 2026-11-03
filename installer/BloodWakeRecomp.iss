@@ -16,16 +16,30 @@
 ;       /DISC="<folder or image>" [/DIR="<install folder>"] [/TASKS=desktopicon]
 ;       [/INSTALLVS] [/VSPLANONLY] [/JOBS=N] [/TOOLKIT=<dir>] [/LOG="<file>"]
 ;   /IOWNTHEGAME  you own Blood Wake and made this copy from your own disc (required when silent)
+;   /DISC         your copy (required when silent: without it Setup stops at the disc page and logs why)
+;   /ACCEPTUNVERIFIED  build a copy Setup doesn't recognise (another region, modified or damaged),
+;                 after reading the warning Setup shows in its window (required when silent for such
+;                 a copy, with /IOWNTHEGAME; it passes --allow-unverified to build_from_disc.py)
 ;   /INSTALLVS    allowed to install Microsoft's Build Tools if no Visual Studio 2022 C++ is found
 ;   /VSPLANONLY   download and hash-check the Build Tools bootstrapper and write the
 ;                 command Setup would run to deps\vs_plan.txt, but never run it (testing)
 ;   /SIMULATENOVS act as if no Visual Studio were found (testing the Build Tools path)
 ;   /SIMULATENOCMAKE act as if no CMake were found (testing pip's CMake)
+;   /SIMULATESAC  act as if Smart App Control were on (testing its page; never turn it on to test)
+;   /SIMULATEUACDECLINE (with /SIMULATENOVS) act as if Windows' permission prompt for the Build
+;                 Tools was declined (testing the message: the bootstrapper is downloaded and
+;                 hash-checked as usual, but never run)
 ;   /STUBBUILD    a fake 5-second build with placeholder files (testing the pages and uninstall)
 ;   Exit codes: 0 ok; 100 + build_from_disc.py's code when the build stopped (102 not an
 ;   unmodified retail copy, 103 a dependency, 104 pipeline, 105 generated code differs,
-;   106 compiler, 107 disk space or I/O); 110 the Build Tools install failed or was declined;
-;   Inno's own codes otherwise (2 = stopped on a page: the log says why).
+;   106 compiler, 107 disk space or I/O, 108 you stopped the build with Cancel);
+;   110 the Build Tools install failed or was declined;
+;   Inno's own codes otherwise (1 = a silent install stopped on a page: the log says why;
+;   2 = cancelled).
+;
+; One install per Windows user (item 98): there's one Settings > Apps entry and one set of
+; shortcuts, so when Blood Wake Recomp is installed, Setup offers that folder and won't
+; install into another (it offers to update the install there, or cancels; silent: stops).
 ;
 ; Uninstall (unins000.exe, or Settings > Apps): always removes the build, the
 ; installed files and the shortcuts. Options (a window, or these when silent):
@@ -106,15 +120,39 @@ MinVersion=10.0
 ArchiveExtraction=full
 Compression=lzma2/max
 SolidCompression=yes
-WizardStyle=modern dynamic windows11
+#ifndef WizStyle
+  #define WizStyle "modern dynamic windows11"
+#endif
+WizardStyle={#WizStyle}
+; Our pictures (item 15, docs/025/STYLE.md), drawn by tools/bw_icon.py in several sizes
+; for Windows' display scaling: the banner's scene beside the Welcome and Finished pages,
+; the icon at the top right of the others. They suit Windows' light and dark modes alike.
+; (The ...DynamicDark ones too: left blank, Inno shows its own dark pictures instead.)
+#ifdef WizSide
+WizardImageFile={#WizSide}
+WizardImageFileDynamicDark={#WizSide}
+#endif
+#ifdef WizSmall
+WizardSmallImageFile={#WizSmall}
+WizardSmallImageFileDynamicDark={#WizSmall}
+#endif
 OutputDir={#OutDir}
 OutputBaseFilename=BloodWakeRecomp-Setup-{#AppVer}
 ; The unpacked game (2.0 GB), the work folder (toolkit, generated code, build: about 0.25 GB), margin.
 ExtraDiskSpaceRequired=2700000000
 UninstallDisplayName=Blood Wake Recomp
+; Setup, the uninstaller and its Settings > Apps entry: our icon (docs/025/STYLE.md),
+; drawn by tools/bw_icon.py from build_installer.py
+#ifdef IconFile
+SetupIconFile={#IconFile}
+#endif
 UninstallDisplayIcon={uninstallexe}
 SetupLogging=yes
 SetupMutex=BloodWakeRecompSetup
+; The running game holds this mutex (docs/025/CONTRACTS.md 1, src/bw_host.c): Setup and the
+; uninstaller ask for Blood Wake to be closed first. The launcher holds none, so the code
+; also looks for any program running from the install folder (item 12).
+AppMutex=BloodWakeRecomp.Running
 CloseApplications=no
 ShowLanguageDialog=no
 VersionInfoDescription=Blood Wake Recomp Setup (unofficial)
@@ -130,7 +168,9 @@ ConfirmUninstall=Remove %1 now, with the choices you made?
 FinishedHeadingLabel=Blood Wake Recomp
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts (a Start menu shortcut is always added):"
+; Both ticked by default; either can be unticked (item 13). Silent: /TASKS="startmenuicon,desktopicon".
+Name: "startmenuicon"; Description: "Create a &Start menu entry"; GroupDescription: "Shortcuts:"
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
 
 [Files]
 Source: "disclaimer.txt"; Flags: dontcopy
@@ -154,6 +194,15 @@ Source: "{#VsUrl}"; DestDir: "{app}\deps"; DestName: "vs_BuildTools.exe"; Extern
 [UninstallDelete]
 Type: files; Name: "{autoprograms}\Blood Wake Recomp.lnk"
 Type: files; Name: "{autodesktop}\Blood Wake Recomp.lnk"
+; What the game and the launcher write into the install folder while you play (item 11):
+; left behind, they made the folder look like someone else's to the next Setup.
+Type: files; Name: "{app}\play.log"
+Type: files; Name: "{app}\xbox_kernel.log"
+Type: files; Name: "{app}\icall_*.dump"
+Type: files; Name: "{app}\bw_launch_next.bin"
+Type: files; Name: "{app}\bw_relaunch.bin"
+Type: files; Name: "{app}\*.dmp"
+Type: files; Name: "{app}\kept_by_uninstall.txt"
 
 [Run]
 Filename: "{app}\python\pythonw.exe"; Parameters: "-E -s ""{app}\tools\launcher.pyw"""; \
@@ -169,18 +218,23 @@ const
   LINK_NAME = 'Blood Wake Recomp.lnk';
 
 var
-  DisclaimerPage, DiscPage, DepsPage: TWizardPage;
+  DisclaimerPage, DiscPage, WarnPage, DepsPage, SacPage: TWizardPage;
+  gSacOn: Boolean;
   OwnCheck: TNewCheckBox;
   ImageRadio, FolderRadio: TNewRadioButton;
   DiscEdit: TNewEdit;
-  DiscStatus, DepsText, VSNote: TNewStaticText;
+  DiscStatus, DiscMark, DepsText, VSNote: TNewStaticText;
+  gDiscKind: Integer;
+  gQuitNoConfirm: Boolean;
+  gUnverifiedAccepted: Boolean;
   VSCheck: TNewCheckBox;
   gHaveVS, gHaveCMake, gVSPlanOnly, gStub: Boolean;
   gVSPath, gVSName, gVSVersion: String;
-  gDisc, gDiscChecked, gDiscVerdict: String;
+  gDisc, gDiscChecked, gDiscVerdict, gDiscEvaluated: String;
   gBuildOK, gBuildRan: Boolean;
   gBuildExit: Integer;
-  gBuildMsg, gLastMsg, gFingerprint: String;
+  gBuildMsg, gLastMsg, gFingerprint, gBuildReason, gCancelFile: String;
+  gInBuild, gBuildCancelled: Boolean;
   gBase, gSpan: Integer;
   gVSInstalledNow: Boolean;
   { uninstall choices }
@@ -226,6 +280,74 @@ begin
   Result := '"' + S + '"';
 end;
 
+{ ── Blood Wake running from the install folder (item 12) ────────────── }
+
+{ The programs running from Dir (the launcher's pythonw.exe, the game, its
+  helpers), as "name (PID n)" lines, or ''. WMI, so no tool is needed. }
+function RunningFrom(const Dir: String): String;
+var
+  Locator, Service, Procs, P: Variant;
+  I, N, Pid: Integer;
+  D, Path, Name: String;
+begin
+  Result := '';
+  if Dir = '' then
+    exit;
+  D := Lowercase(AddBackslash(ExpandFileName(Dir)));
+  { (the mutex is checked at the end, even when the folder is new) }
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('.', 'root\CIMV2');
+    Procs := Service.ExecQuery('SELECT ProcessId, Name, ExecutablePath FROM Win32_Process');
+    N := Procs.Count;
+    for I := 0 to N - 1 do begin
+      P := Procs.ItemIndex(I);
+      if not VarIsNull(P.ExecutablePath) then begin
+        Path := P.ExecutablePath;
+        Name := P.Name;
+        { The uninstaller's own first phase waits in the folder (unins000.exe): not Blood Wake. }
+        if (Pos(D, Lowercase(Path)) = 1) and not WildcardMatch(Lowercase(Name), 'unins*.exe') then begin
+          Pid := P.ProcessId;
+          Result := Result + '  ' + Name + ' (PID ' + IntToStr(Pid) + ')' + #13#10;
+        end;
+      end;
+    end;
+  except
+    Log('Checking for running programs failed: ' + GetExceptionMessage);
+  end;
+  { The game's own mutex (contract 1): a game started from elsewhere counts too.
+    The uninstaller's own AppMutex check comes only after its options window. }
+  if CheckForMutexes('BloodWakeRecomp.Running') and (Pos('bloodwake.exe', Lowercase(Result)) = 0) then
+    Result := Result + '  Blood Wake (the game is running)' + #13#10;
+end;
+
+{ Waits for the player to close what runs from Dir. True when nothing does
+  (or they chose to go on anyway); False to stop. Silent: logs and stops. }
+function ClosedFirst(const Dir, What: String): Boolean;
+var
+  R: String;
+  Silent: Boolean;
+begin
+  Result := True;
+  if IsUninstaller() then Silent := UninstallSilent() else Silent := WizardSilent();
+  R := RunningFrom(Dir);
+  while R <> '' do begin
+    Log('Running from ' + Dir + ':' + #13#10 + R);
+    if Silent then begin
+      Log('Stopped: close Blood Wake first (the launcher and the game), then ' + What + ' again.');
+      Result := False;
+      exit;
+    end;
+    if MsgBox('Close Blood Wake first: the launcher or the game is still running from ' + Dir + '.' + #13#10#13#10 + R + #13#10 +
+        'Close the game and the launcher, then press Try again. Cancel stops ' + What + '.', mbError, MB_RETRYCANCEL) <> IDRETRY then begin
+      Log('Stopped: Blood Wake was still running.');
+      Result := False;
+      exit;
+    end;
+    R := RunningFrom(Dir);
+  end;
+end;
+
 { ── The disc: its main program against the retail fingerprint ───────── }
 
 function U16(const S: AnsiString; Off: Integer): Integer;
@@ -257,7 +379,7 @@ end;
 
 { Finds default.xbe in an Xbox image's root folder (XDVDFS, as the toolkit's
   tools/xiso reads it) and hashes it. Layout: 'XISO' or 'full disc image'. }
-function ImageXbe(const Path: String; var Sha, Layout: String; var Size: Int64): Boolean;
+function ImageXbe(const Path: String; var Sha, Layout, Magic: String; var Size: Int64): Boolean;
 var
   F: TFileStream;
   Bases: array[0..4] of Int64;
@@ -306,6 +428,7 @@ begin
           if not ReadAt(F, Base + Sec * 2048, Size, Buf) then
             exit;
           Sha := GetSHA256OfString(Buf);
+          Magic := String(Copy(Buf, 1, 4));
           Result := True;
           exit;
         end;
@@ -318,22 +441,50 @@ begin
   end;
 end;
 
-function CheckDisc(const Path: String; var Msg: String): Boolean;
+const
+  DISC_UNUSABLE = 0;      { not an Xbox image, or no default.xbe: nothing to build }
+  DISC_VERIFIED = 1;      { its main program is the retail one Setup knows }
+  DISC_UNVERIFIED = 2;    { an Xbox program Setup doesn't recognise: the warning page, item 2 }
+
+function FileMagic(const Path: String): String;
 var
-  Sha, Layout, X: String;
+  F: TFileStream;
+  Buf: AnsiString;
+begin
+  Result := '';
+  try
+    F := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      if ReadAt(F, 0, 4, Buf) then
+        Result := String(Buf);
+    finally
+      F.Free;
+    end;
+  except
+    Result := '';
+  end;
+end;
+
+{ What the copy is: DISC_VERIFIED, DISC_UNVERIFIED or DISC_UNUSABLE, and the
+  status line in plain words. Only the main program is checked here (a second
+  or so); the build checks every other file while it copies them. }
+function CheckDisc(const Path: String; var Msg: String): Integer;
+var
+  Sha, Layout, X, Magic: String;
   Size: Int64;
 begin
-  Result := False;
+  Result := DISC_UNUSABLE;
   Sha := '';
+  Magic := '';
   Size := -1;
   if Trim(Path) = '' then begin
-    Msg := 'Pick your copy of Blood Wake first.';
+    Msg := 'Choose your copy of Blood Wake first.';
     exit;
   end;
   if DirExists(Path) then begin
     X := AddBackslash(Path) + 'default.xbe';
     if not FileExists(X) then begin
-      Msg := 'This folder has no default.xbe. Pick the folder that holds your disc''s files: default.xbe sits at its top, next to the game''s folders.';
+      Msg := 'This folder has no default.xbe. Choose the folder that holds your disc''s files: default.xbe sits at its top, next to the game''s folders.';
       exit;
     end;
     Layout := 'a folder of the disc''s files';
@@ -343,23 +494,29 @@ begin
       Msg := 'Setup couldn''t read ' + X + ': ' + GetExceptionMessage;
       exit;
     end;
+    Magic := FileMagic(X);
     if not FileSize64(X, Size) then
       Size := -1;
   end else if FileExists(Path) then begin
-    if not ImageXbe(Path, Sha, Layout, Size) then begin
-      Msg := 'This file isn''t an Xbox disc image Setup can read: it has no Xbox file system, or no default.xbe. Pick a full disc image or an XISO of your Blood Wake disc, or a folder of its files.';
+    if not ImageXbe(Path, Sha, Layout, Magic, Size) then begin
+      Msg := 'This file isn''t an Xbox disc image Setup can read: it has no Xbox file system, or no default.xbe. Choose a full disc image or an XISO of your Blood Wake disc, or a folder of its files.';
       exit;
     end;
   end else begin
     Msg := 'Setup can''t find ' + Path + '.';
     exit;
   end;
-  if (Lowercase(Sha) <> XBE_SHA256) or (Size <> XBE_SIZE) then begin
-    Msg := 'This isn''t the supported version of Blood Wake: its main program (default.xbe) doesn''t match the retail fingerprint. Only an unmodified retail copy works.';
+  if Magic <> 'XBEH' then begin
+    Msg := 'This copy''s default.xbe isn''t an Xbox program, so there''s nothing to build. Choose your Blood Wake disc image or a folder of its files.';
     exit;
   end;
-  Msg := 'Recognised: Blood Wake, ' + RETAIL_LABEL + ', ' + Layout + '. Its main program matches the retail fingerprint; Setup checks every other file while it copies them.';
-  Result := True;
+  if (Lowercase(Sha) = XBE_SHA256) and (Size = XBE_SIZE) then begin
+    Msg := 'Recognised: Blood Wake, ' + RETAIL_LABEL + '. It''s ' + Layout + ', and its main program matches the retail one; Setup checks every other file while it copies them.';
+    Result := DISC_VERIFIED;
+  end else begin
+    Msg := 'Setup doesn''t recognise this copy: it may be another region, a modified copy, or damaged. You can still go on: the next page explains what that means.';
+    Result := DISC_UNVERIFIED;
+  end;
 end;
 
 { ── Dependencies ─────────────────────────────────────────────────────── }
@@ -403,6 +560,21 @@ begin
   Log(Format('Detected: Visual Studio 2022 C++ = %s [%s %s], CMake = %d', [gVSPath, gVSName, gVSVersion, Ord(gHaveCMake)]));
 end;
 
+{ Smart App Control (item 4, docs/RISKS.md R10): when it's on and enforcing,
+  Windows blocks programs that aren't signed or known to Microsoft, so the
+  game Setup builds here won't start. 1 = on; 2 = evaluation (doesn't block);
+  0 = off. /SIMULATESAC (testing) reads "on". }
+function SmartAppControlOn(): Boolean;
+var
+  V: Cardinal;
+begin
+  if HasParam('SIMULATESAC') then begin
+    Result := True;
+    exit;
+  end;
+  Result := RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Control\CI\Policy', 'VerifiedAndReputablePolicyState', V) and (V = 1);
+end;
+
 function WantVS(): Boolean;
 begin
   Result := (not gHaveVS) and (VSCheck.Checked or gVSPlanOnly);
@@ -443,19 +615,87 @@ begin
   WizardForm.NextButton.Enabled := OwnCheck.Checked;
 end;
 
+{ Next goes on only when the path in the box is the one that was checked and
+  the copy is usable. While the box is empty or the copy can't be used, Next
+  stays greyed out and the status line says what's needed. }
+procedure UpdateDiscNext();
+begin
+  if WizardForm.CurPageID = DiscPage.ID then
+    WizardForm.NextButton.Enabled := (gDiscChecked <> '') and (Trim(DiscEdit.Text) = gDiscChecked);
+end;
+
+{ The mark beside the path (docs/025/STYLE.md's status colours, for Windows'
+  light or dark mode): a tick for a recognised copy, ! for one Setup doesn't
+  recognise, a cross for one it can't use. Never colour alone: the status line
+  says it in words. }
+procedure ShowMark(Kind: Integer; Shown: Boolean);
+begin
+  DiscMark.Visible := Shown;
+  if Kind = DISC_VERIFIED then begin
+    DiscMark.Caption := #$2714;
+    if IsDarkInstallMode() then DiscMark.Font.Color := $8ECF3F else DiscMark.Font.Color := $4E7F1B;
+  end else if Kind = DISC_UNVERIFIED then begin
+    DiscMark.Caption := '!';
+    if IsDarkInstallMode() then DiscMark.Font.Color := $41B0F5 else DiscMark.Font.Color := $005B9A;
+  end else begin
+    DiscMark.Caption := #$2716;
+    if IsDarkInstallMode() then DiscMark.Font.Color := $5F4AFF else DiscMark.Font.Color := $2F18C0;
+  end;
+end;
+
 procedure ShowDiscResult();
 var
   Msg: String;
 begin
   gDisc := Trim(DiscEdit.Text);
-  if CheckDisc(gDisc, Msg) then begin
-    gDiscChecked := gDisc;
-    gDiscVerdict := Msg;
-    DiscStatus.Caption := Msg;
-  end else begin
+  gDiscEvaluated := gDisc;
+  gUnverifiedAccepted := False;          { a new copy needs its own answer }
+  if gDisc = '' then begin
     gDiscChecked := '';
-    DiscStatus.Caption := 'Not usable: ' + Msg;
+    gDiscKind := DISC_UNUSABLE;
+    DiscStatus.Caption := 'Choose your copy of Blood Wake to go on: press Browse, or type or paste where it is.';
+    ShowMark(DISC_UNUSABLE, False);
+  end else begin
+    if DirExists(gDisc) then
+      FolderRadio.Checked := True        { the choice follows what was picked, for Browse }
+    else if FileExists(gDisc) then
+      ImageRadio.Checked := True;
+    gDiscKind := CheckDisc(gDisc, Msg);
+    if gDiscKind <> DISC_UNUSABLE then begin
+      gDiscChecked := gDisc;
+      gDiscVerdict := Msg;
+      DiscStatus.Caption := Msg;
+    end else begin
+      gDiscChecked := '';
+      DiscStatus.Caption := 'Not usable: ' + Msg;
+    end;
+    ShowMark(gDiscKind, True);
   end;
+  UpdateDiscNext();
+end;
+
+{ The box changed (typed, pasted or browsed). A path that exists is checked at
+  once (a folder: about a second; an image: a few seconds at most); one that
+  doesn't exist yet just says so, so typing isn't slowed down. }
+procedure DiscChanged(Sender: TObject);
+var
+  S: String;
+begin
+  S := Trim(DiscEdit.Text);
+  if S = gDiscEvaluated then begin
+    UpdateDiscNext();
+    exit;
+  end;
+  if (S <> '') and not DirExists(S) and not FileExists(S) then begin
+    gDiscEvaluated := '';
+    gDiscChecked := '';
+    gDiscKind := DISC_UNUSABLE;
+    ShowMark(DISC_UNUSABLE, False);
+    DiscStatus.Caption := 'Setup can''t find this yet. Type or paste the full path of your disc image or folder, or press Browse.';
+    UpdateDiscNext();
+    exit;
+  end;
+  ShowDiscResult();
 end;
 
 procedure BrowseClick(Sender: TObject);
@@ -464,17 +704,14 @@ var
 begin
   S := Trim(DiscEdit.Text);
   if ImageRadio.Checked then begin
-    if GetOpenFileName('Pick your Blood Wake disc image', S, ExtractFileDir(S),
-        'Xbox disc images (*.iso;*.xiso)|*.iso;*.xiso|All files (*.*)|*.*', 'iso') then begin
-      DiscEdit.Text := S;
-      ShowDiscResult();
-    end;
+    if GetOpenFileName('Choose your Blood Wake disc image', S, ExtractFileDir(S),
+        'Xbox disc images (*.iso;*.xiso)|*.iso;*.xiso|All files (*.*)|*.*', 'iso') then
+      DiscEdit.Text := S;      { OnChange checks it }
   end else begin
-    if BrowseForFolder('Pick the folder with your Blood Wake disc''s files (the one with default.xbe in it):', S, False) then begin
+    if BrowseForFolder('Choose the folder with your Blood Wake disc''s files (the one with default.xbe in it):', S, False) then
       DiscEdit.Text := S;
-      ShowDiscResult();
-    end;
   end;
+  DiscChanged(nil);            { the same path again: OnChange doesn't fire }
 end;
 
 procedure FillDepsPage();
@@ -550,13 +787,14 @@ begin
   OwnCheck.Checked := HasParam('IOWNTHEGAME');
 
   { The disc }
-  DiscPage := CreateCustomPage(DisclaimerPage.ID, 'Your copy of Blood Wake',
-    'Where are the files from your disc?');
+  DiscPage := CreateCustomPage(DisclaimerPage.ID, 'Choose your disc',
+    'Setup builds the game from your own copy of Blood Wake.');
   Intro := TNewStaticText.Create(DiscPage);
   Intro.Parent := DiscPage.Surface;
   Intro.Width := DiscPage.SurfaceWidth;
   Intro.WordWrap := True;
-  Intro.Caption := 'Pick a disc image you made from your own disc (a full disc image or an XISO), or a folder with the disc''s files. Setup only reads it: it copies the game''s files into the install folder.';
+  Intro.Caption := 'This is the step where you choose your copy of Blood Wake. Setup can''t go on without one.' + #13#10#13#10 +
+    'Choose a disc image you made from your own disc (a full disc image or an XISO), or a folder with the disc''s files. Setup only reads it: it copies the game''s files into the install folder.';
   Intro.AdjustHeight;
   ImageRadio := TNewRadioButton.Create(DiscPage);
   ImageRadio.Parent := DiscPage.Surface;
@@ -574,7 +812,20 @@ begin
   DiscEdit := TNewEdit.Create(DiscPage);
   DiscEdit.Parent := DiscPage.Surface;
   DiscEdit.Top := FolderRadio.Top + FolderRadio.Height + ScaleY(12);
-  DiscEdit.Width := DiscPage.SurfaceWidth - ScaleX(90);
+  DiscEdit.Width := DiscPage.SurfaceWidth - ScaleX(118);
+  DiscMark := TNewStaticText.Create(DiscPage);
+  DiscMark.Parent := DiscPage.Surface;
+  DiscMark.AutoSize := False;
+  DiscMark.Font.Name := 'Segoe UI Symbol';
+  DiscMark.Font.Size := 13;
+  DiscMark.Font.Style := [fsBold];
+  DiscMark.Left := DiscEdit.Left + DiscEdit.Width + ScaleX(4);
+  DiscMark.Top := DiscEdit.Top - ScaleY(4);
+  DiscMark.Width := ScaleX(22);
+  DiscMark.Height := ScaleY(26);
+  DiscMark.Alignment := taCenter;
+  DiscMark.StyleElements := [seClient, seBorder];   { keep its own colour under Setup's light or dark style }
+  DiscMark.Visible := False;
   Browse := TNewButton.Create(DiscPage);
   Browse.Parent := DiscPage.Surface;
   Browse.Top := DiscEdit.Top - ScaleY(1);
@@ -591,13 +842,42 @@ begin
   DiscStatus.WordWrap := True;
   DiscStatus.Height := ScaleY(80);
   DiscStatus.Caption := '';
-  if not CmdParam('DISC', V) or (V = '') then
+  { Silent installs use /DISC only (NextButtonClick stops them without it); the
+    wizard offers the last install's disc. }
+  if (not CmdParam('DISC', V) or (V = '')) and not WizardSilent() then
     V := GetPreviousData('Disc', '');
   DiscEdit.Text := V;
   if DirExists(V) then
     FolderRadio.Checked := True;
-  if V <> '' then
-    ShowDiscResult();
+  ShowDiscResult();
+  DiscEdit.OnChange := @DiscChanged;
+
+  { The warning for a copy Setup doesn't recognise (item 2). Accept goes on,
+    Decline stops Setup, Back picks another copy. }
+  WarnPage := CreateCustomPage(DiscPage.ID, 'This copy isn''t recognised',
+    'Read this before you go on.');
+  Memo := TNewMemo.Create(WarnPage);
+  Memo.Parent := WarnPage.Surface;
+  Memo.Left := 0;
+  Memo.Top := 0;
+  Memo.Width := WarnPage.SurfaceWidth;
+  Memo.Height := WarnPage.SurfaceHeight;
+  Memo.ScrollBars := ssVertical;
+  Memo.ReadOnly := True;
+  Memo.WordWrap := True;
+  Memo.Text :=
+    'Setup doesn''t recognise your copy of Blood Wake: its main program isn''t the ' + RETAIL_LABEL + ' one Setup knows. ' +
+    'It may be another region, a modified copy, or damaged. You can still build it if all of this is fine with you.' + #13#10#13#10 +
+    'Ownership' + #13#10 +
+    'You must own the game this copy came from. Blood Wake Recomp contains nothing from the game and doesn''t provide it.' + #13#10#13#10 +
+    'Safety' + #13#10 +
+    'A copy from an unknown source can be tampered with. Setup turns the copy''s program into a program that runs on this PC, ' +
+    'so a tampered copy could act as malware. Use only a copy you made from your own disc.' + #13#10#13#10 +
+    'The game' + #13#10 +
+    'Other versions or modified copies may not build, may crash, or may behave differently. Remastered''s fixes switch themselves ' +
+    'off where the code differs. Saves may not carry over between versions, and bug reports from unverified copies get best-effort help.' + #13#10#13#10 +
+    'Accept builds this copy anyway; it''s recorded as an unverified copy. Decline stops Setup without installing anything. ' +
+    'Back lets you choose another copy.';
 
   { What's needed }
   DepsPage := CreateCustomPage(wpSelectDir, 'What Blood Wake needs',
@@ -625,29 +905,109 @@ begin
   VSNote.Height := ScaleY(48);
   VSNote.Caption := 'From microsoft.com, about 3 GB on drive C:. Windows asks for permission for this one step. Other programs can use them too, so the uninstaller keeps them unless you ask.';
   FillDepsPage();
+
+  { Smart App Control (item 4): shown only when it's on }
+  gSacOn := SmartAppControlOn();
+  Log(Format('Smart App Control on: %d', [Ord(gSacOn)]));
+  SacPage := CreateCustomPage(DepsPage.ID, 'Smart App Control will block the game',
+    'It''s on on this PC. Read this before you go on.');
+  Intro := TNewStaticText.Create(SacPage);
+  Intro.Parent := SacPage.Surface;
+  Intro.Width := SacPage.SurfaceWidth;
+  Intro.WordWrap := True;
+  Intro.Caption :=
+    'Setup builds Blood Wake on this PC, so the game isn''t code-signed by anyone. Smart App Control, a Windows security feature, ' +
+    'is on here: it blocks programs that aren''t signed or known to Microsoft, so it will stop the game from starting.' + #13#10#13#10 +
+    'To play, turn it off: open Windows Security, then App & browser control > Smart App Control settings, and choose Off. ' +
+    'It''s a setting for the whole PC, and on some versions of Windows it can''t be turned back on without reinstalling Windows, ' +
+    'so it''s your decision.' + #13#10#13#10 +
+    'Continue anyway builds the game now; it starts once Smart App Control is off. Cancel stops Setup without installing anything.';
+  Intro.AdjustHeight;
+end;
+
+function SacNote(): String;
+begin
+  Result := '';
+  if gSacOn then
+    Result := #13#10#13#10 + 'Smart App Control is on, so Windows will block the game until you turn it off: ' +
+      'Windows Security > App & browser control > Smart App Control settings > Off.';
+end;
+
+{ Where to start the game, for the shortcuts that were actually made (item 13). }
+function StartWhere(): String;
+var
+  S, D: Boolean;
+begin
+  S := WizardIsTaskSelected('startmenuicon');
+  D := WizardIsTaskSelected('desktopicon');
+  if S and D then
+    Result := 'Start it from the Start menu or the desktop: "Blood Wake Recomp".'
+  else if S then
+    Result := 'Start it from the Start menu: "Blood Wake Recomp".'
+  else if D then
+    Result := 'Start it from the desktop: "Blood Wake Recomp".'
+  else
+    Result := 'You chose no shortcuts: start it with "Blood Wake.cmd" in ' + ExpandConstant('{app}') + ', or tick the box below to open the launcher now.';
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
+var
+  V: String;
 begin
   if CurPageID = DisclaimerPage.ID then begin
     { interactive only: silent installs reach NextButtonClick, which logs why it stops }
     if not WizardSilent() then
       WizardForm.NextButton.Enabled := OwnCheck.Checked;
-  end else if CurPageID = DepsPage.ID then
+  end else if CurPageID = DiscPage.ID then begin
+    if not WizardSilent() then
+      UpdateDiscNext();
+  end;
+  { The warning page's own buttons: Accept and Decline }
+  if CurPageID = WarnPage.ID then begin
+    WizardForm.NextButton.Caption := '&Accept';
+    WizardForm.CancelButton.Caption := '&Decline';
+  end else
+    WizardForm.CancelButton.Caption := SetupMessage(msgButtonCancel);
+  if CurPageID = SacPage.ID then
+    WizardForm.NextButton.Caption := 'Continue &anyway';
+  if CurPageID = DepsPage.ID then
     FillDepsPage()
   else if CurPageID = wpFinished then begin
     if gBuildOK then
       WizardForm.FinishedLabel.Caption := 'Blood Wake is built and ready.' + #13#10#13#10 + gFingerprint + #13#10#13#10 +
-        'Start it from the Start menu: "Blood Wake Recomp". The launcher lets you pick Original (exactly as shipped) or Remastered, set up your screen and controls, and press Play.'
+        StartWhere() + ' The launcher lets you pick Original (exactly as shipped) or Remastered, set up your screen and controls, and press Play.' +
+        SacNote()
     else
       WizardForm.FinishedLabel.Caption := 'Setup installed its files, but the game wasn''t built:' + #13#10#13#10 + gBuildMsg + #13#10#13#10 +
         'The build''s logs are in ' + ExpandConstant('{app}\work\logs') + '. Fix the problem and run Setup again: it picks up where it left off. Or remove everything from Settings > Apps.';
+    { Inno sized the label for its own text: fit ours, and keep the launcher box below it }
+    WizardForm.FinishedLabel.AdjustHeight;
+    WizardForm.RunList.Top := WizardForm.FinishedLabel.Top + WizardForm.FinishedLabel.Height + ScaleY(12);
+    V := WizardForm.FinishedLabel.Caption;
+    StringChangeEx(V, #13#10, ' / ', True);
+    Log('Finished page: ' + V);
   end;
 end;
 
 { The install folder must be new, empty, or an earlier Blood Wake Recomp install:
   the uninstaller removes the folders Setup and the build put there (game, build,
   tools, work, python...), and must never meet someone else's folder of that name. }
+{ What an earlier Blood Wake Recomp leaves in its folder after an uninstall:
+  the game's runtime files (0.2.4's uninstaller didn't remove them), and the
+  Python or the game's files when the player chose to keep them. }
+function KnownLeftover(const Dir, Name: String; IsDir: Boolean): Boolean;
+var
+  N: String;
+begin
+  N := Lowercase(Name);
+  if IsDir then
+    Result := ((N = 'python') and FileExists(AddBackslash(Dir) + 'python\.bw_python'))
+      or ((N = 'game') and DirExists(AddBackslash(Dir) + 'game\disc'))
+  else
+    Result := (N = 'play.log') or (N = 'xbox_kernel.log') or (N = 'bw_launch_next.bin') or (N = 'bw_relaunch.bin')
+      or (N = 'kept_by_uninstall.txt') or WildcardMatch(N, 'icall_*.dump') or WildcardMatch(N, '*.dmp');
+end;
+
 function FolderUsable(const Dir: String): Boolean;
 var
   F: TFindRec;
@@ -655,12 +1015,15 @@ begin
   Result := True;
   if not DirExists(Dir) then
     exit;
-  if FileExists(AddBackslash(Dir) + 'installer.ini') or FileExists(AddBackslash(Dir) + 'unins000.dat') then
+  if FileExists(AddBackslash(Dir) + 'installer.ini') or FileExists(AddBackslash(Dir) + 'unins000.dat')
+      or FileExists(AddBackslash(Dir) + 'kept_by_uninstall.txt') then
     exit;
   if FindFirst(AddBackslash(Dir) + '*', F) then
     try
       repeat
-        if (F.Name <> '.') and (F.Name <> '..') then begin
+        if (F.Name <> '.') and (F.Name <> '..')
+            and not KnownLeftover(Dir, F.Name, (F.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) then begin
+          Log('The install folder holds something that isn''t Blood Wake Recomp''s: ' + F.Name);
           Result := False;
           exit;
         end;
@@ -670,12 +1033,67 @@ begin
     end;
 end;
 
+{ The folder Blood Wake Recomp is already installed in (its Settings > Apps
+  entry), or '' when it isn't, or when that install's uninstaller is gone (the
+  folder was deleted by hand: nothing is left to protect). }
+function RegisteredDir(): String;
+begin
+  Result := WizardForm.PrevAppDir;
+  if (Result <> '') and not FileExists(AddBackslash(Result) + 'unins000.exe') then begin
+    Log('An earlier install is registered in ' + Result + ', but its uninstaller is gone: treated as not installed.');
+    Result := '';
+  end;
+end;
+
+function SameDir(const A, B: String): Boolean;
+begin
+  Result := Lowercase(RemoveBackslashUnlessRoot(ExpandFileName(A))) = Lowercase(RemoveBackslashUnlessRoot(ExpandFileName(B)));
+end;
+
+{ Item 98: there's one Settings > Apps entry and one set of shortcuts, so a
+  second install in another folder would take over the first's, and
+  uninstalling it would leave the first with neither. When it's already
+  installed, Setup updates that install, or stops. }
+function OneInstallOnly(): Boolean;
+var
+  R: String;
+begin
+  Result := True;
+  R := RegisteredDir();
+  if (R = '') or SameDir(WizardDirValue, R) then
+    exit;
+  if WizardSilent() then begin
+    Log('Stopped at the folder page: Blood Wake Recomp is already installed in ' + R + ', and /DIR names another folder (' +
+      WizardDirValue + '). Install into ' + R + ' to update it, or uninstall it first to move it.');
+    Result := False;
+    exit;
+  end;
+  Log('Already installed in ' + R + '; the folder page names ' + WizardDirValue + ': asking.');
+  if TaskDialogMsgBox('Blood Wake Recomp is already installed',
+      'It''s installed in ' + R + '.' + #13#10#13#10 +
+      'Setup can update that install. Two installs in different folders would share one entry in Settings > Apps and the same shortcuts, ' +
+      'so to move it, uninstall it first (Settings > Apps), then run Setup again.',
+      mbConfirmation, MB_YESNO, ['Install it there instead' + #10 + 'Updates the install in ' + R, 'Cancel Setup'], 0) = IDYES then begin
+    WizardForm.DirEdit.Text := R;
+    Log('Installing into the existing folder instead: ' + R);
+  end else begin
+    Log('Cancelled: Blood Wake Recomp is already installed in ' + R + '.');
+    gQuitNoConfirm := True;
+    WizardForm.Close;
+    Result := False;
+  end;
+end;
+
 function NextButtonClick(CurPageID: Integer): Boolean;
 var
   Msg: String;
 begin
   Result := True;
   if CurPageID = wpSelectDir then begin
+    if not OneInstallOnly() then begin
+      Result := False;
+      exit;
+    end;
     if not FolderUsable(WizardDirValue) then begin
       Msg := 'Please pick a new or empty folder: ' + WizardDirValue + ' already has other things in it. Setup puts several folders inside the install folder, and the uninstaller removes them again, so it needs a folder of its own.';
       Log('Stopped at the folder page: ' + Msg);
@@ -688,16 +1106,34 @@ begin
       Result := False;
     end;
   end else if CurPageID = DiscPage.ID then begin
+    { Only a path that was checked and passed goes on: an empty box never does
+      (both '' would otherwise match). }
     gDisc := Trim(DiscEdit.Text);
-    if (gDisc = '') or (gDisc <> gDiscChecked) then
+    if gDisc <> gDiscEvaluated then
       ShowDiscResult();
-    if gDisc <> gDiscChecked then begin
-      CheckDisc(gDisc, Msg);
+    if (gDiscChecked = '') or (gDisc <> gDiscChecked) then begin
+      if gDisc = '' then begin
+        if WizardSilent() then
+          Msg := 'No disc was given: silent installs need /DISC="<folder or disc image>".'
+        else
+          Msg := 'Choose your copy of Blood Wake first: press Browse, or type or paste where it is.';
+      end else
+        CheckDisc(gDisc, Msg);
       Log('Stopped at the disc page: ' + Msg);
       SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
       Result := False;
     end else
       Log('Disc: ' + gDisc + ': ' + gDiscVerdict);
+  end else if CurPageID = WarnPage.ID then begin
+    if WizardSilent() and not HasParam('ACCEPTUNVERIFIED') then begin
+      Log('Stopped at the warning page: Setup doesn''t recognise this copy (' + gDisc + '). Silent installs of an unverified copy need /ACCEPTUNVERIFIED as well as /IOWNTHEGAME.');
+      Result := False;
+    end else begin
+      gUnverifiedAccepted := True;
+      Log('The unverified-copy warning was accepted for ' + gDisc + ': the build goes on with --allow-unverified.');
+    end;
+  end else if CurPageID = SacPage.ID then begin
+    Log('Smart App Control is on: the game will be blocked until it''s turned off (Windows Security > App & browser control > Smart App Control settings > Off). Going on, as chosen.');
   end else if CurPageID = DepsPage.ID then begin
     if (not gHaveVS) and (not WantVS()) then begin
       Msg := 'Blood Wake can''t be built without Microsoft''s C++ build tools. Tick the box to let Setup install them, or install Visual Studio 2022 (with "Desktop development with C++") yourself and run Setup again.';
@@ -705,6 +1141,24 @@ begin
       SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
       Result := False;
     end;
+  end;
+end;
+
+{ The warning page is only for a copy Setup doesn't recognise. }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := ((PageID = WarnPage.ID) and (gDiscKind <> DISC_UNVERIFIED))
+    or ((PageID = SacPage.ID) and not gSacOn);
+end;
+
+{ Decline on the warning page stops Setup at once: the answer was given. }
+procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
+begin
+  if gQuitNoConfirm then
+    Confirm := False                    { the player already chose "Cancel Setup" (item 98) }
+  else if CurPageID = WarnPage.ID then begin
+    Confirm := False;
+    Log('The unverified-copy warning was declined: Setup stops, nothing was installed.');
   end;
 end;
 
@@ -718,8 +1172,12 @@ function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoType
 var
   S: String;
 begin
-  S := 'Your copy of Blood Wake:' + NewLine + Space + gDisc + NewLine + Space + 'Recognised: Blood Wake, ' + RETAIL_LABEL +
-    NewLine + Space + '(its main program matches the retail fingerprint)' + NewLine + NewLine;
+  S := 'Your copy of Blood Wake:' + NewLine + Space + gDisc + NewLine;
+  if gDiscKind = DISC_VERIFIED then
+    S := S + Space + 'Recognised: Blood Wake, ' + RETAIL_LABEL + NewLine + Space + '(its main program matches the retail one)' + NewLine + NewLine
+  else
+    S := S + Space + 'Not recognised: you accepted the warning, so Setup builds it anyway' + NewLine + Space +
+      '(it''s recorded as an unverified copy)' + NewLine + NewLine;
   S := S + MemoDirInfo + NewLine + NewLine;
   S := S + 'Setup will download:' + NewLine;
   if NeedPython() then
@@ -822,11 +1280,16 @@ begin
   if JsonValue(S, 'error') = 'true' then begin
     gBuildMsg := Msg;
     gBuildExit := StrToIntDef(JsonValue(S, 'exit'), 1);
+    gBuildReason := JsonValue(S, 'reason');
   end;
   if Step = 'log' then
     exit;
-  if (Step = 'fingerprint') and (JsonValue(S, 'error') <> 'true') and (Pct >= 20) then
-    gFingerprint := 'Your copy checks out: ' + Msg + '.';
+  if (Step = 'fingerprint') and (JsonValue(S, 'error') <> 'true') and (Pct >= 20) then begin
+    if (JsonValue(S, 'verdict') = '') or (JsonValue(S, 'verdict') = 'verified') then
+      gFingerprint := 'Your copy checks out: ' + Msg + '.'
+    else
+      gFingerprint := 'Your copy: ' + Msg + '.';
+  end;
   if Msg <> '' then
     gLastMsg := Msg;
   WizardForm.StatusLabel.Caption := StepText(Step);
@@ -851,10 +1314,110 @@ begin
   end;
 end;
 
+{ The build without Exec's wait (item 10). Inno disables its window while Exec
+  waits, so Cancel couldn't be pressed. The helper is started without waiting;
+  it writes its progress lines (the first with its process id) to a file, and
+  Setup reads them while it keeps its own window answering, until the helper
+  ends. A message is passed through untouched, so its layout doesn't matter. }
+type
+  TMsgBuf = record
+    A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P: Longint;
+  end;
+
+function PeekMessage(var Msg: TMsgBuf; Wnd: Longint; MinF, MaxF, Remove: Cardinal): Boolean;
+  external 'PeekMessageW@user32 stdcall';
+function TranslateMessage(var Msg: TMsgBuf): Boolean;
+  external 'TranslateMessage@user32 stdcall';
+function DispatchMessage(var Msg: TMsgBuf): Longint;
+  external 'DispatchMessageW@user32 stdcall';
+function OpenProcess(Access: Cardinal; Inherit: Boolean; Pid: Cardinal): THandle;
+  external 'OpenProcess@kernel32 stdcall';
+function WaitForSingleObject(H: THandle; Ms: Cardinal): Cardinal;
+  external 'WaitForSingleObject@kernel32 stdcall';
+function GetExitCodeProcess(H: THandle; var Code: Cardinal): Boolean;
+  external 'GetExitCodeProcess@kernel32 stdcall';
+function CloseHandle(H: THandle): Boolean;
+  external 'CloseHandle@kernel32 stdcall';
+function GetTickCount(): Cardinal;
+  external 'GetTickCount@kernel32 stdcall';
+
+procedure PumpMessages();
+var
+  M: TMsgBuf;
+begin
+  while PeekMessage(M, 0, 0, 0, 1) do begin       { PM_REMOVE }
+    TranslateMessage(M);
+    DispatchMessage(M);
+  end;
+end;
+
+function RunHelperLive(const Params: String; var Code: Integer): Boolean;
+var
+  Py, Prog, S: String;
+  Lines: TArrayOfString;
+  Seen, N, I, R: Integer;
+  Pid, C, T0: Cardinal;
+  H: THandle;
+  Ended: Boolean;
+begin
+  Result := False;
+  Code := -1;
+  Py := ExpandConstant('{app}\python\python.exe');
+  Prog := ExpandConstant('{app}\setup\progress.jsonl');
+  DeleteFile(Prog);
+  Log('Running (live): ' + Py + ' -I -u setup_helper.py ' + Params);
+  if not Exec(Py, '-I -u ' + ArgQuote(ExpandConstant('{app}\setup\setup_helper.py')) + ' ' + Params,
+      ExpandConstant('{app}'), SW_HIDE, ewNoWait, R) then begin
+    Log('The helper did not start: ' + SysErrorMessage(R));
+    exit;
+  end;
+  Seen := 0;
+  Pid := 0;
+  H := 0;
+  Ended := False;
+  T0 := GetTickCount();
+  repeat
+    PumpMessages();
+    Sleep(100);
+    if (H <> 0) and (WaitForSingleObject(H, 0) = 0) then
+      Ended := True;
+    if LoadStringsFromFile(Prog, Lines) then begin
+      N := GetArrayLength(Lines);
+      { The newest line counts once it's whole (each is one JSON object, written at
+        once): holding it back until the next one came hid a long step's line. }
+      if (not Ended) and (N > 0) then begin
+        S := Trim(Lines[N - 1]);
+        if (S = '') or (S[Length(S)] <> '}') then
+          N := N - 1;
+      end;
+      for I := Seen to N - 1 do begin
+        S := Lines[I];
+        if JsonValue(S, 'step') = 'pid' then begin
+          Pid := StrToIntDef(JsonValue(S, 'pid'), 0);
+          H := OpenProcess($00101000, False, Pid);   { SYNCHRONIZE, PROCESS_QUERY_LIMITED_INFORMATION }
+          Log(Format('The helper is process %d', [Pid]));
+        end else if JsonValue(S, 'step') <> 'exit' then
+          OnHelperLine(S, False, I = 0);
+      end;
+      if N > Seen then
+        Seen := N;
+    end;
+    if (Pid = 0) and (GetTickCount() - T0 > 120000) then begin
+      Log('The helper wrote nothing for 2 minutes: giving up on it.');
+      exit;
+    end;
+  until Ended;
+  if GetExitCodeProcess(H, C) then
+    Code := C;
+  CloseHandle(H);
+  Result := True;
+end;
+
 function InstallBuildTools(): Boolean;
 var
   Boot, Target, Args, Ini: String;
   Code: Integer;
+  Started: Boolean;
 begin
   Result := False;
   Boot := ExpandConstant('{app}\deps\vs_BuildTools.exe');
@@ -875,8 +1438,20 @@ begin
   WizardForm.StatusLabel.Caption := 'Installing Microsoft''s Build Tools for Visual Studio 2022...';
   WizardForm.FilenameLabel.Caption := 'Windows asks for permission. This takes 10 to 30 minutes and downloads about 2 GB from Microsoft.';
   Log('VS Build Tools: ' + Boot + ' ' + Args);
-  if not ShellExec('', Boot, Args, '', SW_SHOWNORMAL, ewWaitUntilTerminated, Code) then begin
-    gBuildMsg := 'Microsoft''s Build Tools couldn''t be installed (' + SysErrorMessage(Code) + '). If you declined the permission prompt, run Setup again and allow it, or install Visual Studio 2022 with "Desktop development with C++" yourself.';
+  if HasParam('SIMULATEUACDECLINE') then begin
+    { testing: exactly what ShellExec reports when Windows' permission prompt is declined }
+    Log('VS Build Tools: /SIMULATEUACDECLINE, not run; as if the permission prompt was declined (error 1223)');
+    Started := False;
+    Code := 1223;
+  end else
+    Started := ShellExec('', Boot, Args, '', SW_SHOWNORMAL, ewWaitUntilTerminated, Code);
+  if not Started then begin
+    if Code = 1223 then         { ERROR_CANCELLED: the prompt was declined }
+      gBuildMsg := 'Microsoft''s build tools weren''t installed: Windows'' permission prompt was declined, so nothing was changed. ' +
+        'To build Blood Wake, run Setup again and choose Yes when Windows asks, or install Visual Studio 2022 with "Desktop development with C++" yourself.'
+    else
+      gBuildMsg := 'Microsoft''s build tools couldn''t be installed (' + SysErrorMessage(Code) + '). Run Setup again, or install Visual Studio 2022 with "Desktop development with C++" yourself.';
+    Log('VS Build Tools: ' + gBuildMsg);
     exit;
   end;
   Log(Format('VS Build Tools exit code %d', [Code]));
@@ -903,9 +1478,14 @@ begin
   Params := '-E -s ' + ArgQuote(ExpandConstant('{app}\tools\launcher.pyw'));
   Exe := ExpandConstant('{app}\build\Release\bloodwake.exe');
   try
-    CreateShellLink(ExpandConstant('{autoprograms}\' + LINK_NAME), 'Blood Wake (unofficial PC port): the launcher',
-      Pyw, Params, ExpandConstant('{app}'), Exe, 0, SW_SHOWNORMAL);
-    if WizardIsTaskSelected('desktopicon') then
+    if WizardIsTaskSelected('startmenuicon') then
+      CreateShellLink(ExpandConstant('{autoprograms}\' + LINK_NAME), 'Blood Wake (unofficial PC port): the launcher',
+        Pyw, Params, ExpandConstant('{app}'), Exe, 0, SW_SHOWNORMAL)
+    else
+      DeleteFile(ExpandConstant('{autoprograms}\' + LINK_NAME));      { an earlier install's }
+    if not WizardIsTaskSelected('desktopicon') then
+      DeleteFile(ExpandConstant('{autodesktop}\' + LINK_NAME))
+    else
       CreateShellLink(ExpandConstant('{autodesktop}\' + LINK_NAME), 'Blood Wake (unofficial PC port): the launcher',
         Pyw, Params, ExpandConstant('{app}'), Exe, 0, SW_SHOWNORMAL);
   except
@@ -913,10 +1493,31 @@ begin
   end;
 end;
 
+{ Cancel during the build (item 10). Inno greys Cancel out once its files are
+  copied; Setup turns it back on for the build. Pressing it asks first, then
+  writes the cancel file: setup_helper.py stops the build and every process it
+  started (a job object), and the build ends as a failed one does. }
+procedure BuildCancelClick(Sender: TObject);
+begin
+  if not gInBuild or gBuildCancelled then
+    exit;
+  if SuppressibleMsgBox('Stop building Blood Wake?' + #13#10#13#10 +
+      'Setup stops the build and everything it started. The files Setup installed stay: run Setup again later to build the game ' +
+      '(it starts the build afresh), or remove them from Settings > Apps.', mbConfirmation, MB_YESNO, IDNO) = IDYES then begin
+    gBuildCancelled := True;
+    SaveStringToFile(gCancelFile, 'cancel' + #13#10, False);
+    WizardForm.CancelButton.Enabled := False;
+    WizardForm.StatusLabel.Caption := 'Stopping the build...';
+    Log('Cancel pressed during the build: the helper was asked to stop it.');
+  end;
+end;
+
 procedure RunBuild();
 var
   Code: Integer;
   Params, V, Ini: String;
+  Retry: Boolean;
+  OldCancel: TNotifyEvent;
 begin
   gBuildRan := True;
   gBuildOK := False;
@@ -946,22 +1547,58 @@ begin
     exit;
   end;
 
-  { The build: 2-100% }
-  gBase := 20;
-  gSpan := 980;
-  gBuildMsg := '';
-  gBuildExit := 0;
-  Params := 'build --source ' + ArgQuote(ExpandConstant('{app}\source'));
-  if gStub then
-    Params := Params + ' --stub';
-  Params := Params + ' -- --disc ' + ArgQuote(gDisc) + ' --install-dir ' + ArgQuote(ExpandConstant('{app}'));
-  if CmdParam('JOBS', V) and (StrToIntDef(V, 0) > 0) then
-    Params := Params + ' --jobs ' + V;
-  if CmdParam('TOOLKIT', V) and (V <> '') then
-    Params := Params + ' --toolkit ' + ArgQuote(V);
-  if not RunHelper(Params, Code) then
-    Code := -1;
-  Log(Format('Build exit code %d', [Code]));
+  { The build: 2-100%. A copy whose main program is the retail one but whose
+    other files differ is only found by the build (the disc page checks the
+    program alone): then Setup asks, and builds it again if the player accepts. }
+  gCancelFile := ExpandConstant('{app}\setup\cancel.flag');
+  DeleteFile(gCancelFile);
+  gBuildCancelled := False;
+  OldCancel := WizardForm.CancelButton.OnClick;
+  WizardForm.CancelButton.OnClick := @BuildCancelClick;
+  WizardForm.CancelButton.Enabled := True;
+  gInBuild := True;
+  repeat
+    Retry := False;
+    gBase := 20;
+    gSpan := 980;
+    gBuildMsg := '';
+    gBuildReason := '';
+    gBuildExit := 0;
+    Params := 'build --source ' + ArgQuote(ExpandConstant('{app}\source')) + ' --cancel-file ' + ArgQuote(gCancelFile) +
+      ' --progress-file ' + ArgQuote(ExpandConstant('{app}\setup\progress.jsonl'));
+    if gStub then
+      Params := Params + ' --stub';
+    Params := Params + ' -- --disc ' + ArgQuote(gDisc) + ' --install-dir ' + ArgQuote(ExpandConstant('{app}'));
+    if gUnverifiedAccepted or HasParam('ACCEPTUNVERIFIED') then
+      Params := Params + ' --allow-unverified --accepted-in Setup';
+    if CmdParam('JOBS', V) and (StrToIntDef(V, 0) > 0) then
+      Params := Params + ' --jobs ' + V;
+    if CmdParam('TOOLKIT', V) and (V <> '') then
+      Params := Params + ' --toolkit ' + ArgQuote(V);
+    if not RunHelperLive(Params, Code) then
+      Code := -1;
+    Log(Format('Build exit code %d', [Code]));
+    if gBuildCancelled then begin
+      Code := 8;
+      gBuildExit := 8;
+      gBuildMsg := 'You stopped the build. Run Setup again to build the game, or remove what Setup installed from Settings > Apps.';
+    end else if (Code = 2) and (gBuildReason = 'files differ') and not gUnverifiedAccepted and not WizardSilent() then begin
+      if SuppressibleMsgBox('Your copy''s main program is the retail one, but some of its other files differ from the retail disc:' + #13#10#13#10 +
+          gBuildMsg + #13#10#13#10 +
+          'It may be a modified or damaged copy. Such a copy may crash or behave differently, and bug reports from it get best-effort help. ' +
+          'You must own the game it came from.' + #13#10#13#10 +
+          'Build it anyway? It''s recorded as a copy whose files differ.', mbConfirmation, MB_YESNO, IDNO) = IDYES then begin
+        gUnverifiedAccepted := True;
+        Log('The "files differ" warning was accepted: building again with --allow-unverified.');
+        Retry := True;
+      end else
+        Log('The "files differ" warning was declined: no build.');
+    end;
+  until not Retry;
+  gInBuild := False;
+  WizardForm.CancelButton.Enabled := False;
+  WizardForm.CancelButton.OnClick := OldCancel;
+  DeleteFile(gCancelFile);
   if Code <> 0 then begin
     if gBuildExit = 0 then
       gBuildExit := Code;
@@ -975,9 +1612,25 @@ begin
     exit;
   end;
   gBuildOK := True;
-  if gFingerprint = '' then
-    gFingerprint := 'Your copy checks out: ' + gDiscVerdict;
+  if gFingerprint = '' then begin
+    if gDiscKind = DISC_VERIFIED then
+      gFingerprint := 'Your copy checks out: ' + gDiscVerdict
+    else
+      gFingerprint := 'Your copy isn''t a recognised one: it was built as you accepted.';
+  end;
   V := 'setup_version={#AppVer} disc=' + ArgQuote(gDisc) + ' python_private=true';
+  if gDiscKind = DISC_VERIFIED then
+    V := V + ' disc_page=verified'
+  else
+    V := V + ' disc_page=unverified';
+  if gUnverifiedAccepted or HasParam('ACCEPTUNVERIFIED') then
+    V := V + ' unverified_accepted=true'
+  else
+    V := V + ' unverified_accepted=false';
+  if gSacOn then
+    V := V + ' smart_app_control=on'
+  else
+    V := V + ' smart_app_control=off';
   if gVSInstalledNow then
     V := V + ' vs_buildtools_installed_by_setup=true vs_buildtools_path=' + ArgQuote(GetIniString('vs', 'path', '', Ini))
   else
@@ -987,10 +1640,21 @@ begin
   WizardForm.ProgressGauge.Position := 1000;
 end;
 
+{ Updating a folder the launcher or the game is running from would leave
+  locked files behind (item 12). }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if not ClosedFirst(WizardDirValue, 'Setup') then
+    Result := 'Blood Wake is still running from ' + WizardDirValue + '. Close the game and the launcher, then run Setup again.';
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssPostInstall then
+  if CurStep = ssPostInstall then begin
+    DeleteFile(ExpandConstant('{app}\kept_by_uninstall.txt'));    { ours again }
     RunBuild();
+  end;
 end;
 
 function GetCustomSetupExitCode(): Integer;
@@ -999,7 +1663,7 @@ begin
   if gBuildRan and not gBuildOK then begin
     if gBuildExit = 10 then
       Result := 110
-    else if (gBuildExit >= 2) and (gBuildExit <= 7) then
+    else if (gBuildExit >= 2) and (gBuildExit <= 8) then
       Result := 100 + gBuildExit
     else
       Result := 109;
@@ -1030,6 +1694,10 @@ var
   Y, W: Integer;
 begin
   Result := True;
+  if not ClosedFirst(ExpandConstant('{app}'), 'the uninstall') then begin
+    Result := False;
+    exit;
+  end;
   uVSOurs := GetIniString('vs', 'installed_by_setup', '0', ExpandConstant('{app}\installer.ini')) = '1';
   uKeepSaves := not HasParam('REMOVESAVES');
   uRemovePython := not HasParam('KEEPPYTHON');
@@ -1208,6 +1876,17 @@ begin
       Gone(App + '\python', True);
     RemoveUserData();
     Gone(App + '\installer.ini', False);
-  end else if CurUninstallStep = usPostUninstall then
-    RemoveDir(ExpandConstant('{app}'));
+  end else if CurUninstallStep = usPostUninstall then begin
+    App := ExpandConstant('{app}');
+    { Kept on purpose (/KEEPPYTHON, /KEEPGAME or the boxes): say so in the folder,
+      so the next Setup knows it's ours and installs into it again (item 11). }
+    if DirExists(App + '\python') or DirExists(App + '\game') then begin
+      SaveStringToFile(App + '\kept_by_uninstall.txt',
+        'The Blood Wake Recomp uninstaller kept these here on purpose: ' +
+        'the private Python (python) and/or the game''s files from your disc (game).' + #13#10 +
+        'Setup can install into this folder again and reuses them. If you don''t need them, delete this folder.' + #13#10, False);
+      Log('Kept on purpose; marker written: ' + App + '\kept_by_uninstall.txt');
+    end;
+    RemoveDir(App);
+  end;
 end;

@@ -11,6 +11,9 @@ cmake_minimum_required(VERSION 3.20)
 # ============================================================================
 
 project(bloodwake C)
+if(MSVC)
+    enable_language(RC)       # src/bloodwake.rc: the icon
+endif()
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -83,23 +86,30 @@ set(GAME_SOURCES
     src/bw_state.c
     src/bw_debugflags.c
     src/bw_edition.c          # BW_EDITION: the editions (D-015)
+    src/bw_hookcheck.c        # item 62: hooks check the code they attach to (bw_hookcheck_table.h)
     src/bw_settings.c         # the launcher's settings file (bw_settings.h)
+    src/bw_keys.c             # settings.ini [keys]: key bindings, steering ramp, deadzones (0.2.5)
     src/bw_hifps_hooks.c      # Remastered high frame rate (D-016): D-011 wrappers, see the file
     src/bw_widescreen.c       # Remastered widescreen: the picture's shape
+    src/bw_monitor.c          # the monitor the game is on (0.2.5 item 34, contract 6)
     src/bw_remaster_hooks.c   # edition hooks (D-011 wrappers; run_pipeline scans it)
     ${BW_EDITION_EXTRA_SOURCES}
     src/bw_audio_hooks.c      # audio D-011 wrappers: the speaker configuration (docs/day1/D2.md)
     src/bw_fix_hooks.c        # Remastered (D-016): the original game's own bugs fixed (docs/day1/D11.md)
     src/bw_visextra_hooks.c   # Remastered: faithful game-side visual extras (docs/day1/T3.md)
     src/bw_ocean_native.c     # Remastered: the native ocean (docs/day1/P2a.md, OCEAN_NATIVE)
+    src/bw_cheat_hooks.c      # settings.ini [cheats] on the first boot (0.2.5 item 77; D-011 wrapper)
+    src/bw_menu_hooks.c       # the menus on a PC: Quit Game, the mouse (0.2.5 items 78-79; D-011 wrappers)
     src/gpu/bw_d3d11.c
     src/gpu/bw_rc_hlsl.c
     src/gpu/bw_vsh_hlsl.c
     src/gpu/bw_gpu_audit.c    # BW_GPU_AUDIT=1: what the game asks of the GPU, counted
     src/gpu/bw_ab.c           # BW_GPU_AB: same-run A/B for GPU fixes (test aid)
     src/gpu/bw_gamma.c        # the title's DAC gamma ramp (D3DDevice_SetGammaRamp hook)
+    src/gpu/bw_gpu_failtest.c # BW_GPU_FAILTEST, BW_GPU_DEBUG: failure switch, debug layer (0.2.5 item 25, test aids)
     src/gpu/bw_vfx.c          # Remastered visual suite (D-016): settings, render scale, helpers
     src/gpu/bw_vfx_post.c     # Remastered visual suite: the frame through its effects to the screen
+    src/gpu/bw_hdr.c          # a screen in HDR mode, every edition: scRGB, BT.2408 mapping, the EDID (0.2.5 item 97)
     src/gpu/bw_texrestore.c   # Remastered texture restoration (T1, VFX_TEX_RESTORE)
     src/gpu/bw_pscache.c      # persistent pixel-shader cache (T1, every edition)
     # Add game-specific sources here, e.g.:
@@ -123,17 +133,48 @@ add_executable(${PROJECT_NAME} WIN32
 # src/recomp/gen/bw_ocean_native.inc (git-ignored with the rest of the
 # generated C), which src/bw_ocean_native.c includes. Rebuilt whenever the
 # generated C or the translator changes.
+# The translator rewrites the .inc only when it changes, so its output can stay
+# older than its inputs; a stamp it touches on every run is what tells the build
+# it's up to date (0.2.5 item 8: it used to rerun on every build).
 set(BW_OCEAN_NATIVE_INC ${BW_GEN_DIR}/bw_ocean_native.inc)
+set(BW_OCEAN_NATIVE_STAMP ${CMAKE_CURRENT_BINARY_DIR}/bw_ocean_native.stamp)
 add_custom_command(
-    OUTPUT ${BW_OCEAN_NATIVE_INC}
+    OUTPUT ${BW_OCEAN_NATIVE_STAMP}
+    BYPRODUCTS ${BW_OCEAN_NATIVE_INC}
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/bw_ocean_xlate.py
-            --gen ${BW_GEN_DIR} --out ${BW_OCEAN_NATIVE_INC}
+            --gen ${BW_GEN_DIR} --out ${BW_OCEAN_NATIVE_INC} --stamp ${BW_OCEAN_NATIVE_STAMP}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/bw_ocean_xlate.py ${RECOMP_GEN_SOURCES}
     COMMENT "native ocean: translating the water's render-vertex functions"
     VERBATIM)
-target_sources(${PROJECT_NAME} PRIVATE ${BW_OCEAN_NATIVE_INC})
-set_source_files_properties(${BW_OCEAN_NATIVE_INC} PROPERTIES HEADER_FILE_ONLY TRUE)
+target_sources(${PROJECT_NAME} PRIVATE ${BW_OCEAN_NATIVE_STAMP} ${BW_OCEAN_NATIVE_INC})
+set_source_files_properties(${BW_OCEAN_NATIVE_INC} PROPERTIES HEADER_FILE_ONLY TRUE GENERATED TRUE)
 set_source_files_properties(src/bw_ocean_native.c PROPERTIES OBJECT_DEPENDS ${BW_OCEAN_NATIVE_INC})
+
+# The icon (0.2.5 item 14, docs/025/STYLE.md): tools/bw_icon.py draws it into
+# the build folder (no image file is kept in the repository), src/bloodwake.rc
+# embeds it in the exe, and a copy goes beside the exe for the launcher's
+# window. Redrawn only when the script changes.
+if(MSVC)
+    set(BW_ICON_DIR ${CMAKE_BINARY_DIR}/bw_icon)
+    set(BW_ICON ${BW_ICON_DIR}/bloodwake.ico)
+    add_custom_command(
+        OUTPUT ${BW_ICON}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/bw_icon.py ico --out ${BW_ICON}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/bw_icon.py
+        COMMENT "the icon: drawing it (tools/bw_icon.py)"
+        VERBATIM)
+    target_sources(${PROJECT_NAME} PRIVATE src/bloodwake.rc ${BW_ICON})
+    # rc finds bloodwake.ico there (on the .rc alone: the C files' flags don't change)
+    set_source_files_properties(src/bloodwake.rc PROPERTIES
+        OBJECT_DEPENDS ${BW_ICON} INCLUDE_DIRECTORIES ${BW_ICON_DIR})
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${BW_ICON} $<TARGET_FILE_DIR:${PROJECT_NAME}>/bloodwake.ico
+        VERBATIM)
+    # The application manifest (0.2.5 item 33): per-monitor DPI aware, so
+    # Windows display scaling isn't stretched. A .manifest source is merged
+    # with the linker's own manifest (an RT_MANIFEST in the .rc would clash).
+    target_sources(${PROJECT_NAME} PRIVATE src/bloodwake.manifest)
+endif()
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
@@ -233,6 +274,16 @@ bw_carried_patch(xbox_usb "src/usb/ohci.c"
 bw_carried_patch(xbox_usb "src/usb/usb_gamepad.c"
                  "36a29f6c38739bf1b8aa31f299fef483f1d0cc6fe03ef1e65c46de80ae512424")
 
+# 0.2.5 (lane C3, docs/025/C3.md): players take the connected controllers in
+# order whatever their Windows slot, rumble stops on focus loss and on demand,
+# optional stick deadzones, and a BW_TEST_XINPUT test switch (item 73, 74, 76).
+bw_carried_patch(xbox_input "src/input/xinput_device.c"
+                 "dba2708b822e5269748558e0d55898082d7478197324b52a56bd9224409ec05f")
+# 0.2.5 (lane C3): the player's own key bindings, steering ramp and strength
+# (settings.ini [keys], read by src/bw_keys.c; item 76).
+bw_carried_patch(xbox_input "src/input/keyboard.c"
+                 "cf4cc96718246341823e40e2ae276e49f1ec2fc550f2a115cabec81c1a1d1424")
+
 # TK-14: the APU's sequencer sample-limit tick (ISTS bit 3) fires every 2048
 # samples; Blood Wake's DirectSound answers each one with a hardware restart,
 # leaving periods of silence in the audio ~20 times a second.
@@ -296,6 +347,12 @@ target_link_libraries(xbox_apu PUBLIC bw_xemu_dsp)
 # Also the D3 wait/handle diagnostics ([BWD3] lines; BW_D3_DIAG=0 silences).
 bw_carried_patch(xbox_kernel "src/kernel/kernel_bridge.c"
                  "a065bdd6d96791f546e849d3d7b752e17a93a002f61234e36d1388a98b2de3b0")
+
+# 0.2.5 item 53: RECOMP_SAVE_DIR was decoded as UTF-8 from the CRT's ANSI copy
+# of the environment, so a save folder named with letters outside plain ASCII
+# fell back to the default one. Read wide from the process block now.
+bw_carried_patch(xbox_kernel "src/kernel/kernel_path.c"
+                 "cf6828ef163b3804de9877ce9db2ca18b46fd50c7601cfefa82c63710cdd30a9")
 
 # One window for a play session (src/bw_host.c): with BW_PARENT_HWND set, the
 # frame window is a child of the launcher's host window, so the game's

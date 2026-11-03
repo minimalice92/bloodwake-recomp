@@ -32,8 +32,9 @@ typedef struct {
     int   fxaa;            /* VFX_FXAA */
     float sharpen;          /* VFX_SHARPEN strength, 0 = off */
     float bloom;            /* VFX_BLOOM strength, 0 = off */
-    int   hdr;              /* VFX_HDR */
+    int   hdr;              /* VFX_HDR: 0 off, 1 on, 2 auto (Remastered's default; 0.2.5 item 97) */
     float hdr_paper, hdr_peak;   /* nits */
+    int   gamut;            /* BW_VFX_GAMUT: 0 bt709 (default), 1 p3stretch, on a screen in HDR mode (item 99) */
     float oled_dim;         /* VFX_OLED_CARE: the most a static bright pixel dims, 0 = off */
     float lod;              /* VFX_DRAW_DISTANCE: LOD/draw-distance factor, 1 = off */
     float ao;               /* VFX_AO strength, 0 = off */
@@ -104,9 +105,13 @@ void bw_vfx_set_scene(ID3D11ShaderResourceView *scene);
  * end of the chain; NULL for none. Set before each bw_vfx_present. */
 void bw_vfx_set_gamma_lut(ID3D11ShaderResourceView *lut);
 
-/* The swap chain's format, and its colour space once made (HDR). */
+/* The off-screen output's format; the suite's note when a swap chain is made
+ * (its format and colour space are bw_hdr.c's, every edition). */
 DXGI_FORMAT bw_vfx_swap_format(void);
 void bw_vfx_swap_created(IDXGISwapChain1 *swap);
+/* HDR highlights this session (VFX_HDR on, or auto on a screen in HDR mode
+ * whose peak is known); decided once, before the first render targets. */
+int bw_vfx_hdr_highlights(void);
 
 /* ---- text (VFX_TEXT) --------------------------------------------------------
  * Is this a glyph sheet: a DXT1 texture of white glyphs on 1-bit alpha, as

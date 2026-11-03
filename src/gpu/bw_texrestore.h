@@ -30,7 +30,7 @@
 #include <stddef.h>
 
 /* Per cached texture. Zeroed = not tried yet. */
-typedef struct {
+typedef struct BwTrSlot {
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
     uint32_t bytes;             /* VRAM of tex (estimated from its levels) */
@@ -39,6 +39,9 @@ typedef struct {
     uint8_t why;                /* BW_TR_WHY_* when state 2 */
     uint8_t lk;                 /* restored: number of enlarged levels (1 for 2x, 2 for 4x) */
     uint8_t alpha;              /* restored: 0 opaque, 1 hard (cut-out), 2 smooth */
+    uint8_t au, av;             /* the edge modes it was made with (1 wrap, 2 mirror, 0 clamp) */
+    uint8_t mixed;              /* item 48: also drawn with other edge modes */
+    struct BwTrSlot *alt;       /* item 48: the copy for the second edge modes (a pool slot), or NULL */
 } BwTrSlot;
 
 enum {
@@ -66,9 +69,20 @@ void bw_tr_request(BwTrSlot *s, uint32_t color, const uint8_t *src, uint32_t w, 
                    uint32_t levels, uint32_t addr_u, uint32_t addr_v, uint32_t addr);
 /* Once per frame on the device thread (the flip): finish the textures the
  * worker has ready, within BW_TEXRESTORE_FRAME_MS (0.3 ms; the first texture always). Changes pipeline state;
- * returns 1 if it drew (the caller rebinds its targets). */
+ * returns 1 if it drew, whether or not each texture then came out (0.2.5
+ * item 47: a failure after the enlargement drew used to return 0), and the
+ * caller then rebinds its targets. */
 int  bw_tr_pump(ID3D11Device *dev, ID3D11DeviceContext *ctx);
 void bw_tr_release(BwTrSlot *s);
+
+/* 0.2.5 item 48: the slot for a 3D draw of this texture with these NV097
+ * address modes. The enlargement treats the outer texels as the edge mode it
+ * was made for, so a texture also drawn with other modes gets a second copy
+ * for them (s->alt, untried at first: the caller asks for it with those
+ * modes). A third combination uses the first copy. The first such draw of
+ * each texture is counted and logged. Returns s itself when the modes match
+ * or s isn't restored (or being made). Device thread. */
+BwTrSlot *bw_tr_slot_for(BwTrSlot *s, uint32_t addr_u, uint32_t addr_v, uint32_t addr);
 
 /* Menu and title photos (kind 1, BW_TEXRESTORE_MENUS: the JPEG screens) and
  * movie frames (kind 2, BW_TEXRESTORE_MOVIES, item 11): the same deblock on

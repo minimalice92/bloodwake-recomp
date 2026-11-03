@@ -3,7 +3,7 @@
 
     python tools/build_from_disc.py --disc <folder|image.iso> --install-dir <dir>
         [--toolkit <dir>] [--work-dir <dir>] [--jobs N] [--check-only] [--no-warmup]
-        [--progress json]
+        [--progress json] [--allow-unverified]
 
 You bring your own copy of the game: a folder of the disc's files, an XISO, or
 a full disc image. This script checks that it is an unmodified retail copy
@@ -21,8 +21,12 @@ Steps (each prints one progress line with --progress json):
   fingerprint  every file against fingerprints/retail.json
   pipeline     tools/run_pipeline.py (no Ghidra) into <work-dir>/gen
   verify       the generated C against fingerprints/generated.json
-  build        CMake + Visual Studio 2022 (x64, Release)
-  stage        the exe, the launcher and the files it runs with, install.json
+  build        CMake + Visual Studio 2022 (x64, Release). <work-dir>/build/
+               bw_build_source.json records what the last good build was made
+               from (a digest of the sources, not file times); a build folder
+               without it, or from other sources (another version, a build
+               that failed), is compiled again from scratch
+  stage       the exe, the launcher and the files it runs with, install.json
   warmup       "Preparing graphics (one time)": a few short scenes of the built
                game, hidden and silent, so its pixel shaders are compiled into
                the shader cache before the first play (tools/bw_warmup.py; about
@@ -31,12 +35,20 @@ Steps (each prints one progress line with --progress json):
   done
 
 --check-only stops after the fingerprint (nothing is unpacked or copied).
+--allow-unverified builds a copy that isn't the recognised retail one, after
+the player accepted Setup's warning (0.2.5 item 3): a different program or
+differing files are reported and the build goes on, and a generated-C mismatch
+is listed in logs/generated_differs.txt. The verdict ("verified", "files
+differ" or "unverified") goes into install.json's "copy" and, for anything but
+verified, one line into build/Release/bw_copy.txt (docs: CONTRACTS.md 9).
 --progress json prints one JSON object per line on stdout:
   {"step": "<step>", "pct": 0-100, "msg": "..."}
 pct is the whole job's progress. A failure adds "error": true and "exit": <code>.
 Tool output goes to <work-dir>/logs/.
 
-Exit codes: 0 ok; 2 not a supported unmodified retail copy; 3 missing
+Exit codes: 0 ok; 2 not a supported unmodified retail copy (without
+--allow-unverified; its JSON line adds "reason": "files differ" when the main
+program is the retail one, or "program differs"); 3 missing
 dependency (the message says which); 4 pipeline failed; 5 the generated code
 doesn't match ours; 6 build failed; 7 disk space or I/O.
 
@@ -52,6 +64,7 @@ import argparse
 import datetime as _dt
 import glob
 import hashlib
+import http.client
 import json
 import os
 import queue
@@ -97,9 +110,23 @@ PIPE_SECONDS = {"parse": 2, "disasm": 520, "funcid": 3, "abi": 3, "ghidra": 1, "
 
 
 class Fail(Exception):
-    def __init__(self, code, step, msg):
+    def __init__(self, code, step, msg, **extra):
         Exception.__init__(self, msg)
-        self.code, self.step, self.msg = code, step, msg
+        self.code, self.step, self.msg, self.extra = code, step, msg, extra
+
+
+# What a copy is (contract 9 in docs/025/CONTRACTS.md: install.json's "copy",
+# and bw_copy.txt beside the exe for anything but a verified copy).
+VERIFIED, FILES_DIFFER, UNVERIFIED = "verified", "files differ", "unverified"
+COPY_WORDS = {FILES_DIFFER: "copy's files differ from the retail disc", UNVERIFIED: "unverified copy"}
+# An unexpected error's exit code, by the step it happened in.
+STEP_EXIT = {"identify": EXIT_IO, "toolkit": EXIT_DEP, "unpack": EXIT_IO, "fingerprint": EXIT_DISC,
+             "pipeline": EXIT_PIPELINE, "verify": EXIT_GEN, "build": EXIT_BUILD, "stage": EXIT_IO,
+             "warmup": EXIT_IO, "done": EXIT_IO}
+STEP_WORDS = {"identify": "looking at the copy", "toolkit": "getting the toolkit", "unpack": "copying the "
+              "game's files", "fingerprint": "checking the copy", "pipeline": "translating the game's code",
+              "verify": "checking the translated code", "build": "compiling", "stage": "installing",
+              "warmup": "preparing graphics", "done": "finishing"}
 
 
 # ── Progress ──────────────────────────────────────────────────────────────
@@ -108,8 +135,10 @@ class Progress:
     def __init__(self, json_mode):
         self.json = json_mode
         self.last = 0
+        self.step = "identify"         # the step under way, for an unexpected error
 
     def __call__(self, step, frac, msg, **extra):
+        self.step = step
         lo, hi = SPAN[step]
         pct = int(round(lo + (hi - lo) * max(0.0, min(1.0, frac))))
         pct = max(pct, self.last) if not extra.get("error") else pct
@@ -291,6 +320,66 @@ def zip_tree(zf):
     return out
 
 
+class CutStream:
+    """BW_TEST_CUT_DOWNLOAD=<bytes> (testing only): the download ends after that
+    many bytes, as a dropped connection does (http.client.IncompleteRead)."""
+
+    def __init__(self, r, limit):
+        self.r, self.left = r, limit
+
+    def read(self, n=-1):
+        if self.left <= 0:
+            raise http.client.IncompleteRead(b"", None)
+        data = self.r.read(min(n if n and n > 0 else 1 << 20, self.left))
+        self.left -= len(data)
+        return data
+
+
+class SlowStream:
+    """BW_TEST_DOWNLOAD_DELAY=<seconds> (testing only): the download takes about
+    that long, in 64 KB pieces, so a test can press Setup's Cancel during it."""
+
+    def __init__(self, r, seconds, size=2300000):
+        self.r, self.pause = r, max(0.0, seconds) * 65536.0 / size
+
+    def read(self, n=-1):
+        time.sleep(self.pause)
+        return self.r.read(65536)
+
+
+def download_toolkit(zpath, prog, tries=2):
+    """The toolkit's archive into zpath. A cut-off or failed download is tried
+    once more; then it ends in the usual "couldn't download" (exit 3)."""
+    cut = os.environ.get("BW_TEST_CUT_DOWNLOAD")
+    tmp = zpath + ".part"
+    for attempt in range(1, tries + 1):
+        prog("toolkit", 0.1, "downloading xboxrecomp %s from GitHub%s" % (
+            TOOLKIT_COMMIT[:7], "" if attempt == 1 else " (second try)"))
+        try:
+            with urllib.request.urlopen(TOOLKIT_URL, timeout=120) as r, open(tmp, "wb") as f:
+                src = CutStream(r, int(cut)) if cut else r
+                if os.environ.get("BW_TEST_DOWNLOAD_DELAY"):
+                    src = SlowStream(src, float(os.environ["BW_TEST_DOWNLOAD_DELAY"]))
+                shutil.copyfileobj(src, f, 1 << 20)
+            with zipfile.ZipFile(tmp) as z:          # a short file without an error is cut off too
+                z.namelist()
+            os.replace(tmp, zpath)
+            return
+        except (OSError, http.client.HTTPException, zipfile.BadZipFile) as e:
+            why = "%s: %s" % (type(e).__name__, e) if str(e) else type(e).__name__
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if attempt < tries:
+                prog("toolkit", 0.1, "the toolkit's download was cut off or failed (%s); trying once more" % why)
+                time.sleep(3)
+                continue
+            raise Fail(EXIT_DEP, "toolkit", "Couldn't download the toolkit (%s): %s. Check the "
+                       "internet connection, or pass --toolkit <a clean checkout of %s>."
+                       % (TOOLKIT_URL, why, TOOLKIT_COMMIT))
+
+
 def get_toolkit(a, work, prog):
     """A clean toolkit folder at the pinned commit."""
     if a.toolkit:
@@ -327,16 +416,7 @@ def get_toolkit(a, work, prog):
     os.makedirs(tdir, exist_ok=True)
     zpath = os.path.join(tdir, "xboxrecomp-%s.zip" % TOOLKIT_COMMIT)
     if not (os.path.isfile(zpath) and sha256_file(zpath) == TOOLKIT_ZIP_SHA256):
-        prog("toolkit", 0.1, "downloading xboxrecomp %s from GitHub" % TOOLKIT_COMMIT[:7])
-        tmp = zpath + ".part"
-        try:
-            with urllib.request.urlopen(TOOLKIT_URL, timeout=120) as r, open(tmp, "wb") as f:
-                shutil.copyfileobj(r, f, 1 << 20)
-        except OSError as e:
-            raise Fail(EXIT_DEP, "toolkit", "Couldn't download the toolkit (%s): %s. Check the "
-                       "internet connection, or pass --toolkit <a clean checkout of %s>."
-                       % (TOOLKIT_URL, e, TOOLKIT_COMMIT))
-        os.replace(tmp, zpath)
+        download_toolkit(zpath, prog)
     zsha = sha256_file(zpath)
     try:
         zf = zipfile.ZipFile(zpath)
@@ -513,9 +593,13 @@ def check_disc(a, kind, src, tk, game_dir, retail, prog):
             ref = retail.by_key.get(path_key("default.xbe"))
             xsha = copy_hashed(image_chunks(iso, xbe[0][1], xd), None)
             if not ref or (xbe[0][1].size, xsha) != (ref["size"], ref["sha256"]):
-                ok, msg, _ = retail.compare({"default.xbe": (xbe[0][1].size, xsha)})
-                raise Fail(EXIT_DISC, "fingerprint", "This isn't the supported retail version of "
-                           "%s: its default.xbe differs (%s)." % (retail.data.get("game"), retail.data.get("label")))
+                if not a.allow_unverified:
+                    raise Fail(EXIT_DISC, "fingerprint", "This isn't the supported retail version of "
+                               "%s: its default.xbe differs (%s). Setup can build it anyway once you've "
+                               "accepted its warning (--allow-unverified)." % (
+                                   retail.data.get("game"), retail.data.get("label")), reason="program differs")
+                prog("fingerprint", 0, "its main program isn't the retail one (SHA-256 %s...): building it "
+                     "as an unverified copy, as accepted" % xsha[:12])
             total = sum(e.size for _, e in entries) or 1
             done = 0
             step = "fingerprint" if a.check_only else "unpack"
@@ -543,8 +627,9 @@ def check_disc(a, kind, src, tk, game_dir, retail, prog):
         for rel, full in files:
             k = path_key(rel)
             dest = None
-            if not (a.check_only or same) and k in retail.by_key:
-                dest = os.path.join(game_dir, *rel.split("/"))   # only the disc's own files
+            # Only the disc's own files; an unverified copy's program may need others too.
+            if not (a.check_only or same) and (k in retail.by_key or a.allow_unverified):
+                dest = os.path.join(game_dir, *rel.split("/"))
             got[rel] = (os.path.getsize(full), copy_hashed(file_chunks(full), dest))
             done += got[rel][0]
             if time.time() - last > 2:
@@ -553,14 +638,36 @@ def check_disc(a, kind, src, tk, game_dir, retail, prog):
                     "checking" if dest is None else "copying", len(got), len(files),
                     done / GB, total / GB))
     ok, msg, details = retail.compare(got)
-    if not ok:
-        raise Fail(EXIT_DISC, "fingerprint", msg)
-    prog("fingerprint", 1, msg)
+    xref = retail.by_key.get(path_key("default.xbe"))
+    xgot = next((v for r, v in got.items() if r.lower() == "default.xbe"), None)
+    xbe_ok = bool(xref and xgot and xgot == (xref["size"], xref["sha256"]))
+    verdict = VERIFIED if ok else (FILES_DIFFER if xbe_ok else UNVERIFIED)
+    if not ok and not a.allow_unverified:
+        # Only a copy whose program matches gets here (an image stops at the XBE, above).
+        raise Fail(EXIT_DISC, "fingerprint", msg + " Setup can build it anyway once you've accepted "
+                   "its warning (--allow-unverified).", reason=FILES_DIFFER if xbe_ok else "program differs")
+    if ok:
+        prog("fingerprint", 1, msg, verdict=verdict)
+    elif verdict == FILES_DIFFER:
+        parts = []
+        if details["differ"]:
+            n = len(details["differ"])
+            parts.append("%d of its files differ%s (%s%s)" % (n, "s" if n == 1 else "", ", ".join(details["differ"][:3]),
+                                                               ", ..." if n > 3 else ""))
+        if details["missing"]:
+            parts.append("%d file%s missing" % (details["missing"], " is" if details["missing"] == 1 else "s are"))
+        prog("fingerprint", 1, "its main program is the retail one, but %s: building it as accepted, "
+             "marked \"files differ\"" % " and ".join(parts), verdict=verdict)
+    else:
+        prog("fingerprint", 1, "an unverified copy (its main program isn't the retail one), built as accepted",
+             verdict=verdict)
     files = sorted((path_key(r), d) for r, (s, d) in got.items()     # as retail.json's total
                    if retail.by_key.get(path_key(r), {}).get("required", False))
     return {"kind": kind if kind == "folder" else ("redump" if "Redump" in layout else "xiso"),
             "label": retail.data.get("label"), "files_total_sha256": total_digest(files),
-            "extra_files_ignored": len(details["extra"])}
+            "extra_files_ignored": len(details["extra"]), "verdict": verdict,
+            "xbe_sha256": xgot[1] if xgot else None,
+            "files_differ": details["differ"][:50], "files_missing": details["missing"]}
 
 
 # ── Running tools ─────────────────────────────────────────────────────────
@@ -649,7 +756,10 @@ def run_pipeline(repo, tk, xbe, gen, work, prog):
     return time.time() - t0
 
 
-def verify_gen(repo, gen, prog):
+def verify_gen(repo, gen, prog, allow_unverified=False, log_dir=None):
+    """The generated C against fingerprints/generated.json: (total, differing files).
+    With allow_unverified a mismatch is logged (logs/generated_differs.txt) and
+    the build goes on, marked unverified."""
     ref = load_json(os.path.join(FINGERPRINTS, "generated.json"), "fingerprints/generated.json")
     got = gen_fingerprint(gen)
     total = total_digest((n, f["sha256"]) for n, f in got.items())
@@ -657,6 +767,22 @@ def verify_gen(repo, gen, prog):
         want = ref.get("files", {})
         differ = sorted(n for n in set(got) | set(want)
                         if got.get(n, {}).get("sha256") != want.get(n, {}).get("sha256"))
+        if allow_unverified:
+            listing = None
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+                listing = os.path.join(log_dir, "generated_differs.txt")
+                with open(listing, "w", encoding="utf-8") as f:
+                    f.write("Generated files that differ from fingerprints/generated.json (%d of %d):\n"
+                            % (len(differ), len(want)))
+                    for n in differ:
+                        f.write("  %s: ours %s, this copy's %s\n" % (
+                            n, want.get(n, {}).get("sha256", "(none)"), got.get(n, {}).get("sha256", "(none)")))
+            prog("verify", 1, "the generated code differs from ours in %d of %d files (%s%s), as expected "
+                 "for an unverified copy: building it anyway%s" % (
+                     len(differ), len(want), ", ".join(differ[:3]), ", ..." if len(differ) > 3 else "",
+                     "; list: %s" % listing if listing else ""))
+            return total, differ
         inputs = gen_inputs(repo)
         changed = sorted(k for k, v in inputs.items() if ref.get("inputs", {}).get(k) != v)
         hint = (" Source files that differ from the ones the fingerprints were made with: %s."
@@ -666,16 +792,82 @@ def verify_gen(repo, gen, prog):
                    "complete and unchanged." % (len(differ), len(want), ", ".join(differ[:4]),
                                                  ", ..." if len(differ) > 4 else "", hint, CAPSTONE))
     prog("verify", 1, "the generated code matches ours (%d files, SHA-256 %s...)" % (len(got), total[:12]))
-    return total
+    return total, []
 
 
-def build(repo, tk, gen, work, cmake, jobs, prog):
+BUILD_SOURCE = "bw_build_source.json"      # in the build folder: what its last good build was made from
+
+
+def build_source(repo, tk, gen, work, cfg, tools):
+    """A digest of everything the build reads except the regenerated C (which is
+    written fresh each time): the source tree's build files (CMakeLists.txt,
+    cmake/, src/ and the tools CMakeLists.txt runs), the toolkit's pinned commit
+    and folder, CMake's options and the tools' versions. File times play no
+    part: an older version's objects can be newer than this version's sources
+    (Setup keeps the times the files had when its source was exported)."""
+    skip = {os.path.normcase(os.path.abspath(p)) for p in (work, gen, os.path.join(repo, "src", "recomp", "gen"))}
+    rels = []
+    for top in ("CMakeLists.txt", "cmake", "src"):
+        p = os.path.join(repo, top)
+        if os.path.isfile(p):
+            rels.append(top)
+        elif os.path.isdir(p):
+            for d, dirs, names in os.walk(p):
+                dirs[:] = sorted(x for x in dirs if x != "__pycache__"
+                                 and os.path.normcase(os.path.abspath(os.path.join(d, x))) not in skip)
+                for n in sorted(names):
+                    rels.append(os.path.relpath(os.path.join(d, n), repo).replace(os.sep, "/"))
+    try:
+        with open(os.path.join(repo, "CMakeLists.txt"), encoding="utf-8", errors="replace") as f:
+            rels += sorted(set(re.findall(r"tools/[\w.-]+\.py", f.read())))       # bw_icon.py, bw_ocean_xlate.py
+    except OSError:
+        pass
+    h = hashlib.sha256()
+    for rel in rels:
+        p = os.path.join(repo, *rel.split("/"))
+        if os.path.isfile(p):
+            h.update(("%s\0%s\n" % (rel, sha256_file(p))).encode("utf-8"))
+    h.update(("toolkit %s %s %s\n" % (TOOLKIT_COMMIT, TOOLKIT_TREE_SHA256, os.path.abspath(tk))).encode("utf-8"))
+    h.update(("cmake %s\n" % subprocess.list2cmdline(cfg[1:])).encode("utf-8"))
+    h.update(("tools %s\n" % json.dumps(tools, sort_keys=True)).encode("utf-8"))
+    return {"format": 1, "digest": h.hexdigest(), "files": len(rels), "toolkit": TOOLKIT_COMMIT,
+            "cmake_args": cfg[1:], "tools": tools}
+
+
+def plan_build(bdir, want):
+    """(clean, why): build everything again unless the build folder's last good
+    build was made from exactly this source (a repair or a re-run of the same
+    version stays incremental)."""
+    if not os.path.isfile(os.path.join(bdir, "CMakeCache.txt")):
+        return False, "a new build folder"
+    try:
+        with open(os.path.join(bdir, BUILD_SOURCE), encoding="utf-8") as f:
+            old = json.load(f)
+    except (OSError, ValueError):
+        return True, "no record of what the last build was made from"
+    if old.get("digest") != want["digest"]:
+        return True, "the source changed since the last build"
+    return False, "the same source as the last build"
+
+
+def build(repo, tk, gen, work, cmake, jobs, prog, tools=None):
     bdir = os.path.join(work, "build")
     logc = os.path.join(work, "logs", "cmake_configure.log")
     logb = os.path.join(work, "logs", "cmake_build.log")
     cfg = [cmake, "-S", repo, "-B", bdir, "-G", "Visual Studio 17 2022", "-A", "x64",
            "-DXBOXRECOMP_DIR=" + tk.replace("\\", "/"), "-DBW_GEN_DIR=" + gen.replace("\\", "/"),
-           "-DPython3_EXECUTABLE=" + sys.executable.replace("\\", "/")]
+           "-DPython3_EXECUTABLE=" + sys.executable.replace("\\", "/"),
+           # The indirect-call recorder is a development aid: players don't need
+           # icall_targets.dump written beside the game (0.2.5 item 6).
+           "-DBW_ICALL_FEEDBACK=OFF"]
+    # Item 101: a build folder from another version (or from a build that
+    # failed) is built again from scratch; the record of what a build was made
+    # from is written only once it has succeeded.
+    want = build_source(repo, tk, gen, work, cfg, tools or {})
+    clean, why = plan_build(bdir, want)
+    stamp = os.path.join(bdir, BUILD_SOURCE)
+    if os.path.exists(stamp):
+        os.remove(stamp)
     prog("build", 0, "configuring (CMake, Visual Studio 2022 x64)")
     if run_logged(cfg, logc, cwd=repo) != 0:
         raise Fail(EXIT_BUILD, "build", "CMake couldn't configure the build. Log: %s\n%s" % (logc, tail(logc)))
@@ -697,11 +889,20 @@ def build(repo, tk, gen, work, cmake, jobs, prog):
              "compiling (%d of about %d files, %d s)" % (state["n"], srcs, time.time() - state["t0"]))
 
     cmd = [cmake, "--build", bdir, "--config", "Release", "--parallel", str(jobs)]
+    if clean:
+        cmd.append("--clean-first")
+        prog("build", 0, "%s, so everything is compiled again" % why)
+    else:
+        prog("build", 0, "compiling (%s)" % why)
     if run_logged(cmd, logb, cwd=repo, on_line=on_line, tick=tick) != 0:
         raise Fail(EXIT_BUILD, "build", "The build failed. Log: %s\n%s" % (logb, tail(logb, 20)))
     exe = os.path.join(bdir, "Release", "bloodwake.exe")
     if not os.path.isfile(exe):
         raise Fail(EXIT_BUILD, "build", "The build finished without bloodwake.exe. Log: %s" % logb)
+    want["built"] = _dt.datetime.now().isoformat(timespec="seconds")
+    want["clean"] = clean
+    with open(stamp, "w", encoding="utf-8") as f:
+        json.dump(want, f, indent=1)
     prog("build", 1, "built in %d s" % (time.time() - state["t0"]))
     return exe, time.time() - state["t0"]
 
@@ -723,14 +924,39 @@ if "%%~1"=="" (
 """
 
 
+def copy_note(record):
+    """bw_copy.txt's one line (contract 9), or None for a verified copy."""
+    c = record.get("copy") or {}
+    if c.get("verdict") in (None, VERIFIED):
+        return None
+    line = COPY_WORDS[c["verdict"]]
+    if c.get("accepted"):
+        line += ", accepted in %s %s" % (c.get("accepted_in") or "the build command",
+                                          c["accepted"].replace("T", " ")[:16])
+    return line
+
+
+STAGED_TOOLS = ("launcher.pyw", "play.py", "bw_warmup.py", "bw_hdr.py")   # into <install>/tools
+
+
 def stage(repo, exe, inst, record, prog):
     rel = os.path.join(inst, "build", "Release")
     os.makedirs(rel, exist_ok=True)
-    for src in (exe, os.path.splitext(exe)[0] + ".pdb"):
+    # the exe, its symbols, and the icon the build drew beside it (the launcher's window)
+    for src in (exe, os.path.splitext(exe)[0] + ".pdb", os.path.join(os.path.dirname(exe), "bloodwake.ico")):
         if os.path.isfile(src):
             shutil.copy2(src, os.path.join(rel, os.path.basename(src)))
+    note, note_path = copy_note(record), os.path.join(rel, "bw_copy.txt")
+    if note:
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write(note + "\n")
+    elif os.path.exists(note_path):
+        os.remove(note_path)               # an earlier install's, from another copy
     os.makedirs(os.path.join(inst, "tools"), exist_ok=True)
-    for name in ("launcher.pyw", "play.py"):
+    # The launcher and what it imports from its own folder: bw_warmup (the
+    # Prepare-graphics offer, item 21) and bw_hdr (Automatic HDR, items 97,
+    # 100). Without them those two features silently do nothing (V, RC4).
+    for name in STAGED_TOOLS:
         shutil.copy2(os.path.join(repo, "tools", name), os.path.join(inst, "tools", name))
     py = sys.executable
     pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
@@ -787,6 +1013,10 @@ def main(argv=None):
     ap.add_argument("--no-warmup", action="store_true",
                     help="skip preparing the graphics (the first play then compiles its shaders as it goes)")
     ap.add_argument("--progress", choices=("text", "json"), default="text")
+    ap.add_argument("--allow-unverified", action="store_true",
+                    help="build a copy that isn't the recognised retail one (another region, modified or "
+                         "damaged), after the player accepted Setup's warning: it's recorded as such")
+    ap.add_argument("--accepted-in", default=None, help=argparse.SUPPRESS)   # "Setup", for bw_copy.txt
     a = ap.parse_args(argv)
     prog = Progress(a.progress == "json")
     inst = os.path.abspath(a.install_dir)
@@ -825,17 +1055,38 @@ def main(argv=None):
         disc = check_disc(a, kind, src, tk, game_dir, retail, prog)
         times["unpack_and_check"] = time.time() - t0
         if a.check_only:
-            prog("done", 1, "the disc is fine: an unmodified %s copy" % disc["label"], disc=disc)
+            if disc["verdict"] == VERIFIED:
+                prog("done", 1, "the disc is fine: an unmodified %s copy" % disc["label"], disc=disc)
+            else:
+                prog("done", 1, "the disc can be built as accepted: %s" % COPY_WORDS[disc["verdict"]], disc=disc)
             return EXIT_OK
+        accepted = _dt.datetime.now().isoformat(timespec="seconds") if disc["verdict"] != VERIFIED else None
+
+        def hint(f):
+            """A failure of a copy that isn't the retail one says so."""
+            if disc["verdict"] == UNVERIFIED:
+                f.msg += ("\nThis copy's main program isn't the retail one Setup knows, which is the likely "
+                          "cause: other versions may not build.")
+            return f
 
         xbe_dir = os.path.join(work, "xbe")         # the pipeline writes its analysis beside the XBE
         os.makedirs(xbe_dir, exist_ok=True)
         xbe = os.path.join(xbe_dir, "default.xbe")
         shutil.copy2(next(p for r, p in folder_files(game_dir) if r.lower() == "default.xbe"), xbe)
         gen = os.path.join(work, "gen")
-        times["pipeline"] = run_pipeline(REPO, tk, xbe, gen, work, prog)
-        gen_total = verify_gen(REPO, gen, prog)
-        exe, times["build"] = build(REPO, tk, gen, work, cmake, a.jobs, prog)
+        try:
+            times["pipeline"] = run_pipeline(REPO, tk, xbe, gen, work, prog)
+            gen_total, gen_differ = verify_gen(REPO, gen, prog, a.allow_unverified, os.path.join(work, "logs"))
+            exe, times["build"] = build(REPO, tk, gen, work, cmake, a.jobs, prog,
+                                        {"python": sys.version.split()[0], "cmake": cmake_ver,
+                                         "visual_studio": vs_ver, "capstone": module_version("capstone")})
+        except Fail as f:
+            raise hint(f)
+        copy = {"verdict": UNVERIFIED if gen_differ else disc["verdict"], "accepted": accepted}
+        if accepted:
+            copy["accepted_in"] = a.accepted_in or "the build command"
+        if gen_differ:
+            copy["generated_files_differ"] = len(gen_differ)
         record = {
             "format": 1,
             "installed": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -847,6 +1098,7 @@ def main(argv=None):
             "tools": {"python": sys.version.split()[0], "python_exe": sys.executable,
                       "capstone": module_version("capstone"), "cmake": cmake_ver,
                       "visual_studio": vs_ver},
+            "copy": copy,
             "disc": disc,
             "generated_total_sha256": gen_total,
             "paths": {"game": game_dir, "work": work, "exe": os.path.join(inst, "build", "Release", "bloodwake.exe")},
@@ -866,11 +1118,25 @@ def main(argv=None):
              % (inst, (time.time() - t_start) / 60))
         return EXIT_OK
     except Fail as f:
-        prog(f.step, 0, f.msg, error=True, exit=f.code)
+        prog(f.step, 0, f.msg, error=True, exit=f.code, **f.extra)
         return f.code
     except OSError as e:
         prog("done", 0, "File error: %s" % e, error=True, exit=EXIT_IO)
         return EXIT_IO
+    except Exception as e:                  # never a raw traceback: a plain line and the usual codes
+        import traceback
+        step = prog.step
+        log = os.path.join(work, "logs", "build_from_disc_error.log")
+        try:
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            with open(log, "w", encoding="utf-8") as f:
+                traceback.print_exc(file=f)
+        except OSError:
+            log = "(not written)"
+        code = STEP_EXIT.get(step, EXIT_IO)
+        prog(step, 0, "Something unexpected went wrong while %s: %s: %s. Details: %s" % (
+            STEP_WORDS.get(step, step), type(e).__name__, e, log), error=True, exit=code)
+        return code
 
 
 if __name__ == "__main__":

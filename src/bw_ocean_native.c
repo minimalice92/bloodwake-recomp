@@ -207,14 +207,8 @@ done:
 
 /* ---- the driver --------------------------------------------------------- */
 
-#define WW_VA            0x001D77F8u   /* WaterWorld; [WW_VA] = the Water object */
-#define WW_PROF_TIME     0xCCF8u       /* mode 0x1D's time-spent counter (rdtsc profiling) */
+#include "bw_waterworld.h"     /* WW_VA, WW_PROF_TIME, the Water object (item 71) */
 #define PROF_DEPTH_VA    0x001E7D20u   /* the rdtsc profiler's stack index */
-#define W_IDX_NEW        0x0Cu
-#define W_PATCH          0x4AB8u
-#define W_PATCH_SZ       0x10000u
-#define W_PFLAG          0x24AB8u
-#define W_PFLAG_SZ       0x400u
 
 #define GP(va)  ((void *)((uintptr_t)(uint32_t)(va) + (uintptr_t)g_xbox_mem_offset))
 #define GU32(va) (*(volatile uint32_t *)GP(va))

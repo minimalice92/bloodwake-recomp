@@ -9,6 +9,7 @@
 #include <string.h>
 #include "bw_edition.h"
 #include "bw_widescreen.h"
+#include "bw_monitor.h"        /* 0.2.5 item 34: the game's monitor, not always the primary */
 
 #define WS_ASPECT_43   (4.0f / 3.0f)
 #define WS_ASPECT_MAX  2.39f          /* 21:9 monitors (2560x1080 2.37, 3440x1440 2.39) */
@@ -34,13 +35,14 @@ static float parse_aspect(const char *e)
     return a;
 }
 
+/* The shape of the monitor the game is on (item 34: it used to be the
+ * primary's always, so a game on a 21:9 second screen got the 16:9 shape). */
 static float display_aspect(int *dw, int *dh)
 {
     MONITORINFO mi;
-    POINT origin = { 0, 0 };
     mi.cbSize = sizeof mi;
     *dw = *dh = 0;
-    if (GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+    if (GetMonitorInfoA(bw_game_monitor(), &mi)) {
         *dw = mi.rcMonitor.right - mi.rcMonitor.left;
         *dh = mi.rcMonitor.bottom - mi.rcMonitor.top;
     }
@@ -81,7 +83,8 @@ void bw_ws_init(int gameplay_boot, int log)
         if (want > 0.0f)
             fprintf(stderr, "[WS] on: picture %.4f (BW_ASPECT=%s)", a, e);
         else
-            fprintf(stderr, "[WS] on: picture %.4f (display %dx%d)", a, dw, dh);
+            fprintf(stderr, "[WS] on: picture %.4f (display %dx%d, %s)", a, dw, dh,
+                    bw_game_monitor_source());
         fprintf(stderr, ", k %.4f this boot (%s)\n", s_k,
                 gameplay_boot ? "gameplay: Hor+, 2D pillarboxed"
                               : "title and menus: 4:3, pillarboxed in the wide window");

@@ -30,14 +30,17 @@ What it does:
     BW_EDITION; each edition keeps its own saves (Original's stay where they
     always were; a new edition starts with a copy of them). --fix tunes the
     edition's changes (BW_FIX, e.g. --fix=-WIDESCREEN);
-  - gives the game as many controllers as are plugged in when it starts
-    (Xbox-style pads, up to 4), as a console would see them; plug a second
-    pad in before launching for split screen. --pads overrides.
+  - gives the game as many controllers as are plugged in (Xbox-style pads,
+    up to 4), as a console would see them: each boot counts them again and
+    one switched on while playing joins (RECOMP_USB_PADS=auto). Each player
+    takes the next connected controller, whichever Windows slot it is in.
+    --pads overrides with a fixed count.
 
 The game's log goes to play.log in the repo root (all boots of the session,
 one header each). Nothing here is a diagnostic run: no frame dumps, no WAV.
 """
 import argparse
+import itertools
 import os
 import subprocess
 import sys
@@ -85,7 +88,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--cpu", action="store_true", help="the CPU renderer instead of the GPU")
     ap.add_argument("--keyboard", action="store_true", help="the keyboard also acts as the pad")
-    ap.add_argument("--boots", type=int, default=200, help="stop after this many boots")
+    ap.add_argument("--boots", type=int, default=None,
+                    help="stop after this many boots (tests; default: no limit)")
     ap.add_argument("--pads", type=int, default=0,
                     help="controllers the game sees (1-4; default: as many as are plugged in)")
     ap.add_argument("--windows", action="store_true",
@@ -116,16 +120,26 @@ def main(argv=None):
         # through: the launcher started with BW_SETTINGS=<file> (tests) and
         # the game it starts must agree on it.
         env["BW_SETTINGS"] = os.environ["BW_SETTINGS"]
+    if os.environ.get("BW_TEST_MUTEX"):
+        # Tests: the session's own mutex name (src/bw_host.c, contract 1), so a
+        # test launcher's Play and its host agree on it.
+        env["BW_TEST_MUTEX"] = os.environ["BW_TEST_MUTEX"]
     env.update(BASE_ENV)
     if not a.cpu:
         env.update(GPU_ENV)
     if a.keyboard:
         env["RECOMP_KEYBOARD"] = "1"
-    pads = a.pads or connected_pads()
-    pads = max(1, min(4, pads))
-    if pads > 1:
-        env["RECOMP_USB_PADS"] = str(pads)
-    print("Controllers: %d" % pads)
+    if a.pads:
+        pads = max(1, min(4, a.pads))
+        if pads > 1:
+            env["RECOMP_USB_PADS"] = str(pads)
+        print("Controllers: %d (--pads)" % pads)
+    else:
+        # Every boot counts the controllers itself (0.2.5 item 73, carried
+        # ohci.c), and one switched on later joins the boot it lands in, so a
+        # pad turned on after Play is there by the next menu.
+        env["RECOMP_USB_PADS"] = "auto"
+        print("Controllers: %d now; one switched on later joins the game" % connected_pads())
     # The edition travels in the environment to every boot (D-015). play.py
     # drops inherited BW_* variables above, so it is set here or not at all.
     if a.edition:
@@ -147,11 +161,15 @@ def main(argv=None):
 
     if not a.windows:
         env["BW_HOST"] = "1"
-        env["BW_HOST_BOOTS"] = str(a.boots)
+        if a.boots:
+            # A cap is for test runs only (0.2.5 item 55): a player idling on
+            # the title reboots into the attract demo and back about once a
+            # minute, so the old default of 200 ended long sessions.
+            env["BW_HOST_BOOTS"] = str(a.boots)
         return subprocess.call([EXE], cwd=REPO, env=env)
 
     launch = os.path.abspath(a.start) if a.start else None
-    for boot in range(1, a.boots + 1):
+    for boot in (range(1, a.boots + 1) if a.boots else itertools.count(1)):
         if os.path.exists(RELAUNCH):
             os.remove(RELAUNCH)
         run_env = dict(env)

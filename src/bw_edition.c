@@ -10,10 +10,12 @@
  */
 #include <windows.h>
 #include <shlobj.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include "bw_edition.h"
 
 extern ptrdiff_t g_xbox_mem_offset;
@@ -298,161 +300,310 @@ void bw_edition_apply_image_fixes(const void *xbe, size_t xbe_size)
  * Each holds its own UDATA (saves), TDATA (settings), Z: cache and partition
  * images. Original keeps the root, so its saves are never moved; the
  * "editions" folder beside them is invisible to the guest (only UDATA, TDATA,
- * CACHE, Cache and Partition*.img are mapped). On an edition's first boot
- * (no marker file and no UDATA in its folder) Original's UDATA and TDATA are
- * copied in: a plain one-way file copy between our own folders, through a
- * temporary folder renamed into place, so a second process starting at the
- * same moment can't see half a copy. */
+ * CACHE, Cache and Partition*.img are mapped). Until an edition's marker file
+ * is written, each start copies in whichever of Original's UDATA and TDATA
+ * the edition doesn't have yet: a plain one-way file copy between our own
+ * folders, through a temporary folder renamed into place, so a second
+ * process starting at the same moment can't see half a copy. The marker is
+ * written only once both are in place (0.2.5 item 52), so a copy that failed
+ * is tried again at the next start.
+ *
+ * Paths are wide (UTF-16) here and UTF-8 where they are handed to the toolkit
+ * (xbox_path_init, RECOMP_SAVE_DIR), which decodes them as UTF-8: the ANSI
+ * calls this used before broke a profile folder named like "Zoë", and lost a
+ * Cyrillic one altogether (0.2.5 item 53). */
 
-static int dir_exists(const char *p)
+/* UTF-8 of a wide string, for logs and the toolkit. */
+static const char *u8(const wchar_t *w, char *out, int n)
 {
-    DWORD a = GetFileAttributesA(p);
+    if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, n, NULL, NULL))
+        out[0] = 0;
+    out[n - 1] = 0;
+    return out;
+}
+
+static int dir_exists(const wchar_t *p)
+{
+    DWORD a = GetFileAttributesW(p);
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-static int copy_tree(const char *from, const char *to, int *files)
+/* Copies the tree; 1 if every file and folder made it. *err gets the first
+ * failure's Windows error code. */
+static int copy_tree(const wchar_t *from, const wchar_t *to, int *files, DWORD *err)
 {
-    WIN32_FIND_DATAA fd;
+    WIN32_FIND_DATAW fd;
     HANDLE h;
-    char pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+    wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
     int ok = 1;
-    if (!CreateDirectoryA(to, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+    if (!CreateDirectoryW(to, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        if (!*err)
+            *err = GetLastError();
         return 0;
-    _snprintf(pat, sizeof pat, "%s\\*", from);
-    pat[sizeof pat - 1] = 0;
-    h = FindFirstFileA(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE)
-        return 1;
+    }
+    _snwprintf(pat, MAX_PATH, L"%ls\\*", from);
+    pat[MAX_PATH - 1] = 0;
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND)
+            return 1;                         /* an empty folder */
+        if (!*err)
+            *err = e;
+        return 0;
+    }
     do {
-        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
             continue;
-        _snprintf(src, sizeof src, "%s\\%s", from, fd.cFileName);
-        _snprintf(dst, sizeof dst, "%s\\%s", to, fd.cFileName);
-        src[sizeof src - 1] = dst[sizeof dst - 1] = 0;
+        _snwprintf(src, MAX_PATH, L"%ls\\%ls", from, fd.cFileName);
+        _snwprintf(dst, MAX_PATH, L"%ls\\%ls", to, fd.cFileName);
+        src[MAX_PATH - 1] = dst[MAX_PATH - 1] = 0;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-            ok &= copy_tree(src, dst, files);
-        else if (CopyFileA(src, dst, TRUE))
+            ok &= copy_tree(src, dst, files, err);
+        else if (CopyFileW(src, dst, TRUE))
             (*files)++;
-        else
+        else {
+            if (!*err)
+                *err = GetLastError();
             ok = 0;
-    } while (FindNextFileA(h, &fd));
+        }
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
     return ok;
 }
 
-static void remove_tree(const char *p)
+static void remove_tree(const wchar_t *p)
 {
-    WIN32_FIND_DATAA fd;
+    WIN32_FIND_DATAW fd;
     HANDLE h;
-    char pat[MAX_PATH], sub[MAX_PATH];
-    _snprintf(pat, sizeof pat, "%s\\*", p);
-    pat[sizeof pat - 1] = 0;
-    h = FindFirstFileA(pat, &fd);
+    wchar_t pat[MAX_PATH], sub[MAX_PATH];
+    _snwprintf(pat, MAX_PATH, L"%ls\\*", p);
+    pat[MAX_PATH - 1] = 0;
+    h = FindFirstFileW(pat, &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, ".."))
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
                 continue;
-            _snprintf(sub, sizeof sub, "%s\\%s", p, fd.cFileName);
-            sub[sizeof sub - 1] = 0;
+            _snwprintf(sub, MAX_PATH, L"%ls\\%ls", p, fd.cFileName);
+            sub[MAX_PATH - 1] = 0;
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
                 remove_tree(sub);
-            else
-                DeleteFileA(sub);
-        } while (FindNextFileA(h, &fd));
+            else {
+                SetFileAttributesW(sub, FILE_ATTRIBUTE_NORMAL);   /* a read-only copy */
+                DeleteFileW(sub);
+            }
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    RemoveDirectoryA(p);
+    RemoveDirectoryW(p);
 }
 
-/* Copy <from>\UDATA and <from>\TDATA into <to>, once. */
-static void import_original(const char *from, const char *to)
+/* Copies into an existing tree the files it doesn't have yet; never
+ * overwrites one. Each file goes through a temporary name, so a start that
+ * ends half way leaves no half file under the real name. 1 if every file is
+ * there afterwards. */
+static int merge_tree(const wchar_t *from, const wchar_t *to, int *files, DWORD *err)
 {
-    static const char *subs[2] = { "UDATA", "TDATA" };
-    char marker[MAX_PATH], dst[MAX_PATH], tmp[MAX_PATH], src[MAX_PATH];
-    int k, files = 0, moved = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+    wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], tmp[MAX_PATH + 16];
+    int ok = 1;
+    if (!CreateDirectoryW(to, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        if (!*err)
+            *err = GetLastError();
+        return 0;
+    }
+    _snwprintf(pat, MAX_PATH, L"%ls\\*", from);
+    pat[MAX_PATH - 1] = 0;
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+            continue;
+        _snwprintf(src, MAX_PATH, L"%ls\\%ls", from, fd.cFileName);
+        _snwprintf(dst, MAX_PATH, L"%ls\\%ls", to, fd.cFileName);
+        src[MAX_PATH - 1] = dst[MAX_PATH - 1] = 0;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ok &= merge_tree(src, dst, files, err);
+            continue;
+        }
+        if (GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES)
+            continue;                         /* the edition's own copy wins */
+        _snwprintf(tmp, MAX_PATH + 16, L"%ls.import-%lu", dst, (unsigned long)GetCurrentProcessId());
+        tmp[MAX_PATH + 15] = 0;
+        if (CopyFileW(src, tmp, FALSE) && MoveFileW(tmp, dst))
+            (*files)++;
+        else {
+            if (!*err)
+                *err = GetLastError();
+            SetFileAttributesW(tmp, FILE_ATTRIBUTE_NORMAL);
+            DeleteFileW(tmp);
+            if (GetFileAttributesW(dst) == INVALID_FILE_ATTRIBUTES)
+                ok = 0;                       /* still missing (not another start's) */
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok;
+}
+
+/* Copy <from>\UDATA and <from>\TDATA into <to>, until both are there. A
+ * folder of the edition's that isn't there yet is copied whole, through a
+ * temporary folder. One that is there before the marker was ever written
+ * means an earlier start's copy failed: every boot makes UDATA itself (the
+ * title image and metadata, B2a), so it is never empty. Original's files are
+ * then merged in, without overwriting any the edition has made since. */
+static void import_original(const wchar_t *from, const wchar_t *to)
+{
+    static const wchar_t *subs[2] = { L"UDATA", L"TDATA" };
+    wchar_t marker[MAX_PATH], dst[MAX_PATH], tmp[MAX_PATH], src[MAX_PATH];
+    char a[3 * MAX_PATH], b[3 * MAX_PATH];
+    int k, files = 0, moved = 0, done = 0;
     FILE *f;
 
-    _snprintf(marker, sizeof marker, "%s\\bw_edition_saves.txt", to);
-    _snprintf(dst, sizeof dst, "%s\\UDATA", to);
-    marker[sizeof marker - 1] = dst[sizeof dst - 1] = 0;
-    if (GetFileAttributesA(marker) != INVALID_FILE_ATTRIBUTES || dir_exists(dst)) {
-        fprintf(stderr, "[ED] saves: %s (this edition's own)\n", to);
+    _snwprintf(marker, MAX_PATH, L"%ls\\bw_edition_saves.txt", to);
+    marker[MAX_PATH - 1] = 0;
+    if (GetFileAttributesW(marker) != INVALID_FILE_ATTRIBUTES) {
+        fprintf(stderr, "[ED] saves: %s (this edition's own)\n", u8(to, a, sizeof a));
         return;
     }
     for (k = 0; k < 2; k++) {
-        _snprintf(src, sizeof src, "%s\\%s", from, subs[k]);
-        _snprintf(dst, sizeof dst, "%s\\%s", to, subs[k]);
-        _snprintf(tmp, sizeof tmp, "%s\\%s.import-%lu", to, subs[k],
-                  (unsigned long)GetCurrentProcessId());
-        src[sizeof src - 1] = dst[sizeof dst - 1] = tmp[sizeof tmp - 1] = 0;
-        if (!dir_exists(src) || dir_exists(dst))
+        DWORD err = 0;
+        int n = 0;
+        _snwprintf(src, MAX_PATH, L"%ls\\%ls", from, subs[k]);
+        _snwprintf(dst, MAX_PATH, L"%ls\\%ls", to, subs[k]);
+        _snwprintf(tmp, MAX_PATH, L"%ls\\%ls.import-%lu", to, subs[k],
+                   (unsigned long)GetCurrentProcessId());
+        src[MAX_PATH - 1] = dst[MAX_PATH - 1] = tmp[MAX_PATH - 1] = 0;
+        if (!dir_exists(src)) {
+            done++;                           /* nothing to copy */
             continue;
-        if (copy_tree(src, tmp, &files) && MoveFileA(tmp, dst))
-            moved++;
-        else
-            remove_tree(tmp);                 /* someone else won, or a copy failed */
+        }
+        if (dir_exists(dst)) {
+            if (merge_tree(src, dst, &n, &err)) {
+                moved += n > 0;
+                files += n;
+                done++;
+                continue;
+            }
+            fprintf(stderr, "[ED] saves: could not add Original's %ls from %s into %s "
+                    "(Windows error %lu; %d files added); the next start tries again\n",
+                    subs[k], u8(from, a, sizeof a), u8(to, b, sizeof b), (unsigned long)err, n);
+            continue;
+        }
+        if (copy_tree(src, tmp, &n, &err)) {
+            if (MoveFileW(tmp, dst)) {
+                moved++;
+                files += n;
+                done++;
+                continue;
+            }
+            err = GetLastError();
+        }
+        remove_tree(tmp);
+        if (dir_exists(dst)) {
+            done++;                           /* another start got there first */
+            continue;
+        }
+        fprintf(stderr, "[ED] saves: could not copy Original's %ls from %s into %s "
+                "(Windows error %lu); this edition starts without it, and the next start "
+                "tries again\n", subs[k], u8(from, a, sizeof a), u8(to, b, sizeof b),
+                (unsigned long)err);
     }
-    f = fopen(marker, "w");
+    if (done < 2) {
+        fprintf(stderr, "[ED] saves: %s import incomplete (%d of 2 folders): no marker "
+                "written\n", s_titles[s_edition], done);
+        return;
+    }
+    f = _wfopen(marker, L"w");
     if (f) {
         SYSTEMTIME st;
         GetLocalTime(&st);
         fprintf(f, "Blood Wake %s saves. First boot %04u-%02u-%02u %02u:%02u:%02u.\n"
                    "Imported from Original (one-way copy, Original untouched): %s, %d files, "
                    "%d folders.\n", s_titles[s_edition], st.wYear, st.wMonth, st.wDay,
-                st.wHour, st.wMinute, st.wSecond, from, files, moved);
+                st.wHour, st.wMinute, st.wSecond, u8(from, a, sizeof a), files, moved);
         fclose(f);
-    }
-    fprintf(stderr, "[ED] saves: first %s boot: copied Original's saves from %s into %s "
-            "(%d files; Original's folder only read)\n", s_titles[s_edition], from, to, files);
+    } else
+        fprintf(stderr, "[ED] saves: could not write the marker %s (errno %d); the next "
+                "start checks the folders again\n", u8(marker, a, sizeof a), errno);
+    if (moved)
+        fprintf(stderr, "[ED] saves: %s: copied Original's saves from %s into %s "
+                "(%d files in %d folders; Original's folder only read)\n", s_titles[s_edition],
+                u8(from, a, sizeof a), u8(to, b, sizeof b), files, moved);
+    else
+        fprintf(stderr, "[ED] saves: %s (this edition's own; nothing to copy from %s)\n",
+                u8(to, b, sizeof b), u8(from, a, sizeof a));
+}
+
+/* An environment variable, wide, from the process block (the CRT's narrow
+ * copy is in the ANSI code page, which can't hold every folder name). NULL
+ * when unset, empty or too long for a path. */
+static const wchar_t *wenv(const wchar_t *name, wchar_t *buf, DWORD n)
+{
+    DWORD r = GetEnvironmentVariableW(name, buf, n);
+    return r && r < n ? buf : NULL;
 }
 
 const char *bw_edition_prepare_saves(void)
 {
-    static char root[MAX_PATH];
-    static char user_env[MAX_PATH + 32];
-    char base[MAX_PATH], orig_user[MAX_PATH], user[MAX_PATH];
-    const char *ov = getenv("BW_EDITION_SAVE_ROOT");
-    const char *rs = getenv("RECOMP_SAVE_DIR");
+    static char root8[3 * MAX_PATH];
+    wchar_t root[MAX_PATH], base[MAX_PATH], orig_user[MAX_PATH], user[MAX_PATH];
+    static wchar_t ovb[MAX_PATH], rsb[MAX_PATH];
+    const wchar_t *ov = wenv(L"BW_EDITION_SAVE_ROOT", ovb, MAX_PATH);
+    const wchar_t *rs = wenv(L"RECOMP_SAVE_DIR", rsb, MAX_PATH);
+    wchar_t ename[16];
+    char a[3 * MAX_PATH], b[3 * MAX_PATH];
 
     if (s_edition == BW_ED_ORIGINAL) {
         fprintf(stderr, "[ED] saves: Original's folder, as before the switch (%s)\n",
-                rs && *rs ? rs : "%LOCALAPPDATA%\\xboxrecomp");
+                rs ? u8(rs, a, sizeof a) : "%LOCALAPPDATA%\\xboxrecomp");
         return NULL;                  /* the toolkit's default, exactly as today */
     }
-    if (ov && *ov)
-        _snprintf(base, sizeof base, "%s", ov);
-    else if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
-        strncat(base, "\\xboxrecomp", sizeof base - strlen(base) - 1);
+    MultiByteToWideChar(CP_UTF8, 0, s_names[s_edition], -1, ename, 16);
+    ename[15] = 0;
+    if (ov)
+        _snwprintf(base, MAX_PATH, L"%ls", ov);
+    else if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, base)))
+        wcsncat(base, L"\\xboxrecomp", MAX_PATH - wcslen(base) - 1);
     else
-        _snprintf(base, sizeof base, "SaveData");
-    base[sizeof base - 1] = 0;
-    _snprintf(root, sizeof root, "%s\\editions\\%s", base, s_names[s_edition]);
-    root[sizeof root - 1] = 0;
-    SHCreateDirectoryExA(NULL, root, NULL);
+        _snwprintf(base, MAX_PATH, L"SaveData");
+    base[MAX_PATH - 1] = 0;
+    _snwprintf(root, MAX_PATH, L"%ls\\editions\\%ls", base, ename);
+    root[MAX_PATH - 1] = 0;
+    SHCreateDirectoryExW(NULL, root, NULL);
 
     /* Where Original keeps UDATA/TDATA, and where this edition will. */
-    if (rs && *rs) {
-        _snprintf(orig_user, sizeof orig_user, "%s", rs);
-        _snprintf(user, sizeof user, "%s\\editions\\%s", rs, s_names[s_edition]);
-        orig_user[sizeof orig_user - 1] = user[sizeof user - 1] = 0;
-        SHCreateDirectoryExA(NULL, user, NULL);
-        _snprintf(user_env, sizeof user_env, "%s", user);
-        user_env[sizeof user_env - 1] = 0;
-        _putenv_s("RECOMP_SAVE_DIR", user_env);   /* read by xbox_path_init */
+    if (rs) {
+        _snwprintf(orig_user, MAX_PATH, L"%ls", rs);
+        _snwprintf(user, MAX_PATH, L"%ls\\editions\\%ls", rs, ename);
+        orig_user[MAX_PATH - 1] = user[MAX_PATH - 1] = 0;
+        SHCreateDirectoryExW(NULL, user, NULL);
+        /* Read by xbox_path_init; the carried kernel_path.c reads it wide. */
+        _wputenv_s(L"RECOMP_SAVE_DIR", user);
     } else {
-        char la[MAX_PATH];
-        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, la)))
-            _snprintf(orig_user, sizeof orig_user, "%s\\xboxrecomp", la);
+        wchar_t la[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, la)))
+            _snwprintf(orig_user, MAX_PATH, L"%ls\\xboxrecomp", la);
         else
-            _snprintf(orig_user, sizeof orig_user, "SaveData");
-        _snprintf(user, sizeof user, "%s", root);
-        orig_user[sizeof orig_user - 1] = user[sizeof user - 1] = 0;
+            _snwprintf(orig_user, MAX_PATH, L"SaveData");
+        _snwprintf(user, MAX_PATH, L"%ls", root);
+        orig_user[MAX_PATH - 1] = user[MAX_PATH - 1] = 0;
     }
     import_original(orig_user, user);
+    if (!WideCharToMultiByte(CP_UTF8, 0, root, -1, root8, sizeof root8, NULL, NULL)) {
+        /* Not expected for a path Windows gave us. Never Original's folder:
+         * a folder of this edition's own beside the game instead. */
+        _snprintf(root8, sizeof root8, "SaveData\\editions\\%s", s_names[s_edition]);
+        root8[sizeof root8 - 1] = 0;
+        fprintf(stderr, "[ED] saves: the save folder name could not be converted to UTF-8 "
+                "(Windows error %lu); using %s\n", (unsigned long)GetLastError(), root8);
+    }
     fprintf(stderr, "[ED] saves: %s disk %s (saves and settings in %s)\n", s_titles[s_edition],
-            root, user);
+            root8, u8(user, b, sizeof b));
+    (void)a;
     fflush(stderr);
-    return root;
+    return root8;
 }
 
 /* ── Counters and the summary ──────────────────────────────────────────── */

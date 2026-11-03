@@ -365,6 +365,11 @@ void sub_000E00B6(void)
 extern __declspec(thread) uint32_t g_esp;
 extern void sub_000DB8B9_gen(void);
 #define BW_LAUNCH_DATA_SIZE 3072u
+__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+__declspec(dllimport) unsigned long __stdcall GetLastError(void);
+__declspec(dllimport) int __stdcall DeleteFileA(const char *name);
+__declspec(dllimport) int __stdcall MoveFileExA(const char *from, const char *to,
+                                                unsigned long flags);
 
 void sub_000DB8B9(void)
 {
@@ -382,23 +387,61 @@ void sub_000DB8B9(void)
     }
     path[n] = 0;
 
-    f = fopen("bw_relaunch.bin", "wb");
-    if (f) {
+    /* Every write is checked (0.2.5 item 58): a failed one used to be logged
+     * as recorded, and the host then found no request and said the game
+     * stopped. The request goes to a temporary file first and is renamed into
+     * place, so the host never finds half of one; a held file (an antivirus
+     * scan) or a full disk is tried again for up to 10 s. */
+    {
         uint32_t ver = 1, dlen = data_va ? BW_LAUNCH_DATA_SIZE : 0;
-        fwrite("BWRL", 1, 4, f);
-        fwrite(&ver, 4, 1, f);
-        fwrite(&n, 4, 1, f);
-        fwrite(path, 1, n, f);
-        fwrite(&dlen, 4, 1, f);
-        if (dlen)
-            fwrite((const void *)((uintptr_t)data_va + g_xbox_mem_offset), 1, dlen, f);
-        fclose(f);
+        int tries, ok = 0, warned = 0;
+        unsigned long err = 0;
+        const char *what = "";
+        for (tries = 1; tries <= 100; tries++) {
+            if (tries > 1)
+                Sleep(100);
+            f = fopen("bw_relaunch.tmp", "wb");
+            if (!f) {
+                err = GetLastError();
+                what = "creating bw_relaunch.tmp";
+            } else {
+                ok = fwrite("BWRL", 1, 4, f) == 4 && fwrite(&ver, 4, 1, f) == 1
+                     && fwrite(&n, 4, 1, f) == 1 && fwrite(path, 1, n, f) == n
+                     && fwrite(&dlen, 4, 1, f) == 1
+                     && (!dlen || fwrite((const void *)((uintptr_t)data_va + g_xbox_mem_offset),
+                                         1, dlen, f) == dlen);
+                if (fclose(f) != 0)
+                    ok = 0;
+                if (!ok) {
+                    err = GetLastError();
+                    what = "writing bw_relaunch.tmp";
+                    DeleteFileA("bw_relaunch.tmp");
+                } else if (!MoveFileExA("bw_relaunch.tmp", "bw_relaunch.bin", 1 /* REPLACE_EXISTING */)) {
+                    err = GetLastError();
+                    what = "renaming it to bw_relaunch.bin";
+                    ok = 0;
+                }
+            }
+            if (ok)
+                break;
+            if (!warned++)
+                fprintf(stderr, "[BW] relaunch request: %s failed (Windows error %lu); trying "
+                        "again for up to 10 s\n", what, err);
+        }
+        if (ok)
+            fprintf(stderr, "[BW] relaunch requested: path='%s' launch data %s"
+                    " (first bytes %08X %08X %08X), recorded in bw_relaunch.bin%s\n",
+                    path, data_va ? "present" : "none",
+                    data_va ? BW_MEM32(data_va) : 0, data_va ? BW_MEM32(data_va + 4) : 0,
+                    data_va ? BW_MEM32(data_va + 8) : 0,
+                    tries > 1 ? " (on a retry)" : "");
+        else {
+            DeleteFileA("bw_relaunch.tmp");
+            fprintf(stderr, "[BW] relaunch requested: path='%s', but bw_relaunch.bin could not "
+                    "be written (%s failed, Windows error %lu, 100 tries over 10 s); the reboot "
+                    "is lost, so the play host will say the game stopped\n", path, what, err);
+        }
     }
-    fprintf(stderr, "[BW] relaunch requested: path='%s' launch data %s"
-            " (first bytes %08X %08X %08X), recorded in bw_relaunch.bin\n",
-            path, data_va ? "present" : "none",
-            data_va ? BW_MEM32(data_va) : 0, data_va ? BW_MEM32(data_va + 4) : 0,
-            data_va ? BW_MEM32(data_va + 8) : 0);
     fflush(stderr);
     /* The launch ends in HalReturnToFirmware -> ExitProcess, which skips
      * atexit: write the sampling profile (BW_PROFILE) now. */

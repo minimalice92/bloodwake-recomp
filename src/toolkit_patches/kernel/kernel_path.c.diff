@@ -1,0 +1,26 @@
+--- xboxrecomp/src/kernel/kernel_path.c
++++ src/toolkit_patches/kernel/kernel_path.c
+@@ -517,8 +517,21 @@
+         const char *ov = getenv("RECOMP_SAVE_DIR");
+         /* Room for the longest suffix the rules append (UDATA\<title id>\
+          * <save>\<file>); a longer root would only truncate later. */
+-        int n = (ov && ov[0])
+-              ? MultiByteToWideChar(CP_UTF8, 0, ov, -1, s_user_dir, MAX_PATH) : 0;
++        int n;
++        /* Blood Wake carried patch (0.2.5 item 53, docs/TOOLKIT_ISSUES.md): the
++         * CRT's narrow copy of the environment is in the ANSI code page, so
++         * decoding it as UTF-8 broke a folder name with a letter like e-acute
++         * and lost one outside the code page (Cyrillic on English Windows):
++         * the saves then fell back to the default save dir. The variable is
++         * read wide, from the process block, which keeps every character. */
++        {
++            DWORD wn = GetEnvironmentVariableW(L"RECOMP_SAVE_DIR", s_user_dir, MAX_PATH);
++            if (!wn)
++                ov = NULL;                    /* unset or empty */
++            else if (!ov || !ov[0])
++                ov = "(set)";                 /* the CRT's copy can lag SetEnvironmentVariableW */
++            n = !ov ? 0 : (wn < MAX_PATH ? (int)wn + 1 : 0);
++        }
+         if (ov && ov[0] && (n == 0 || n > MAX_PATH - 96)) {
+             xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                      "RECOMP_SAVE_DIR %s: %s; using the default save dir",

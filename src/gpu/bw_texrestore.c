@@ -36,6 +36,7 @@
 #include "bw_texrestore.h"
 #include "bw_vfx.h"
 #include "bw_vfx_int.h"
+#include "bw_gpu_failtest.h"   /* 0.2.5 item 25: BW_GPU_FAILTEST (test aid) */
 
 #include <math.h>
 #include <stdio.h>
@@ -530,6 +531,7 @@ int bw_tr_deblock_gpu(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11ShaderR
 static unsigned s_n_ok, s_n_why[BW_TR_WHY_N], s_n_alpha[3], s_n_lk[3];
 static double s_total_mb, s_cpu_ms, s_cpu_max, s_dev_ms, s_dev_max, s_pump_max;
 static unsigned s_n_dev, s_logged, s_changed, s_inflight;
+static unsigned s_n_mixed;          /* item 48: restored textures also drawn with other edge modes */
 static double s_freq;
 
 static double now_ms(void)
@@ -668,13 +670,13 @@ void bw_tr_frame(void)
     s_changed = 0;
     fprintf(stderr, "[TEXRESTORE] %u restored (%u at 4x, %u at 2x; alpha %u opaque, %u cut-out, %u smooth),"
                     " %.0f MB VRAM, %u in the works; left as shipped: %u normal maps, %u water/effect,"
-                    " %u size, %u budget, %u changing, %u failed; worker CPU %.2f ms avg / %.2f max"
+                    " %u size, %u budget, %u changing, %u failed; %u drawn with two edge modes; worker CPU %.2f ms avg / %.2f max"
                     " (%.0f ms total); device thread %.2f ms avg / %.2f max per texture, %.2f ms max"
                     " in a frame\n",
             s_n_ok, s_n_lk[2], s_n_lk[1], s_n_alpha[0], s_n_alpha[1], s_n_alpha[2], s_total_mb,
             s_inflight, s_n_why[BW_TR_WHY_NORMAL], s_n_why[BW_TR_WHY_EXCLUDED],
             s_n_why[BW_TR_WHY_SMALL], s_n_why[BW_TR_WHY_BUDGET], s_n_why[BW_TR_WHY_CHURN],
-            s_n_why[BW_TR_WHY_FAIL], s_n_dev ? s_cpu_ms / s_n_dev : 0.0, s_cpu_max, s_cpu_ms,
+            s_n_why[BW_TR_WHY_FAIL], s_n_mixed, s_n_dev ? s_cpu_ms / s_n_dev : 0.0, s_cpu_max, s_cpu_ms,
             s_n_dev ? s_dev_ms / s_n_dev : 0.0, s_dev_max, s_pump_max);
 }
 
@@ -810,8 +812,35 @@ static int worker_start(void)
     return ok;
 }
 
+/* Item 48: the second copies' slots. A fixed pool, never freed, so a job
+ * still in the works for a returned slot reads valid memory (and no longer
+ * matches it: release zeroes the ticket). */
+#define TR_ALT_N 256
+static BwTrSlot s_alt_pool[TR_ALT_N];
+static uint8_t s_alt_busy[TR_ALT_N];
+static unsigned s_alt_full;
+
+static BwTrSlot *alt_take(void)
+{
+    unsigned i;
+    for (i = 0; i < TR_ALT_N; i++)
+        if (!s_alt_busy[i]) {
+            s_alt_busy[i] = 1;
+            memset(&s_alt_pool[i], 0, sizeof s_alt_pool[i]);
+            return &s_alt_pool[i];
+        }
+    return NULL;
+}
+
 void bw_tr_release(BwTrSlot *s)
 {
+    if (s->alt) {                           /* item 48: its second copy goes with it */
+        BwTrSlot *a = s->alt;
+        s->alt = NULL;
+        bw_tr_release(a);
+        if (a >= s_alt_pool && a < s_alt_pool + TR_ALT_N)
+            s_alt_busy[a - s_alt_pool] = 0;
+    }
     if (s->srv) { ID3D11ShaderResourceView_Release(s->srv); s->srv = NULL; }
     if (s->tex) { ID3D11Texture2D_Release(s->tex); s->tex = NULL; }
     if (s->state == 1) {
@@ -822,6 +851,33 @@ void bw_tr_release(BwTrSlot *s)
         s_changed = 1;
     }
     memset(s, 0, sizeof *s);                /* a job still in the works no longer matches */
+}
+
+
+BwTrSlot *bw_tr_slot_for(BwTrSlot *s, uint32_t addr_u, uint32_t addr_v, uint32_t addr)
+{
+    uint8_t u = (uint8_t)(addr_u == 1 ? 1 : addr_u == 2 ? 2 : 0);
+    uint8_t v = (uint8_t)(addr_v == 1 ? 1 : addr_v == 2 ? 2 : 0);
+    if ((s->state != 1 && s->state != 3) || (u == s->au && v == s->av))
+        return s;
+    if (!s->mixed) {
+        s->mixed = 1;
+        s_n_mixed++;
+        s_changed = 1;
+        if (!s->alt)
+            s->alt = alt_take();
+        if (!s->alt)
+            s_alt_full++;
+        if (s_n_mixed <= 16)
+            fprintf(stderr, "[TEXRESTORE] %08X is also drawn with edges %s/%s; its restored copy was made"
+                            " for %s/%s, so %s (%u such textures so far)\n",
+                    addr, mode_name(u), mode_name(v), mode_name(s->au), mode_name(s->av),
+                    s->alt ? "it gets a second copy for these" : "that copy serves both (no slot left)",
+                    s_n_mixed);
+    }
+    if (!s->alt || (s->alt->state != 0 && (u != s->alt->au || v != s->alt->av)))
+        return s;                           /* a third combination: the first copy */
+    return s->alt;
 }
 
 static int left(BwTrSlot *s, int why, uint32_t addr, uint32_t color, uint32_t w, uint32_t h)
@@ -846,6 +902,8 @@ void bw_tr_request(BwTrSlot *s, uint32_t color, const uint8_t *src, uint32_t w, 
     size_t n = 0;
     TrJob *j;
     memset(s, 0, sizeof *s);
+    s->au = (uint8_t)(addr_u == 1 ? 1 : addr_u == 2 ? 2 : 0);   /* item 48 */
+    s->av = (uint8_t)(addr_v == 1 ? 1 : addr_v == 2 ? 2 : 0);
     if (!gpu_init() || !worker_start()) {
         left(s, BW_TR_WHY_FAIL, addr, color, w, h);
         return;
@@ -883,8 +941,12 @@ void bw_tr_request(BwTrSlot *s, uint32_t color, const uint8_t *src, uint32_t w, 
 
 /* The device thread's part: the chain (lk enlarged levels, then the game's),
  * the game's levels uploaded once and copied in on the GPU, the enlargement
- * drawn from level 0. */
-static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx)
+ * drawn from level 0. Returns 1 if the texture was restored; *drew becomes 1
+ * once the enlargement has drawn (it binds its own target and state), which
+ * can happen before a later step fails (0.2.5 item 47: the caller then
+ * rebinds its targets either way). */
+static const char *s_fail_what;     /* the step that failed, for the log */
+static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx, int *drew)
 {
     const BwVfx *v = bw_vfx();
     BwTrSlot *s = j->slot;
@@ -931,6 +993,7 @@ static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx)
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_IMMUTABLE;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    s_fail_what = "the game's levels (texture)";
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, init, &stex)))
         goto fail;
     memset(&sd, 0, sizeof sd);
@@ -938,12 +1001,14 @@ static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx)
     sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     sd.Texture2D.MostDetailedMip = 0;
     sd.Texture2D.MipLevels = 1;
+    s_fail_what = "the game's levels (view)";
     if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)stex, &sd, &ssrv)))
         goto fail;
     /* the chain */
     td.Width = W; td.Height = H; td.MipLevels = mips;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    s_fail_what = "the restored chain (texture)";
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &tex)))
         goto fail;
     for (lv = 0; lv < j->levels; lv++)
@@ -958,6 +1023,7 @@ static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx)
         rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
         rd.Texture2D.MipSlice = lv;
+        s_fail_what = "an enlarged level (render-target view)";
         if (FAILED(ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)tex, &rd, &rtv)))
             goto fail;
         cb.p[0] = (float)w; cb.p[1] = (float)h; cb.p[2] = (float)(k >> lv); cb.p[3] = 0.0f;
@@ -969,10 +1035,13 @@ static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx)
         vp.TopLeftX = 0; vp.TopLeftY = 0;
         vp.Width = (float)(W >> lv); vp.Height = (float)(H >> lv);
         vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+        *drew = 1;                          /* from here the caller's targets are unbound */
         bw_vfx_fullscreen(rtv, &vp, s_ps, s_cb, &ssrv, 1);
         ID3D11RenderTargetView_Release(rtv);
     }
-    if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)tex, NULL, &srv)))
+    s_fail_what = "the restored chain (view)";
+    if (FAILED(BW_GPU_FT("texrestore", E_OUTOFMEMORY,       /* item 25 test aid */
+                         ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)tex, NULL, &srv))))
         goto fail;
     ok = 1;
     t1 = now_ms();
@@ -1024,15 +1093,19 @@ fail:
     if (stex) ID3D11Texture2D_Release(stex);
     if (srv) ID3D11ShaderResourceView_Release(srv);
     if (tex) ID3D11Texture2D_Release(tex);
-    if (!ok)
+    if (!ok) {
+        if (s_logged < log_limit())
+            fprintf(stderr, "[TEXRESTORE] %08X %ux%u: %s could not be made%s\n", j->addr, w, h, s_fail_what,
+                    *drew ? "; the game's targets are bound again" : "");
         return left(s, BW_TR_WHY_FAIL, j->addr, j->color, w, h);
+    }
     return 1;
 }
 
 int bw_tr_pump(ID3D11Device *dev, ID3D11DeviceContext *ctx)
 {
     double t0, budget = frame_budget_ms();
-    int drew = 0, n = 0;
+    int drew = 0, n = 0;              /* drew: pipeline state changed (item 47) */
     if (!s_thread || !s_inflight)
         return 0;
     t0 = now_ms();
@@ -1047,7 +1120,7 @@ int bw_tr_pump(ID3D11Device *dev, ID3D11DeviceContext *ctx)
             break;
         if (s_inflight) s_inflight--;
         if (j->slot->state == 3 && j->slot->ticket == j->ticket) {
-            drew |= tr_finish(j, dev, ctx);
+            tr_finish(j, dev, ctx, &drew);
             n++;
         }
         job_free(j);

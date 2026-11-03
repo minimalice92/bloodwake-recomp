@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- bloodwake.exe's application manifest (0.2.5 item 33): the game sees
+     Windows display scaling as it is. Per-monitor DPI aware (v2, falling back
+     to v1 on older Windows 10), so at 150% a maximised window's swap chain is
+     the panel's real pixel size, not a smaller one Windows stretches (soft,
+     below native in Remastered, and no tearing or variable refresh).
+     CMakeLists.txt adds it to the exe's sources (MSVC), where the linker
+     merges it with its own manifest; one exe serves the host window and
+     every boot's child. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

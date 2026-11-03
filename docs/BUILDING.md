@@ -38,13 +38,15 @@ python tools/build_from_disc.py --disc "<your copy>" --install-dir "<install fol
 | `--work-dir <folder>` | Where the toolkit, the generated C and the build go (default: `<install-dir>\work`). Logs are in `<work-dir>\logs\`. |
 | `--jobs N` | Parallel compile jobs (default: your number of CPU threads). |
 | `--check-only` | Only identify your copy and check its fingerprint. Nothing is unpacked or copied. |
+| `--allow-unverified` | Build a copy that isn't the recognised retail one (another version, or a modified or damaged copy), as Setup does once you've accepted its warning. A differing program or differing files are reported and the build goes on; it's marked as unverified in `install.json` and in `build\Release\bw_copy.txt`. Use only a copy you made from your own disc: a copy from an unknown source could be tampered with. |
+| `--no-warmup` | Skip "Preparing graphics (one time)"; your first game then compiles its shaders as it goes. |
 | `--progress json` | One JSON object per line on standard output, for front ends such as the installer: `{"step": "...", "pct": 0-100, "msg": "..."}`. A failure adds `"error": true` and `"exit": <code>`. The default is plain text. |
 
 ### What it does, step by step
 1. **identify:** works out whether `--disc` is a folder, an XISO or a full disc image.
 2. **toolkit:** gets xboxrecomp at the pinned commit (from `--toolkit`, checked, or downloaded and hash-checked).
 3. **unpack:** copies your disc's files into `<install-dir>\game\disc` (from an image, with the toolkit's own reader).
-4. **fingerprint:** checks every file against `fingerprints/retail.json`. Only an unmodified retail copy passes.
+4. **fingerprint:** checks every file against `fingerprints/retail.json`. Only an unmodified retail copy passes, unless `--allow-unverified` was given.
 5. **pipeline:** translates the game's code to C with the toolkit (`tools/run_pipeline.py`), into `<work-dir>\gen`.
 6. **verify:** checks the generated C against `fingerprints/generated.json`. These are hashes of our own run's output, so a match proves your build is the same as ours. The code itself is never published.
 7. **build:** CMake and Visual Studio 2022, 64-bit, Release.
@@ -54,7 +56,7 @@ python tools/build_from_disc.py --disc "<your copy>" --install-dir "<install fol
 | Code | Meaning |
 |---|---|
 | 0 | Done. |
-| 2 | Not a supported, unmodified retail copy. |
+| 2 | Not a supported, unmodified retail copy (`--allow-unverified` builds it anyway). |
 | 3 | A dependency is missing; the message says which. |
 | 4 | The translation (pipeline) step failed. |
 | 5 | The generated code doesn't match ours (usually a different package or toolkit version). |

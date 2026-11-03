@@ -12,8 +12,18 @@ void bw_pscache_init(void);
  * it; NULL otherwise. The bytes stay owned by the cache. */
 const void *bw_pscache_find(const char *src, size_t len, size_t *size);
 
-/* A shader just compiled: keep it for later runs. */
+/* A shader just compiled: keep it for later runs. An entry already held for
+ * this text with other bytes (cached bytecode the driver rejected) is
+ * replaced, in memory and on disk (0.2.5 item 41). */
 void bw_pscache_store(const char *src, size_t len, const void *blob, size_t size);
+
+/* 0.2.5 item 43: the same for the vertex programs' shaders (vs_5_0, O3 with
+ * IEEE strictness; ws = compiled with the BW_WS define), kept as
+ * vs_<hash>.bin beside the pixel shaders. Called on the device's thread
+ * only, as the pixel-shader calls are. */
+const void *bw_pscache_find_vs(const char *src, size_t len, int ws, size_t *size);
+void bw_pscache_store_vs(const char *src, size_t len, int ws, const void *blob, size_t size);
+void bw_pscache_vs_counts(unsigned *hits, unsigned *stored);   /* this run's, for the log */
 
 /* BW_GPU_PSCACHE_VERIFY=1: compile on hits too and compare (test aid). */
 int bw_pscache_verify(void);

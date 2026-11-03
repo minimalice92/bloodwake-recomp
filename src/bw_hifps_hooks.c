@@ -85,6 +85,7 @@
 #include "bw_edition.h"
 #include "gpu/bw_d3d11.h"
 #include "bw_framelog.h"   /* P2b: BW_FRAMELOG test aid */
+#include "bw_monitor.h"    /* contract 6: the game's monitor (B1, item 34) */
 
 extern ptrdiff_t g_xbox_mem_offset;
 extern __declspec(thread) uint32_t g_eax, g_ecx, g_edx, g_esp;   /* RECOMP_TLS (TK-7) */
@@ -152,7 +153,6 @@ static unsigned s_target;
 static int s_interp = 1, s_extrap, s_log, s_lightning = 1, s_randsplit = 1;
 static int s_in_update;          /* inside Game_Update */
 static uint32_t s_steps_since_draw, s_snapshots;
-static int s_cam_ok;
 
 static Mat      s_prev[NODE_N], s_cur[NODE_N], s_wrote[NODE_N];
 static uint32_t s_id_prev[NODE_N], s_id_cur[NODE_N];   /* hash ^ drawable | 1, 0 = free */
@@ -187,23 +187,20 @@ static unsigned env_u(const char *name, unsigned dflt)
 }
 
 /* The refresh rate of the monitor the game's window will be on: the play
- * host's window (BW_PARENT_HWND, bw_host.c) or the primary monitor. */
+ * host's window (BW_PARENT_HWND, bw_host.c) or the primary monitor, as
+ * bw_game_monitor() says (contract 6, shared with widescreen). */
 static unsigned display_refresh(void)
 {
     DEVMODEA dm;
-    const char *e = getenv("BW_PARENT_HWND");
     const char *dev = NULL;
     MONITORINFOEXA mi;
+    HMONITOR mon = bw_game_monitor();
     memset(&dm, 0, sizeof dm);
     dm.dmSize = sizeof dm;
-    if (e && *e) {
-        HWND h = (HWND)(uintptr_t)_strtoui64(e, NULL, 0);
-        HMONITOR mon = h ? MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY) : NULL;
-        memset(&mi, 0, sizeof mi);
-        mi.cbSize = sizeof mi;
-        if (mon && GetMonitorInfoA(mon, (MONITORINFO *)&mi))
-            dev = mi.szDevice;
-    }
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    if (mon && GetMonitorInfoA(mon, (MONITORINFO *)&mi))
+        dev = mi.szDevice;
     if (!EnumDisplaySettingsA(dev, ENUM_CURRENT_SETTINGS, &dm) || dm.dmDisplayFrequency <= 1)
         return 0;
     return (unsigned)dm.dmDisplayFrequency;
@@ -499,7 +496,7 @@ static void apply_interp(float t)
         }
     }
     s_rcam_n = 0;
-    if (s_nviews && s_nviews == s_nviews_prev && s_cam_ok) {
+    if (s_nviews && s_nviews == s_nviews_prev) {
         s_rcam_n = s_nviews;
         for (n = 0; n < s_nviews; n++) {
             const CamKey *a = &s_cam_prev[n], *b = &s_cam_cur[n];
@@ -614,20 +611,7 @@ static uint32_t ptd_va(void)
  * so the next step sees exactly what it would have. BW_HIFPS_WATER=0 turns it
  * off; BW_HIFPS_WATER_VERIFY=1 compares the whole Water object and the
  * WaterWorld clock before and after each frame and counts differing bytes. */
-#define WW_OBJ_VA       0x001D77F8u
-#define W_UPDATES       0x08u
-#define W_IDX_NEW       0x0Cu
-#define W_IDX_PREV      0x10u
-#define W_HEIGHTS       0x2AB8u
-#define W_HEIGHTS_SZ    0x1000u
-#define W_PATCH         0x4AB8u
-#define W_PATCH_SZ      0x10000u
-#define W_PFLAG         0x24AB8u
-#define W_PFLAG_SZ      0x400u
-#define W_OBJ_SIZE      0x252F0u
-#define WW_CLOCK_MS     0xACA4u
-#define WW_CLOCK_S      0xACA8u
-#define WW_CLOCK_PREV_S 0xACACu
+#include "bw_waterworld.h"   /* WW_VA, its clock, the Water object (item 71) */
 
 static int s_water = 1, s_waterverify;
 static int s_water_on_frame;          /* BW_HIFPS_WATER=2: the buffer is blended */
@@ -643,7 +627,7 @@ static unsigned long s_st_water, s_st_waterbad;
 
 static void apply_water(float t)
 {
-    uint32_t w = HU32(WW_OBJ_VA), nw, pv, hn, hp, i;
+    uint32_t w = HU32(WW_VA), nw, pv, hn, hp, i;
     float tn, tp;
     s_water_on_frame = 0;
     if (!s_water || !w || w < 0x00010000u)
@@ -664,7 +648,7 @@ static void apply_water(float t)
         if (!s_w_verify && !(s_w_verify = (uint8_t *)malloc(W_OBJ_SIZE)))
             return;
         memcpy(s_w_verify, HP(w), W_OBJ_SIZE);
-        memcpy(s_w_clock_verify, HP(WW_OBJ_VA + WW_CLOCK_MS), 12);
+        memcpy(s_w_clock_verify, HP(WW_VA + WW_CLOCK_MS), 12);
     }
     hn = w + W_HEIGHTS + nw * W_HEIGHTS_SZ;
     hp = w + W_HEIGHTS + pv * W_HEIGHTS_SZ;
@@ -676,13 +660,13 @@ static void apply_water(float t)
         HF32(hn + 4 * i) = a + (b - a) * t;
     }
     memset(HP(w + W_PFLAG + nw * W_PFLAG_SZ), 0, W_PFLAG_SZ);
-    s_w_ms = HU32(WW_OBJ_VA + WW_CLOCK_MS);
-    s_w_s = HU32(WW_OBJ_VA + WW_CLOCK_S);
-    tn = HF32(WW_OBJ_VA + WW_CLOCK_S);
-    tp = HF32(WW_OBJ_VA + WW_CLOCK_PREV_S);
+    s_w_ms = HU32(WW_VA + WW_CLOCK_MS);
+    s_w_s = HU32(WW_VA + WW_CLOCK_S);
+    tn = HF32(WW_VA + WW_CLOCK_S);
+    tp = HF32(WW_VA + WW_CLOCK_PREV_S);
     if (tn > tp && tn - tp < 1.0f) {
-        HF32(WW_OBJ_VA + WW_CLOCK_S) = tp + (tn - tp) * t;
-        HU32(WW_OBJ_VA + WW_CLOCK_MS) = s_w_ms - (uint32_t)((tn - tp) * (1.0f - t) * 1000.0f + 0.5f);
+        HF32(WW_VA + WW_CLOCK_S) = tp + (tn - tp) * t;
+        HU32(WW_VA + WW_CLOCK_MS) = s_w_ms - (uint32_t)((tn - tp) * (1.0f - t) * 1000.0f + 0.5f);
     }
     s_w_obj = w;
     s_w_new = nw;
@@ -699,14 +683,14 @@ static void restore_water(void)
     memcpy(HP(w + W_HEIGHTS + nw * W_HEIGHTS_SZ), s_w_h, W_HEIGHTS_SZ);
     memcpy(HP(w + W_PFLAG + nw * W_PFLAG_SZ), s_w_pf, W_PFLAG_SZ);
     memcpy(HP(w + W_PATCH + nw * W_PATCH_SZ), s_w_pd, W_PATCH_SZ);
-    HU32(WW_OBJ_VA + WW_CLOCK_MS) = s_w_ms;
-    HU32(WW_OBJ_VA + WW_CLOCK_S) = s_w_s;
+    HU32(WW_VA + WW_CLOCK_MS) = s_w_ms;
+    HU32(WW_VA + WW_CLOCK_S) = s_w_s;
     if (s_waterverify && s_w_verify) {
         const uint8_t *now = (const uint8_t *)HP(w);
         uint32_t i, diff = 0;
         for (i = 0; i < W_OBJ_SIZE; i++)
             diff += now[i] != s_w_verify[i];
-        diff += memcmp(HP(WW_OBJ_VA + WW_CLOCK_MS), s_w_clock_verify, 12) != 0;
+        diff += memcmp(HP(WW_VA + WW_CLOCK_MS), s_w_clock_verify, 12) != 0;
         if (diff) {
             static int shown;
             s_st_waterbad++;
@@ -741,8 +725,17 @@ static void restore_water(void)
  * cover every offset the two functions write (markers 0xA6C, reticle 0x1E0).
  * Coordinated with D5's widescreen: its Camera_WorldToScreen wrapper
  * (bw_remaster_hooks.c) runs inside the replay as in the step.
- * BW_HIFPS_HUD=0 turns it off. */
-#define HUD_RECS      8
+ * BW_HIFPS_HUD=0 turns it off.
+ *
+ * One slot per (function, object). 4-player split screen alone has 8 such
+ * objects (a marker set and a reticle per view), and a rematch or a new
+ * battle in the same boot makes new ones, so the table once filled up for
+ * good and later markers juddered at 30 Hz (item 63). A full table now
+ * reuses the slot unused longest (one not recorded in the running step:
+ * an object gone with its level is never replayed again, since replay takes
+ * only slots of the latest step). A miss (every slot in use this step) is
+ * counted in the BW_HIFPS_LOG line. */
+#define HUD_RECS      16
 #define HUD_MAXSZ     0xA6Cu
 typedef struct {
     uint32_t fn, obj, arg, size, step;
@@ -752,21 +745,35 @@ typedef struct {
 static HudRec s_hud[HUD_RECS];
 static int s_nhud, s_hudon = 1;
 static unsigned long s_st_hud, s_st_hudmoved, s_st_hudtouched;
+static unsigned long s_hud_reused, s_hud_missed;   /* this boot */
 extern void sub_00084AE0_gen(void);
 extern void sub_00085850_gen(void);
 
 static HudRec *hud_rec(uint32_t fn, uint32_t obj, uint32_t size)
 {
-    int i;
+    int i, old = -1;
+    uint32_t now = s_snapshots + 1;          /* the step that is running now */
     for (i = 0; i < s_nhud; i++)
         if (s_hud[i].fn == fn && s_hud[i].obj == obj)
             return &s_hud[i];
-    if (s_nhud >= HUD_RECS)
-        return NULL;
-    s_hud[s_nhud].fn = fn;
-    s_hud[s_nhud].obj = obj;
-    s_hud[s_nhud].size = size;
-    return &s_hud[s_nhud++];
+    if (s_nhud < HUD_RECS)
+        i = s_nhud++;
+    else {
+        for (i = 0; i < HUD_RECS; i++)
+            if (s_hud[i].step != now && (old < 0 || s_hud[i].step < s_hud[old].step))
+                old = i;
+        if (old < 0) {
+            s_hud_missed++;
+            return NULL;
+        }
+        i = old;
+        s_hud_reused++;
+    }
+    s_hud[i].fn = fn;
+    s_hud[i].obj = obj;
+    s_hud[i].size = size;
+    s_hud[i].replayed = 0;
+    return &s_hud[i];
 }
 
 static void hud_record(uint32_t fn, uint32_t size)
@@ -1143,7 +1150,6 @@ void sub_00028600(void)
         sub_00028600_gen();
         return;
     }
-    s_cam_ok = 1;
     interp = s_interp && s_snapshots >= 2 && HU32(GAME_VA + GAME_STATE) == 0;
     audit = interp && s_steps_since_draw == 0 && s_audit != 0;
     if (audit)
@@ -1217,12 +1223,13 @@ void sub_00028600(void)
             fprintf(stderr, "[BW] hifps: %lu frames %lu steps (%lu frames with none), "
                     "alpha %.2f, nodes lerped %lu snapped %lu, ocean batches %lu reused %lu"
                     " (verify mismatches %lu), cameras %lu (overwritten %lu), water %lu"
-                    " (verify %lu, tiles blended %lu, older evaluated %lu), hud replays %lu (bytes moved %lu, frame-touched %lu)\n",
+                    " (verify %lu, tiles blended %lu, older evaluated %lu), hud replays %lu (bytes moved %lu, frame-touched %lu)"
+                    "; hud objects this boot: %d slots of %d, %lu reused, %lu missed\n",
                     s_st_frames, s_st_steps, s_st_zero,
                     s_st_frames ? s_st_alpha / s_st_frames : 0.0, s_st_lerped, s_st_snapped,
                     s_st_ob, s_st_obhit, s_st_obbad, s_st_cam, s_st_camover,
                     s_st_water, s_st_waterbad, s_st_oblerp, s_st_obprev, s_st_hud, s_st_hudmoved,
-                    s_st_hudtouched);
+                    s_st_hudtouched, s_nhud, HUD_RECS, s_hud_reused, s_hud_missed);
             s_st_frames = s_st_steps = s_st_zero = s_st_lerped = s_st_snapped = 0;
             s_st_ob = s_st_obhit = s_st_obbad = s_st_cam = s_st_camover = 0;
             s_st_water = s_st_waterbad = s_st_hud = s_st_hudmoved = s_st_hudtouched = 0;
@@ -1288,7 +1295,6 @@ static uint32_t s_ob_n = OB_N_DEFAULT;
 #define OB_MAXV     64u                  /* vertices per batch: 25 seen */
 #define OB_STRIDE   0x28u
 #define OB_BYTES    (OB_MAXV * OB_STRIDE)
-#define WW_VA       0x001D77F8u
 typedef struct {
     uint64_t key;
     uint32_t gen, base, len;
@@ -1417,18 +1423,18 @@ void sub_00098130(void)
         /* the step before's result */
         ep = ob_slot(h, s_water_gen - 1u);
         if (!(ep->key == h && ep->gen == s_water_gen - 1u && ep->base == base && ep->len == len)) {
-            uint32_t w = HU32(WW_OBJ_VA), nw = HU32(w + W_IDX_NEW), pv = HU32(w + W_IDX_PREV);
-            uint32_t ms = HU32(WW_OBJ_VA + WW_CLOCK_MS), sec = HU32(WW_OBJ_VA + WW_CLOCK_S);
-            float tn = HF32(WW_OBJ_VA + WW_CLOCK_S), tp = HF32(WW_OBJ_VA + WW_CLOCK_PREV_S);
+            uint32_t w = HU32(WW_VA), nw = HU32(w + W_IDX_NEW), pv = HU32(w + W_IDX_PREV);
+            uint32_t ms = HU32(WW_VA + WW_CLOCK_MS), sec = HU32(WW_VA + WW_CLOCK_S);
+            float tn = HF32(WW_VA + WW_CLOCK_S), tp = HF32(WW_VA + WW_CLOCK_PREV_S);
             HU32(w + W_IDX_NEW) = pv;
-            HF32(WW_OBJ_VA + WW_CLOCK_S) = tp;
+            HF32(WW_VA + WW_CLOCK_S) = tp;
             if (tn > tp && tn - tp < 1.0f)
-                HU32(WW_OBJ_VA + WW_CLOCK_MS) = ms - (uint32_t)((tn - tp) * 1000.0f + 0.5f);
+                HU32(WW_VA + WW_CLOCK_MS) = ms - (uint32_t)((tn - tp) * 1000.0f + 0.5f);
             ob_call(esp0, frame);
             called = 1;
             HU32(w + W_IDX_NEW) = nw;
-            HU32(WW_OBJ_VA + WW_CLOCK_MS) = ms;
-            HU32(WW_OBJ_VA + WW_CLOCK_S) = sec;
+            HU32(WW_VA + WW_CLOCK_MS) = ms;
+            HU32(WW_VA + WW_CLOCK_S) = sec;
             ep->key = h;
             ep->gen = s_water_gen - 1u;
             ep->base = base;

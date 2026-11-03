@@ -38,16 +38,24 @@ extern __declspec(thread) uint32_t g_eax;
  * answers surround when the host's audio device has 6 or more channels
  * (bw_audio_host_channels, the carried XAudio2 output). */
 extern void sub_000D9240_gen(void);
-extern int bw_audio_surround_wanted(void);      /* toolkit_patches/apu */
+/* -1 = not decided yet (XAudio2 init hasn't run), 0 or 1; why = what decided it */
+extern int bw_audio_surround_wanted(const char **why);   /* toolkit_patches/apu */
 
 static int s_spk_mode = -2;                     /* -1: the game's own answer */
 static uint32_t s_spk_flags;
 
+/* Item 67 (MR2 #4): the answer is cached only once the audio output has
+ * decided on surround. main.c brings XAudio2 up before the game's first
+ * instruction, so a call before that is not expected (seen: mission 1 asks
+ * long after init, run 20261103-015058-r6-gpu-c2-67-force); if one came, it
+ * would get the game's own answer and the next call would decide. The log
+ * names the switch that set the answer. */
 uint32_t bw_audio_speaker_flags(int *forced)
 {
     if (s_spk_mode == -2) {
         const char *e = getenv("BW_AUDIO_SPEAKERS");
-        s_spk_mode = -1;
+        const char *why = "BW_AUDIO_SPEAKERS";
+        int sur;
         if (e && *e) {
             s_spk_mode = 1;
             if (!strcmp(e, "stereo"))
@@ -60,13 +68,23 @@ uint32_t bw_audio_speaker_flags(int *forced)
                 s_spk_flags = 0x10000;
             else
                 s_spk_flags = (uint32_t)strtoul(e, NULL, 0);
-        } else if (bw_audio_surround_wanted()) {
+        } else if ((sur = bw_audio_surround_wanted(&why)) < 0) {
+            static int told;
+            if (!told++)
+                fprintf(stderr, "[AUDIO] the game asked for the speaker configuration before the "
+                        "audio output was set up: its own answer for now, decided on a later call\n");
+            if (forced)
+                *forced = 0;
+            return 0;
+        } else if (sur) {
             s_spk_mode = 1;
             s_spk_flags = 2;
+        } else {
+            s_spk_mode = -1;
         }
         if (s_spk_mode > 0)
             fprintf(stderr, "[AUDIO] speaker configuration the game sees: 0x%X (%s)\n",
-                    s_spk_flags, e && *e ? "BW_AUDIO_SPEAKERS" : "Remastered AUDIO_SURROUND");
+                    s_spk_flags, why);
     }
     if (forced)
         *forced = s_spk_mode > 0;

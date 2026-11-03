@@ -301,16 +301,13 @@ void sub_000762D0(void)
 extern void sub_00028B30_gen(void);
 void sub_00028B30(void)
 {
-    uint32_t ra;
     if (bw_ws_k() <= 1.0f) {
         sub_00028B30_gen();
         return;
     }
     ws_emit(BW_WS_MARK(BW_WS_OP_2D_BEGIN, BW_WS_WHAT_OVERLAY));
     sub_00028B30_gen();
-    ra = g_eax;
-    ws_emit(BW_WS_MARK(BW_WS_OP_2D_END, BW_WS_WHAT_OVERLAY));
-    g_eax = ra;
+    ws_emit(BW_WS_MARK(BW_WS_OP_2D_END, BW_WS_WHAT_OVERLAY));   /* keeps eax, ecx, edx */
 }
 
 /* Movie_DrawQuad 0x000D6050 (seen): four pre-transformed vertices through
@@ -319,16 +316,13 @@ void sub_00028B30(void)
 extern void sub_000D6050_gen(void);
 void sub_000D6050(void)
 {
-    uint32_t ra;
     if (bw_ws_k() <= 1.0f) {
         sub_000D6050_gen();
         return;
     }
     ws_emit(BW_WS_MARK(BW_WS_OP_2D_BEGIN, BW_WS_WHAT_MOVIE));
     sub_000D6050_gen();
-    ra = g_eax;
-    ws_emit(BW_WS_MARK(BW_WS_OP_2D_END, BW_WS_WHAT_MOVIE));
-    g_eax = ra;
+    ws_emit(BW_WS_MARK(BW_WS_OP_2D_END, BW_WS_WHAT_MOVIE));   /* keeps eax, ecx, edx */
 }
 
 /* ---- 5. the static world: widen the grid square ---------------------------

@@ -13,7 +13,7 @@ It is **not affiliated with, endorsed by, sponsored by or connected to** Microso
 - `fingerprints/` holds SHA-256 hashes only. A hash identifies a file without revealing anything about what's in it.
 
 ## Your responsibilities
-- **You must own a legitimate retail copy of Blood Wake**, and make the copy you build from yourself, from your own disc. The build checks your copy against the published fingerprints and refuses anything else.
+- **You must own a legitimate retail copy of Blood Wake**, and make the copy you build from yourself, from your own disc. The build checks your copy against the published fingerprints. A copy it doesn't recognise (another version, or a modified or damaged copy) is built only after you accept a warning, and is marked as unverified: a copy from an unknown source could be tampered with, and Setup turns its program into one that runs on your PC.
 - Use this only for yourself. **Don't share** the files your build produces: the unpacked game, the generated C, or the executable. They contain or are made from the game, which belongs to its rights holders.
 - Follow the law where you live. Whether making a personal copy of a game you own is allowed differs from country to country; that's yours to check.
 
