@@ -1338,6 +1338,12 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             }
             hs_submit(MIXER_FRAME_SAMPLES,
                       xa2_submit_samples(out, MIXER_FRAME_SAMPLES), q);
+        } else {
+            /* Blood Wake carried patch (0.2.5 item 105): a stalled queue
+             * submits nothing, so a lost device is looked after from here
+             * (xa2_poll_stalled in the carried apu_xaudio2.c) */
+            extern void xa2_poll_stalled(int stalled_ms);
+            xa2_poll_stalled((int)((qemu_clock_get_us(QEMU_CLOCK_REALTIME) - d->pace_drain_us) / 1000));
         }
         return;
     }

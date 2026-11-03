@@ -96,12 +96,27 @@ static int                     g_xa2_frames_written = 0;
  * there, it tries again when Windows announces a new default device (or
  * every 5 s), silently in between.
  *
+ * And (0.2.5 item 105) while the device queue is stalled: a device that
+ * stops taking sound without an error (seen: the monitor's HDMI audio going
+ * away and coming back) keeps the queue full, so the APU paces by the host
+ * clock and submits nothing, and the check at the next submit never came:
+ * the flag set by the critical error or Windows' notice was never acted on
+ * and the boot stayed silent to its end. Now apu_core.c calls
+ * xa2_poll_stalled each period while the queue is stalled: a flagged loss is
+ * acted on there, and a device that has taken no sound for a second counts as
+ * lost (at most every 5 s).
+ *
  * Test switches (any edition; never in a preset):
  *   BW_TEST_AUDIO_LOST=<ms>[,<ms>...]  at those times after init, behave as if
  *       the device were lost: the voice stops consuming and the flag is set,
  *       as OnCriticalError would
+ *   BW_TEST_AUDIO_STALL=<ms>[,<ms>...]  (item 105) at those times after init,
+ *       the voice stops taking sound with no error and no notice
+ *   BW_TEST_AUDIO_NODEVICE=<from>-<to>  (item 105) opens in that window (ms
+ *       after the first open) fail as if Windows had no output device
  *   BW_AUDIO_REBUILD=0  no rebuild (the old behaviour, for comparing) */
-static volatile LONG g_xa2_lost;       /* 0, or why: 1 critical error, 2 new default device, 3 test */
+static volatile LONG g_xa2_lost;       /* 0, or why: 1 critical error, 2 new default device, 3 test,
+                                        * 4 no sound taken for a second while stalled (item 105) */
 static volatile LONG g_xa2_lost_hr;
 static uint64_t  g_xa2_played_base;   /* samples the voices before the last rebuild played */
 static unsigned  g_xa2_rebuilds;
@@ -180,6 +195,33 @@ static void xa2_release(void)
     }
 }
 
+/* BW_TEST_AUDIO_NODEVICE (item 105): an open in the window fails as if Windows
+ * had no output device. */
+static int xa2_test_nodevice(int quiet)
+{
+    static int parsed;
+    static ULONGLONG t0;
+    static unsigned long a, b;
+    ULONGLONG now = GetTickCount64();
+    if (!parsed) {
+        const char *e = getenv("BW_TEST_AUDIO_NODEVICE");
+        parsed = 1;
+        t0 = now;
+        if (e && *e) {
+            char *end;
+            a = strtoul(e, &end, 10);
+            b = *end == '-' ? strtoul(end + 1, NULL, 10) : 0;
+        }
+    }
+    if (b > a && now - t0 >= a && now - t0 < b) {
+        if (!quiet)
+            fprintf(stderr, "[XA2] test: no audio device (BW_TEST_AUDIO_NODEVICE, %llu ms)\n",
+                    (unsigned long long)(now - t0));
+        return 1;
+    }
+    return 0;
+}
+
 /* The engine, a mastering voice on the default device, and the source voice,
  * started. At boot it also decides the layout (5.1 or stereo); a rebuild
  * keeps it. quiet: no failure lines (retries while no device is there). */
@@ -195,6 +237,8 @@ static HRESULT xa2_open(int boot, int quiet)
         return FAILED(hr) ? hr : E_FAIL;
     }
     IXAudio2_RegisterForCallbacks(g_xa2, &s_ecb);
+    if (xa2_test_nodevice(quiet))        /* item 105's test switch */
+        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 
     /* Blood Wake: the device's own channel count decides whether a 5.1
      * source voice is wanted; without one, a 2-channel mastering voice as
@@ -293,8 +337,33 @@ static ULONGLONG test_lost_due(ULONGLONG since)
     return 0;
 }
 
-/* The APU frame thread, before each submit: a lost or changed device is
- * rebuilt here (see above). */
+/* BW_TEST_AUDIO_STALL (item 105): the next stall time (ms after init) due, or 0. */
+static ULONGLONG test_stall_due(ULONGLONG since)
+{
+    static int parsed;
+    static ULONGLONG at[16];
+    static int n, next;
+    if (!parsed) {
+        const char *e = getenv("BW_TEST_AUDIO_STALL");
+        parsed = 1;
+        while (e && *e && n < 16) {
+            char *end;
+            unsigned long v = strtoul(e, &end, 10);
+            if (end == e)
+                break;
+            at[n++] = v;
+            e = end;
+            while (*e == ',' || *e == ' ')
+                e++;
+        }
+    }
+    if (next < n && since >= at[next])
+        return at[next++];
+    return 0;
+}
+
+/* The APU frame thread, before each submit (and while the queue is stalled,
+ * item 105): a lost or changed device is rebuilt here (see above). */
 static void xa2_check_device(void)
 {
     ULONGLONG now = GetTickCount64(), t;
@@ -303,7 +372,8 @@ static void xa2_check_device(void)
     HRESULT hr;
     static const char *const k_why[] = { "", "XAudio2 reported a critical error",
                                          "Windows has a new default audio device",
-                                         "test switch BW_TEST_AUDIO_LOST" };
+                                         "test switch BW_TEST_AUDIO_LOST",
+                                         "the device has taken no sound for a second" };
 
     if ((t = test_lost_due(now - g_xa2_t0)) != 0) {
         if (g_xa2_source)
@@ -311,6 +381,12 @@ static void xa2_check_device(void)
         fprintf(stderr, "[XA2] test: the audio device is lost at %llu ms (the voice stops "
                 "consuming)\n", (unsigned long long)t);
         InterlockedExchange(&g_xa2_lost, 3);
+    }
+    if ((t = test_stall_due(now - g_xa2_t0)) != 0) {
+        if (g_xa2_source)
+            IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+        fprintf(stderr, "[XA2] test: the device stops taking sound at %llu ms, with no error and no"
+                " notice (BW_TEST_AUDIO_STALL)\n", (unsigned long long)t);
     }
     if (g_xa2_rebuilt_at && now - g_xa2_rebuilt_at >= 1000 && g_xa2_source) {
         XAUDIO2_VOICE_STATE st;
@@ -328,7 +404,7 @@ static void xa2_check_device(void)
         if (g_xa2_waiting && why == 2)
             g_xa2_quiet_events++;        /* while no device: counted, said once when it's back */
         else
-            fprintf(stderr, "[XA2] the audio device is gone or changed: %s\n", k_why[why < 4 ? why : 0]);
+            fprintf(stderr, "[XA2] the audio device is gone or changed: %s\n", k_why[why < 5 ? why : 0]);
         if (why == 1)
             fprintf(stderr, "[XA2] (the error: 0x%08lX)\n", (unsigned long)g_xa2_lost_hr);
         if (e && *e == '0') {
@@ -378,6 +454,29 @@ static void xa2_check_device(void)
             "the game was told at boot); sound goes on\n",
             (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)f.QuadPart, g_xa2_rebuilds,
             g_xa2_channels == 6 ? "5.1" : "stereo");
+}
+
+/* 0.2.5 item 105 (carried apu_core.c calls it): each period while the device
+ * queue is stalled, when no submit runs xa2_check_device. A loss flagged
+ * meanwhile is acted on, and a device that has taken no sound for a second
+ * counts as lost (why 4), at most every 5 s. BW_AUDIO_REBUILD=0 keeps the old
+ * behaviour (silent until the next boot). */
+void xa2_poll_stalled(int stalled_ms)
+{
+    static int no_rebuild = -1;
+    static ULONGLONG s_last;
+    ULONGLONG now = GetTickCount64();
+    if (no_rebuild < 0) {
+        const char *e = getenv("BW_AUDIO_REBUILD");
+        no_rebuild = e && *e == '0';
+    }
+    if (!g_xa2_initialized || no_rebuild)
+        return;
+    if (!g_xa2_lost && !g_xa2_waiting && stalled_ms >= 1000 && now - s_last >= 5000) {
+        s_last = now;
+        InterlockedCompareExchange(&g_xa2_lost, 4, 0);
+    }
+    xa2_check_device();
 }
 
 int xa2_init(void)
