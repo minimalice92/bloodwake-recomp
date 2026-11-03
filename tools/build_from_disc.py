@@ -554,8 +554,12 @@ class Retail:
         missing = [f for k, f in self.by_key.items() if k not in seen and f.get("required", True)]
         ok = not bad and not missing
         if ok:
-            msg = "an unmodified %s copy of %s (%d files checked)" % (
-                self.data.get("label", "retail"), self.data.get("game", "the game"), len(seen))
+            # "an unmodified retail copy (North America, 450 files checked)": the
+            # label's region only, so Setup's Finished line doesn't say it twice
+            label = self.data.get("label", "")
+            region = label.split(", ", 1)[1].split(" (")[0] if ", " in label else ""
+            msg = "an unmodified retail copy (%s%d files checked)" % (
+                region + ", " if region else "", len(seen))
         else:
             parts = []
             if bad:
