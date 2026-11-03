@@ -163,7 +163,7 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
 WelcomeLabel1=Welcome to Blood Wake Recomp
-WelcomeLabel2=Blood Wake Recomp is an unofficial fan port that runs Blood Wake (Xbox, 2001) natively on Windows. Setup builds the game on this PC from your own copy.%n%nYou need:%n%n-  your copy of Blood Wake: a disc image or a folder of the disc's files%n-  about 3 GB of free space%n-  an internet connection%n-  about 15 minutes (longer on an older PC)%n%nNothing from the game is downloaded or sent anywhere.
+WelcomeLabel2=Blood Wake Recomp is an unofficial fan port that runs Blood Wake (Xbox, 2001) natively on Windows. Setup builds the game on this PC from your own copy.%n%nYou need:%n%n-  your copy of Blood Wake (a disc image or a folder)%n-  about 3 GB of free space%n-  an internet connection%n-  about 15 minutes (longer on an older PC)%n%nNothing from the game is downloaded or sent anywhere.
 ConfirmUninstall=Remove %1 now?
 ClickNext=
 ; Inno's stock pages on the common path, without the title, subtitle and body repeating each other (item 106)
