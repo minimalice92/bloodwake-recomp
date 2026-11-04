@@ -9,10 +9,13 @@
 ![Remastered at 4K: a gunboat at full speed into a low sunset, its wake trailing, the HUD in the corners](docs/images/shot-hero.jpg)
 *Full speed into the sunset. Remastered at 4K with every setting maxed: the original art, nothing redrawn or replaced.*
 
+> [!TIP]
+> **New in 0.2.5, the stable base:** more than 100 fixes and improvements, every one tested. It plays full screen out of the box, with keyboard and mouse or a controller. Remap any key in the launcher, and switch cheats on with a tick. HDR is drawn from your screen's own data, by the ITU's standards, with an optional Automatic HDR. Setup is shorter, and it updates an older install in place, keeping your saves and settings. Start-up, sound and graphics are far harder to break. [Read the release notes](https://github.com/minimalice92/bloodwake-recomp/releases/latest).
+
 > [!NOTE]
 > Unofficial, free and non-commercial. You need your own Blood Wake disc, and nothing from the game is in this repository. See [Staying safe](#staying-safe).
 
-<img src="docs/images/stats.svg" width="600" alt="100%: recompiled, 0 functions failed, the whole game plays. 8,110 functions named. About 3 days from the first plan to the first release. 70+ AI agents. 0 crashes in 948 mission runs of soak tests. 17 bugs from 2001 fixed in Remastered.">
+<img src="docs/images/stats.svg" width="600" alt="100%: recompiled, 0 functions failed, the whole game plays. 8,110 functions named. About 3 days from the first plan to the first release. 80+ AI agents. 0 crashes in 948 mission runs of soak tests. 17 bugs from 2001 fixed in Remastered.">
 
 ## Features and Showcase
 One program, two editions, picked in the launcher.
@@ -30,7 +33,8 @@ The original art and sound, never replaced. Every change has its own switch.
 **Looks**
 - 16:9 and 21:9 widescreen: more of the world, nothing stretched, the HUD in the corners.
 - Native resolution up to 4K, 8x anti-aliasing, 16x texture filtering, longer detail distance.
-- Cleaner textures up close, no banding, sharp text. Optional HDR, ambient occlusion, bloom and an OLED care mode.
+- Cleaner textures up close, no banding, sharp text. Ambient occlusion, bloom and an OLED care mode.
+- **HDR done by the book:** on an HDR screen the picture is mapped from the screen's own data (its EDID), by the ITU's standards, so there are no washed-out greys and nothing to set up. Tick **Automatic HDR** and the launcher switches Windows HDR on while you play and back afterwards. A **Colour** option stretches the colours onto wide-gamut (P3) screens, if you like it vivid.
 
 ![Remastered at 21:9 ultrawide: a temple skyline across the full width, the HUD at the screen's edges](docs/images/shot-ultrawide.jpg)
 *21:9 ultrawide: the whole temple skyline, more of the world at the sides, nothing stretched.*
@@ -53,6 +57,7 @@ The original art and sound, never replaced. Every change has its own switch.
 
 **Sounds**
 - Cleaner pitch changes, a louder mix with a limiter, the game's own surround mix on 5.1 and 7.1, lower latency.
+- Sound that survives: unplug the headphones, switch the output or let the monitor's HDMI audio drop out, and the sound comes back by itself.
 
 **Fixes**
 - 17 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, a dark line on the distant night sea, and more.
@@ -67,7 +72,7 @@ Every setting: [docs/SETTINGS.md](docs/SETTINGS.md). Both editions in full: [doc
 - **Windows 10 or 11, 64-bit**, and a graphics card with DirectX 11.
 - **Your own Blood Wake disc**, copied to your PC as a folder of its files, an Xbox ISO (XISO) or a full disc image. Setup recognises the North American retail release in [`fingerprints/retail.json`](fingerprints/retail.json). Another version, or a modified copy, can be built too, after a plain warning you have to accept.
 - **A few GB of free space** for the build (the game's files alone are about 2 GB).
-- An Xbox-style controller (XInput), or the keyboard.
+- An Xbox-style controller (XInput), or a keyboard and mouse: the keyboard works as controller 1 out of the box, and in Remastered the mouse works in every menu.
 
 The build also uses free tools, which the installer fetches if they're missing, from their official sites only: Python 3.13 with the packages pinned in [`tools/requirements.txt`](tools/requirements.txt), Visual Studio 2022 Build Tools (version 17, C++ workload; 2026 isn't supported yet), CMake 3.20 or later, and the xboxrecomp toolkit at a pinned commit, checked against a pinned hash.
 
@@ -76,13 +81,15 @@ The build also uses free tools, which the installer fetches if they're missing, 
 
 1. Download `BloodWakeRecomp-Setup-<version>.exe` from [Releases](https://github.com/minimalice92/bloodwake-recomp/releases) and run it. It installs for your Windows user only; only the step that installs Microsoft's build tools, if needed, asks for administrator rights.
 2. Accept the disclaimer, confirming you own the game and copied it from your own disc.
-3. Choose your copy of the disc. Setup tells you in plain words whether it recognises the copy. If it doesn't (another region, a modified copy or a damaged one), it explains what that means before you decide to go on.
+3. Choose your copy of the disc. Setup tells you in plain words whether it recognises it. If it doesn't (another region, a modified copy or a damaged one), it explains what that means before you decide to go on.
 4. Pick the install folder (by default `%LOCALAPPDATA%\Programs\Blood Wake Recomp`) and the shortcuts.
-5. Let it build: translating and compiling the game takes about 15 minutes, with a progress bar, and can't be cancelled once it starts. Its last step, "Preparing graphics (one time)", plays a few short scenes hidden and silent (about 2 minutes) so your first game doesn't stutter while its graphics shaders compile.
+5. Let it build: about 15 minutes, with a progress bar, and you can cancel at any point. Its last step, "Preparing graphics", plays a few short scenes hidden and silent (about 2 minutes) so your first game doesn't stutter while its shaders compile.
 6. Play from the Start menu or the desktop shortcut.
 
+**Updating:** run the new installer over your current version, into the same folder. Your saves, settings and prepared graphics are kept.
+
 ![The installer's shortcuts page: a Start menu entry and a desktop shortcut, each with its own box](docs/images/ui-installer-shortcuts.jpg)
-*The installer: a Start menu entry and a desktop shortcut, both ticked; untick either.*
+*The installer (0.2.5): a Start menu entry and a desktop shortcut; untick either.*
 
 To uninstall, use Windows' **Apps** settings: it removes the build and its shortcuts, and keeps your saves and settings unless you choose otherwise.
 
@@ -97,15 +104,18 @@ Then start the launcher from the install folder. Every option, step and exit cod
 
 ### Playing
 ![The launcher's Graphics tab: anti-aliasing, texture filtering, detail distance and the other picture settings, with a Play button](docs/images/ui-launcher-graphics.jpg)
-*The launcher: pick an edition and your settings, then press Play.*
+*The launcher (0.2.5): pick an edition and your settings, then press Play.*
 
-- The launcher has a tab each for Edition, Display, Graphics, Audio, Fixes and Controls. Hover over anything for an explanation.
+- The launcher has a tab each for Edition, Display, Graphics, Audio, Fixes, Controls, Cheats and Advanced. Hover over any setting for a short explanation.
+- **Controls:** remap any key, or a mouse button, with a click and a press; set the keyboard's steering and the sticks' deadzones.
+- **Cheats:** tick the ones you want under one switch.
+- **If something goes wrong:** after two failed starts the launcher offers safe mode, and **Make a bug report** (Advanced tab) puts one zip on your desktop with the log and your settings, nothing from the game.
 
-**Presets (Remastered).** The Edition tab has three presets that set the Display and Graphics tabs in one go. Best Quality is the default. You can still change any setting afterwards; the preset then shows Custom. HDR and OLED care are never changed by a preset.
+**Presets (Remastered).** The Edition tab has three presets that set the Display and Graphics tabs in one go. Best Quality is the default. You can still change any setting afterwards; the preset then shows Custom. Automatic HDR, Colour and OLED care are never changed by a preset.
 - **Best Quality:** a modern game on max settings: every upgrade and extra on (ambient occlusion, bloom and gentle sharpening included), tuned so nothing overlaps.
 - **Balanced and Original:** the original game true to form, looking its best on a modern screen, with none of the extras that change the look.
 - **Best Performance:** for a slower PC: the cheapest settings that keep the essentials (widescreen, a high frame rate, light anti-aliasing), so it still feels like a modern game.
-- Alt+Enter or F11 switches between a window and borderless fullscreen while you play.
+- The game opens borderless full screen; Alt+Enter or F11 switches to a window and back while you play, and Window stays a choice on the Display tab. In Remastered, the main menu's last entry reads Quit Game.
 - Each edition keeps its own saves, under `%LOCALAPPDATA%\xboxrecomp\` (Remastered's in `editions\remastered`). The first time you play Remastered, it starts with a copy of your Original saves. Settings live in `%LOCALAPPDATA%\BloodWake\settings.ini`.
 
 ### Troubleshooting
@@ -126,20 +136,21 @@ Still stuck? Open an issue: say what you did, what you saw, and your Windows ver
 The Xbox runs a PC-style x86 processor, so its program can be translated instead of emulated. The [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit turns every function of the game into C, and Microsoft's compiler builds that into a Windows program. The toolkit's runtime stands in for the Xbox's system, memory, sound chip and controllers, and this port's Direct3D 11 back end turns the game's own graphics commands into work for your graphics card.
 
 ### Made with AI
-The engineering was done by Claude, Anthropic's AI model: a lead session plus **70+ AI agents** working in batches (naming, file formats, stability, fidelity checks, the remaster, the installer). Each batch had a written brief and a written report, and the lead reviewed and re-verified it before merging. The maintainer set the direction, made the calls and played the game.
+The engineering was done by Claude, Anthropic's AI model: a lead session plus **80+ AI agents** working in batches (naming, file formats, stability, fidelity checks, the remaster, the installer). Each batch had a written brief and a written report, and the lead reviewed and re-verified it before merging. The maintainer set the direction, made the calls and played the game.
 
 - **25 Oct 2026:** the plan in the morning; by night the whole program translated, booting to the menus and playing Battle Mode.
 - **26 Oct:** sound, GPU graphics at full speed, every mission booting, split screen, 948 soak runs without a crash.
 - **27 Oct:** all 8,110 functions named, and Remastered built.
 - **Early 28 Oct:** the installer, this repository and release v0.1.0.
+- **3 Nov:** 0.2.5, the stable base: a one-day run of ten lanes and more than 100 items, each checked by a release gate. Eight release candidates were tested and the bugs found on the way were fixed, every judgement call logged with a one-line undo.
 
 ### Proof, not promises
 - **Original stays exactly as shipped.** Every merge is replayed against the previous build with the same random seed and compared step by step. A build made the public way, from the disc and without the private names file, matches the workshop build for 3,867 of 3,867 steps in each edition.
 - **The translation is deterministic.** Six runs gave six identical sets of generated C, and every player's build is checked against the published fingerprints of it.
 - **The water, rewritten bit for bit.** The functions that build the sea's surface each frame are re-translated at build time into plain native code doing the same operations in the same order. 2,627,309 batches compared with the game's own code: 0 differences. Four-player split screen went from 66 to 113 fps.
-- **Stable.** 0 crashes in 948 mission runs of soak tests; a later soak of every mission, both battles and Blood Ball: 0 crashes, 0 freezes.
+- **Stable.** 0 crashes in 948 mission runs of soak tests; a later soak of every mission, both battles and Blood Ball: 0 crashes, 0 freezes. For 0.2.5: 3 hours of play per edition, both story campaigns to the end, 219 starts in a row, and sound kept through 68 forced audio-device failures, with no crash or freeze.
 - **Played through.** An autopilot won 24 of the 28 story missions, the final one included, with no port problem in about 37 attempts. The other four need skills the autopilot doesn't have yet.
-- **57 toolkit issues found and fixed here.** From 8- and 16-bit multiplies translated as 32-bit ones, to point sprites, fog and polygon offset never drawn, to a 60.00 Hz vertical blank where NTSC runs at 59.94. The fixes are carried in this project (`src/toolkit_patches/`, `tools/xbr_patches.py`), with the toolkit itself untouched at its pinned version. They will be offered to xboxrecomp with neutral repros containing nothing from any game; none has been submitted yet.
+- **69 toolkit issues found and fixed here.** From 8- and 16-bit multiplies translated as 32-bit ones, to point sprites, fog and polygon offset never drawn, to a 60.00 Hz vertical blank where NTSC runs at 59.94. The fixes are carried in this project (`src/toolkit_patches/`, `tools/xbr_patches.py`), with the toolkit itself untouched at its pinned version. They will be offered to xboxrecomp with neutral repros containing nothing from any game; none has been submitted yet.
 - **Every function named: 8,110.** Each name proposed with evidence from the code, and 6,149 re-checked independently (6,109 confirmed as they stood). Ten functions that deal with the console's security were left alone on purpose.
 - **The file formats, decoded.** Models, boats and weapons, missions, effects, fonts, menus, sound and textures: specced, checked against every archive on the disc, then verified blind.
 - **Bugs explained before they're fixed.** Each of the 17 fixes was traced in the code first. The hardest and strangest: a faint dark line on the distant sea at night, where folded waves got the sky reflection blended twice. Remastered now draws it once; Original keeps it, as the console very likely showed it.

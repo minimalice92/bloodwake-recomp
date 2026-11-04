@@ -27,7 +27,7 @@
     <g transform="translate(307,164)">
       <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
       <rect x="22" y="22" width="36" height="4" rx="2" fill="#4fb3ff"/>
-      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">70+</text>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">80+</text>
       <text x="22" y="108" font-size="19" fill="#b4c3d4">AI agents, in batches,</text>
       <text x="22" y="132" font-size="19" fill="#b4c3d4">with an AI lead</text>
     </g>
