@@ -10,7 +10,7 @@
 *Full speed into the sunset. Remastered at 4K with every setting maxed: the original art, nothing redrawn or replaced.*
 
 > [!TIP]
-> **New in 0.2.5, the stable base:** more than 100 fixes and improvements, every one tested. It plays full screen out of the box, with keyboard and mouse or a controller. Remap any key in the launcher, and switch cheats on with a tick. HDR is drawn from your screen's own data, by the ITU's standards, with an optional Automatic HDR. Setup is shorter, and it updates an older install in place, keeping your saves and settings. Start-up, sound and graphics are far harder to break. [Read the release notes](https://github.com/minimalice92/bloodwake-recomp/releases/latest).
+> **New in 0.3.0, the sound release:** the Xbox sound chip's effects programs now run as native code, word for word the same output, and the sound reaches Windows through a new low-latency path: a shot reaches your ears 46 ms sooner in Original and 36 ms sooner in Remastered, with no gaps, and Discord keeps working. A rare crackle in busy battles is fixed at its cause. In Remastered, particles, trails and the HUD now behave exactly as on the Xbox at any frame rate. Original still plays step for step as it shipped. [Read the release notes](https://github.com/minimalice92/bloodwake-recomp/releases/latest).
 
 > [!NOTE]
 > Unofficial, free and non-commercial. You need your own Blood Wake disc, and nothing from the game is in this repository. See [Staying safe](#staying-safe).
@@ -23,7 +23,7 @@ One program, two editions, picked in the launcher.
 ### Original: the game as it shipped
 - **Every mission and mode:** Story Mode's 28 missions, Battle Mode, and couch split screen for 2 to 4 players.
 - **Exactly as shipped in 2001:** the 4:3 picture, 30 frames a second, its quirks and its bugs. Only problems the port itself would cause are fixed.
-- **The console's own pace and sound:** the game runs on the console's 59.94 Hz clock, and the Xbox sound chip's own echo and 3D-sound programs run as they did on the console.
+- **The console's own pace and sound:** the game runs on the console's 59.94 Hz clock, and the Xbox sound chip's own echo and 3D-sound programs run as on the console, now translated to native code as the game starts: the same output word for word, checked over 15.4 million frames side by side with the emulator.
 - **Its own saves**, kept apart from Remastered's.
 - **Proven unchanged:** every merge is replayed against the previous build with the same random seed and compared step by step, for example 2,990 of 2,990 steps identical.
 
@@ -56,8 +56,12 @@ The original art and sound, never replaced. Every change has its own switch.
 *Rockets over the Tombstones: Battle Mode in widescreen.*
 
 **Sounds**
-- Cleaner pitch changes, a louder mix with a limiter, the game's own surround mix on 5.1 and 7.1, lower latency.
+- Cleaner pitch changes, a louder mix with a limiter, the game's own surround mix on 5.1 and 7.1.
+- Low latency: a shot reaches your ears 89 ms after you press fire (126 in 0.2.5), through Windows' own audio engine, so Discord and other apps keep their sound.
 - Sound that survives: unplug the headphones, switch the output or let the monitor's HDMI audio drop out, and the sound comes back by itself.
+
+**Moves like the Xbox at any frame rate**
+- Spray, trails, bolts and effect scripts advance once per game step, bit for bit as the original does, and the reticle and markers glide between steps.
 
 **Fixes**
 - 17 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, a dark line on the distant night sea, and more.
@@ -89,7 +93,7 @@ The build also uses free tools, which the installer fetches if they're missing, 
 **Updating:** run the new installer over your current version, into the same folder. Your saves, settings and prepared graphics are kept.
 
 ![The installer's shortcuts page: a Start menu entry and a desktop shortcut, each with its own box](docs/images/ui-installer-shortcuts.jpg)
-*The installer (0.2.5): a Start menu entry and a desktop shortcut; untick either.*
+*The installer: a Start menu entry and a desktop shortcut; untick either.*
 
 To uninstall, use Windows' **Apps** settings: it removes the build and its shortcuts, and keeps your saves and settings unless you choose otherwise.
 
@@ -104,7 +108,7 @@ Then start the launcher from the install folder. Every option, step and exit cod
 
 ### Playing
 ![The launcher's Graphics tab: anti-aliasing, texture filtering, detail distance and the other picture settings, with a Play button](docs/images/ui-launcher-graphics.jpg)
-*The launcher (0.2.5): pick an edition and your settings, then press Play.*
+*The launcher: pick an edition and your settings, then press Play.*
 
 - The launcher has a tab each for Edition, Display, Graphics, Audio, Fixes, Controls, Cheats and Advanced. Hover over any setting for a short explanation.
 - **Controls:** remap any key, or a mouse button, with a click and a press; set the keyboard's steering and the sticks' deadzones.
@@ -143,12 +147,14 @@ The engineering was done by Claude, Anthropic's AI model: a lead session plus **
 - **27 Oct:** all 8,110 functions named, and Remastered built.
 - **Early 28 Oct:** the installer, this repository and release v0.1.0.
 - **3 Nov:** 0.2.5, the stable base: a one-day run of ten lanes and more than 100 items, each checked by a release gate. Eight release candidates were tested and the bugs found on the way were fixed, every judgement call logged with a one-line undo.
+- **5 Nov:** 0.3.0, the sound release: the sound chip's programs as native code, a new sound output, and the high frame rate made exact, through six release candidates and the same gate.
 
 ### Proof, not promises
 - **Original stays exactly as shipped.** Every merge is replayed against the previous build with the same random seed and compared step by step. A build made the public way, from the disc and without the private names file, matches the workshop build for 3,867 of 3,867 steps in each edition.
 - **The translation is deterministic.** Six runs gave six identical sets of generated C, and every player's build is checked against the published fingerprints of it.
+- **The sound chip, translated word for word.** Its effects programs run as native code made as the game starts. 40 recordings of real play (835,360 runs) replay identically through both, and three hours of Original ran the old and the new side by side: 15.4 million frames, 0 differences.
 - **The water, rewritten bit for bit.** The functions that build the sea's surface each frame are re-translated at build time into plain native code doing the same operations in the same order. 2,627,309 batches compared with the game's own code: 0 differences. Four-player split screen went from 66 to 113 fps.
-- **Stable.** 0 crashes in 948 mission runs of soak tests; a later soak of every mission, both battles and Blood Ball: 0 crashes, 0 freezes. For 0.2.5: 3 hours of play per edition, both story campaigns to the end, 219 starts in a row, and sound kept through 68 forced audio-device failures, with no crash or freeze.
+- **Stable.** 0 crashes in 948 mission runs of soak tests; a later soak of every mission, both battles and Blood Ball: 0 crashes, 0 freezes. For 0.2.5: 3 hours of play per edition, both story campaigns to the end, 219 starts in a row, and sound kept through 68 forced audio-device failures, with no crash or freeze. For 0.3.0: 3 hours of play per edition at once, both story campaigns to the end, battles and split screen, 403 starts: 0 crashes, 0 freezes, 0 sound gaps.
 - **Played through.** An autopilot won 24 of the 28 story missions, the final one included, with no port problem in about 37 attempts. The other four need skills the autopilot doesn't have yet.
 - **69 toolkit issues found and fixed here.** From 8- and 16-bit multiplies translated as 32-bit ones, to point sprites, fog and polygon offset never drawn, to a 60.00 Hz vertical blank where NTSC runs at 59.94. The fixes are carried in this project (`src/toolkit_patches/`, `tools/xbr_patches.py`), with the toolkit itself untouched at its pinned version. They will be offered to xboxrecomp with neutral repros containing nothing from any game; none has been submitted yet.
 - **Every function named: 8,110.** Each name proposed with evidence from the code, and 6,149 re-checked independently (6,109 confirmed as they stood). Ten functions that deal with the console's security were left alone on purpose.

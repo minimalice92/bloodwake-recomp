@@ -610,6 +610,79 @@ static uint8_t *voice_donor(const char *name, uint32_t *size_out, int *pak_out)
 
 extern void sub_00014FA0_gen(void);
 
+/* ════════════════════════════════════════════════════════════════════════
+ * HEADPHONES_AT_BOOT: a saved Sound Mode of Headphones reaches the chip
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ * Seen (docs/audio/trace.md, the au-trace follow-up): Audio_Init 0x17500
+ * passes the saved mode (0x1E7B2C) to IDirectSound_EnableHeadphones before
+ * the sound pak's effects image is downloaded. CDirectSound_EnableHeadphones
+ * 0xFA0F4 then sets bit 31 of its speaker config ([settings]+8) but writes
+ * its crosstalk effect (the GP's X:0x02AE, 3 speakers, 1 headphones) only
+ * when the effect index [settings]+0x10 isn't 0xFFFFFFFF, which it is until
+ * the image is in. Nothing applies it later, so the effect keeps the speakers
+ * value until the player changes the mode in a menu. It returns at once when
+ * the value equals bit 31, so after the image (Audio_LoadPakItem kind 7) the
+ * game's own call runs off and then on: the same two writes a pause-menu
+ * switch from Speakers makes. With Speakers saved nothing runs. */
+#define VA_DSOUND_ENABLE_HEADPHONES 0x000FAA1Du   /* IDirectSound_EnableHeadphones(pDS, on), stdcall */
+#define X_AUDIO_MGR_DSOUND          0x001A4394u   /* Audio +0x3C: the game's IDirectSound* */
+/* The crosstalk word in the GP's X window (0xFE830000 + 4 * 0x2AE): what the
+ * effect write changes. The GP loads the effect (its code and this data) by
+ * its own DMA a frame or so after the download; DirectSound sends effect data
+ * through the GP too, so a write before that load is lost or worse (seen: a
+ * call straight after the download gave the GP a bad DMA block and the run
+ * crashed). So the call waits until the word shows the effect loaded. */
+#define GP_WIN_X_CROSSTALK          (0xFE830000u + 4u * 0x2AEu)
+extern int bw_xdsp_enabled(void);         /* the DSPs run (src/toolkit_patches/apu/bw_apu_xdsp.c) */
+
+static void headphones_at_boot(void)
+{
+    uint32_t ds, settings, cfg, effect, args[2];
+    ULONGLONG waited = 0;
+    f_regs_t r;
+    if (!bw_fix_enabled(BW_FIX_HEADPHONES_AT_BOOT))
+        return;
+    ds = F_MEM32(X_AUDIO_MGR_DSOUND);
+    settings = F_OK(ds) ? F_MEM32(ds) : 0;  /* CDirectSound = ds - 8; its settings at +8 */
+    if (!F_OK(settings))
+        return;
+    cfg = F_MEM32(settings + 8u);
+    effect = F_MEM32(settings + 0x10u);
+    if (!(cfg & 0x80000000u) || effect == 0xFFFFFFFFu) {
+        fprintf(stderr, "[FIX] HEADPHONES_AT_BOOT: the effects image is in; DirectSound's mode is %s"
+                "%s: nothing to apply\n", cfg & 0x80000000u ? "headphones" : "speakers",
+                effect == 0xFFFFFFFFu ? " and it has no crosstalk effect" : "");
+        fflush(stderr);
+        return;
+    }
+    if (bw_xdsp_enabled()) {
+        /* on this thread (the one that downloaded the image), a few ms */
+        ULONGLONG t0 = GetTickCount64();
+        while (!(F_MEM32(GP_WIN_X_CROSSTALK) & 0x00FFFFFFu) && GetTickCount64() - t0 < 250)
+            Sleep(1);
+        if (!(F_MEM32(GP_WIN_X_CROSSTALK) & 0x00FFFFFFu)) {
+            fprintf(stderr, "[FIX] HEADPHONES_AT_BOOT: the GP didn't show its crosstalk effect"
+                    " within 250 ms of the download: not applied\n");
+            fflush(stderr);
+            return;
+        }
+        waited = GetTickCount64() - t0;
+    }
+    f_save(&r);
+    args[0] = ds;
+    args[1] = 0;
+    f_call(VA_DSOUND_ENABLE_HEADPHONES, 0, 2, args);
+    args[1] = 1;
+    f_call(VA_DSOUND_ENABLE_HEADPHONES, 0, 2, args);
+    f_restore(&r);
+    bw_fix_note_hit(BW_FIX_HEADPHONES_AT_BOOT);
+    fprintf(stderr, "[FIX] HEADPHONES_AT_BOOT: the saved Headphones mode applied to DirectSound's"
+            " crosstalk effect (index %u) now that the effects image is in (the GP had it after"
+            " %llu ms)\n", effect, (unsigned long long)waited);
+    fflush(stderr);
+}
+
 void sub_00014FA0(void)            /* Audio_LoadPakItem(data, size, kind, entry) */
 {
     uint32_t data = F_MEM32(g_esp + 4), size = F_MEM32(g_esp + 8), kind = F_MEM32(g_esp + 0xC);
@@ -622,6 +695,8 @@ void sub_00014FA0(void)            /* Audio_LoadPakItem(data, size, kind, entry)
     if (size != 0u || kind != 11u || !data || !F_OK(entry)
         || !bw_fix_enabled(BW_FIX_VOICE_PLACEHOLDER_BORROW)) {
         sub_00014FA0_gen();                 /* Original, and every non-empty item */
+        if (kind == 7u && size)
+            headphones_at_boot();           /* the DSP effects image is in */
         return;
     }
     f_str(entry, name, sizeof name);

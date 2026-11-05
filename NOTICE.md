@@ -6,6 +6,7 @@ This repository's own files are under the MIT licence (`LICENSE`). These parts a
 |---|---|---|---|
 | `src/xemu_dsp/` (except our shims) | The MCPX DSP56300 interpreter from [xemu](https://github.com/xemu-project/xemu) v0.8.139 (`hw/xbox/mcpx/apu/dsp/`), unchanged | GPL-2.0-or-later; `dsp_dma.*` LGPL-2.0-or-later | espes; Matt Borgerson; adapted from Hatari's DSP emulation (the ARAnyM developer team; Thomas Huth). See each file's header. |
 | `src/xemu_dsp/shim/`, `bw_dsp.*`, `CMakeLists.txt` | Our stand-ins for the few QEMU pieces the DSP uses, and its wrapper | GPL-2.0-or-later (they exist only to host the DSP) | the bloodwake-recomp contributors |
+| `src/xemu_dsp/bw_dsp_fast.*`, `src/xemu_dsp/bw_dsp_jit.inc`, `src/xemu_dsp/bw_dsp_x64.inc`, `tools/dsp_bench/` | Our translated DSP engine (with its x64 JIT) and its benchmark, adapted from xemu's interpreter (whose source it includes) | GPL-2.0-or-later | the bloodwake-recomp contributors; xemu's authors as above |
 | `src/toolkit_patches/apu/apu_core.c`, `apu_dsp.c`, `apu_vp.c` | Patched copies of xboxrecomp's MCPX APU files, which xboxrecomp extracted from xemu | LGPL-2.1-or-later | espes; Jannik Vogel; Matt Borgerson; changes by the bloodwake-recomp contributors |
 | `src/toolkit_patches/` (the other files) | Patched copies of xboxrecomp runtime files, each with a `.diff` showing exactly what changed | MIT (`LICENSES/MIT-xboxrecomp.txt`) | sp00nz; changes by the bloodwake-recomp contributors |
 

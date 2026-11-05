@@ -414,7 +414,11 @@ def scenario_unverified(a, results):
 
 # ── Silent installs and uninstalls (stub builds) ──────────────────────────
 
-APPID_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{0FB930E5-4F64-4720-9243-3E2404D38AB5}_is1"
+# BW_SETUP_TEST_APPID (testing): the AppId of a test build of Setup made with another
+# AppId, so these scenarios never touch a real install's Settings > Apps entry on the
+# same Windows user (lane rc4: this PC has a real 0.2.5 install).
+APPID = os.environ.get("BW_SETUP_TEST_APPID") or "{0FB930E5-4F64-4720-9243-3E2404D38AB5}"
+APPID_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\%s_is1" % APPID
 LINK = "Blood Wake Recomp.lnk"
 
 

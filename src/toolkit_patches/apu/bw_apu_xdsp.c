@@ -30,6 +30,8 @@
 #endif
 #include <windows.h>
 #include "bw_dsp.h"
+#include "bw_dsp_trace.h"
+#include "bw_apu_hot.h"     /* au-hot: BW_APU_HOTSTAT, a test aid */
 
 #define GP_WIN 0xFE830000u
 #define EP_WIN 0xFE850000u
@@ -729,6 +731,48 @@ static void do_reset_act(MCPXAPUState *d, BwDsp *dsp, int act, uint32_t rst, int
     }
 }
 
+/* ---- P memory watch (BW_DSP_PWATCH=1, a test aid, au-dsp) ---------------
+ *
+ * One log line whenever a DSP's program memory changes: what changed it
+ * ("boot", a bootstrap; "cpu", DirectSound's writes to the window, merged in
+ * by sync_in; "run", the DSP itself during its frame: DMA into P or a
+ * movem), how many words, their range and a hash of the whole memory. It
+ * writes no memory contents anywhere (call A6: the DSP programs are never
+ * written to disk). Inert when unset. */
+static int s_pwatch = -1;
+static uint32_t *s_pwatch_last[2];
+
+static void pwatch_check(BwDsp *dsp, int is_ep, const char *why)
+{
+    uint32_t words, *p, first = 0, last = 0, n = 0, i, h = 2166136261u;
+    if (s_pwatch < 0) {
+        const char *e = getenv("BW_DSP_PWATCH");
+        s_pwatch = e && e[0] == '1';
+    }
+    if (!s_pwatch)
+        return;
+    p = bw_dsp_mem(dsp, 'P', &words);
+    if (!s_pwatch_last[is_ep])
+        s_pwatch_last[is_ep] = (uint32_t *)calloc(words, 4);
+    for (i = 0; i < words; i++) {
+        if ((p[i] & 0xFFFFFFu) != s_pwatch_last[is_ep][i]) {
+            if (!n)
+                first = i;
+            last = i;
+            n++;
+        }
+    }
+    if (!n)
+        return;
+    for (i = 0; i < words; i++) {
+        s_pwatch_last[is_ep][i] = p[i] & 0xFFFFFFu;
+        h = (h ^ s_pwatch_last[is_ep][i]) * 16777619u;
+    }
+    fprintf(stderr, "[APU-XDSP] P watch: %s P changed (%s) at frame %ld: %u words in"
+                    " 0x%04X-0x%04X, P hash %08X\n", is_ep ? "EP" : "GP", why, s_frames, n,
+            first, last, h);
+}
+
 /* ---- one frame of the DSP stage ----------------------------------------- */
 
 /* What the frame thread hands the DSP stage for one 32-sample frame. */
@@ -746,9 +790,14 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
     int i;
     int64_t t0, t1, t2, t3, t4;
 
+    bw_dsp_trace_frame(s_frames, f->div);       /* BW_DSP_TRACE's frame clock */
     t0 = qpc();
     do_reset_act(d, s_gp, f->gp_act, f->gprst, 0);
     do_reset_act(d, s_ep, f->ep_act, f->eprst, 1);
+    if (s_pwatch) {
+        pwatch_check(s_gp, 0, f->gp_act == ACT_BOOT ? "boot" : "reset");
+        pwatch_check(s_ep, 1, f->ep_act == ACT_BOOT ? "boot" : "reset");
+    }
 
     /* New SGE entries get their copy decided while the translations that
      * made them are fresh (also on DirectSound's register writes). */
@@ -760,6 +809,10 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
 
     sync_in(s_gp, s_gp_ranges, 4);
     sync_in(s_ep, s_ep_ranges, 3);
+    if (s_pwatch) {
+        pwatch_check(s_gp, 0, "cpu");
+        pwatch_check(s_ep, 1, "cpu");
+    }
 
     /* The VP's mixbins into the GP's mix buffer (X:0x1400). */
     mix = bw_dsp_mem(s_gp, 'M', &words);
@@ -799,6 +852,8 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
         }
     }
     t2 = qpc();
+    if (s_pwatch)
+        pwatch_check(s_gp, 0, "run");
     if (f->ep_on && f->div % 8 == 0) {
         uint32_t c;
         s_sink_target = f->out;
@@ -826,6 +881,8 @@ static void dsp_do_frame(MCPXAPUState *d, const XFrame *f)
         }
     }
     t3 = qpc();
+    if (s_pwatch)
+        pwatch_check(s_ep, 1, "run");
 
     sync_out(s_gp, s_gp_ranges, 4);
     sync_out(s_ep, s_ep_ranges, 3);
@@ -922,6 +979,7 @@ static DWORD WINAPI dsp_thread(LPVOID arg)
 {
     MCPXAPUState *d = arg;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    { extern void bw_audio_thread_mmcss(const char *who); bw_audio_thread_mmcss("DSP"); }   /* au-out: bw_apu_out.c */
     fprintf(stderr, "[APU-XDSP] DSP thread %lu running\n", GetCurrentThreadId());
     for (;;) {
         int64_t n;
@@ -931,7 +989,14 @@ static DWORD WINAPI dsp_thread(LPVOID arg)
         n = s_done;
         ReleaseSRWLockExclusive(&s_ring_lock);
 
-        dsp_frame_guarded(d, &s_ring[n % XRING]);
+        if (g_bw_hot) {
+            /* au-hot: this frame's wall time and the thread's own cycles in it */
+            int64_t w0 = bw_hot_t(), c0 = bw_hot_cycles();
+            dsp_frame_guarded(d, &s_ring[n % XRING]);
+            bw_hot_dsp_frame(bw_hot_t() - w0, bw_hot_cycles() - c0);
+        } else {
+            dsp_frame_guarded(d, &s_ring[n % XRING]);
+        }
 
         AcquireSRWLockExclusive(&s_ring_lock);
         s_done = n + 1;
@@ -944,14 +1009,23 @@ static DWORD WINAPI dsp_thread(LPVOID arg)
 /* The frame thread waits until the DSP thread has finished frame n. */
 static void wait_done(int64_t n)
 {
-    int64_t t0 = 0;
+    int64_t t0 = 0, hot0 = 0;
     AcquireSRWLockExclusive(&s_ring_lock);
     if (s_done <= n) {
         t0 = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (g_bw_hot) {
+            hot0 = bw_hot_t();          /* au-hot: the wait, and how far behind the DSP thread was */
+            bw_hot_dsp_lag((int)(n + 1 - s_done));
+            bw_hot_stage(BW_ST_DSPWAIT, 0);   /* au-vp: the watch */
+        }
         while (s_done <= n)
             SleepConditionVariableSRW(&s_ring_cv, &s_ring_lock, INFINITE, 0);
     }
     ReleaseSRWLockExclusive(&s_ring_lock);
+    if (hot0) {
+        bw_hot_seg(BW_HOT_DSPW, bw_hot_t() - hot0);
+        bw_hot_stage(BW_ST_DSP, 0);
+    }
     if (t0) {
         int64_t w = qemu_clock_get_us(QEMU_CLOCK_REALTIME) - t0;
         s_wait_us += w;
@@ -967,6 +1041,17 @@ void bw_xdsp_init(MCPXAPUState *d)
 {
     if (!bw_xdsp_enabled() || s_gp)
         return;
+    bw_dsp_trace_init(d);                       /* BW_DSP_TRACE (a test aid) */
+    /* The audio rework's gate (call D5) and the maintainer's answer of
+     * 2026-11-04 (docs/audio/CALLS.md): every edition runs the translated
+     * engine with its JIT, bit-identical to xemu's interpreter (the corpus,
+     * lockstep in game and a 3 h Original lockstep soak: docs/audio/dsp.md,
+     * V.md, orig.md). BW_DSP_ENGINE=interp keeps the interpreter (D-012's
+     * reference); BW_DSP_ENGINE overrides either way. */
+    {
+        extern int bw_xdsp_edition_recomp(void);
+        bw_dsp_engine_default(bw_xdsp_edition_recomp());
+    }
     s_gp = bw_dsp_new(d, gp_scratch_rw, gp_fifo_rw, true);
     s_ep = bw_dsp_new(d, ep_scratch_rw, ep_fifo_rw, false);
     {
@@ -1082,6 +1167,15 @@ int bw_xdsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FR
  * Called by the carried apu_xaudio2.c at init, before any audio frame. */
 #include "../../bw_edition.h"
 
+/* The DSP engine's default (call D5): the translated engine in every edition
+ * since 0.3.0 (lane au-orig, docs/audio/orig.md: Original's proof). A port
+ * change, not an edition one: the engine is bit-identical to the
+ * interpreter, so the game hears the same DSP output word for word. */
+int bw_xdsp_edition_recomp(void)
+{
+    return 1;
+}
+
 static int s_surround_out, s_surround_decided;
 static const char *s_surround_why = "";
 
@@ -1118,4 +1212,33 @@ int bw_audio_surround_wanted(const char **why)
     if (why)
         *why = s_surround_why;
     return s_surround_decided ? s_surround_out : -1;
+}
+
+/* ---- BW_DSP_TRACE's view of the scatter-gather spaces (bw_dsp_trace.c) ---
+ *
+ * One entry's 4 KB as the DSP would read it (sg_rw's copy decision), for the
+ * trace's snapshots: no FIFO position moves and nothing is logged. which: 0
+ * GP scratch, 1 GP FIFO, 2 EP scratch, 3 EP FIFO. Returns the entry count. */
+uint32_t bw_xdsp_peek_page(MCPXAPUState *d, int which, uint32_t entry, uint8_t *out)
+{
+    SgeCache *c;
+    uint32_t base, max, prd;
+    uint8_t *host;
+    memset(out, 0, SG_PAGE);
+    if (which < 0 || which > 3)
+        return 0;
+    c = &s_sgc[which];
+    base = d->regs[c->base_reg];
+    max = d->regs[c->max_reg];
+    if (!base)
+        return 0;
+    if (entry > max)
+        return max + 1;
+    AcquireSRWLockExclusive(&s_sgc_lock);
+    sgc_table(c, base);
+    host = sgc_entry(c, entry, &prd);
+    if (host)
+        memcpy(out, host, SG_PAGE);
+    ReleaseSRWLockExclusive(&s_sgc_lock);
+    return max + 1;
 }

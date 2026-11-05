@@ -13,10 +13,10 @@
 /* ---- the failure switch -------------------------------------------------- */
 
 enum { K_DEVICE, K_RESOURCE, K_SURFACE, K_DEPTH, K_TEXTURE, K_POST, K_TEXRESTORE,
-       K_VFXSHADER, K_PRESENT, K_SWAPCHAIN, K_N };
+       K_VFXSHADER, K_PRESENT, K_SWAPCHAIN, K_GPUWAIT, K_N };
 static const char *const s_kind_name[K_N] = {
     "device", "resource", "surface", "depth", "texture", "post", "texrestore",
-    "vfxshader", "present", "swapchain"
+    "vfxshader", "present", "swapchain", "gpuwait"
 };
 
 #define FT_MAX_RULES 16
@@ -64,7 +64,7 @@ static void ft_parse(void)
         }
         if (k < 0 || n < 1) {
             fprintf(stderr, "[GPU-FAILTEST] ignored \"%.*s\": kinds are device, resource, surface,"
-                            " depth, texture, post, texrestore, vfxshader, present, swapchain; n from 1\n",
+                            " depth, texture, post, texrestore, vfxshader, present, swapchain, gpuwait; n from 1\n",
                     (int)(end - item), item);
             continue;
         }

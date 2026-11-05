@@ -23,6 +23,18 @@
 #include "apu.h"
 #include "fpconv.h"
 #include <process.h>
+#include "../../bw_latlog.h"   /* Blood Wake (lat-a): BW_LATLOG test aid (press to sound) */
+#include "bw_apu_hot.h"        /* Blood Wake (au-hot): BW_APU_HOTSTAT, a test aid */
+/* au-hot: what the voice being processed was, and the resampler's share */
+static int s_hot_vflags, s_hot_taps;
+static int64_t s_hot_vres;
+#include <intrin.h>
+static int bw_hot_isden(float x)        /* au-hot: a denormal (subnormal) */
+{
+    uint32_t u;
+    memcpy(&u, &x, 4);
+    return !(u & 0x7F800000u) && (u & 0x007FFFFFu);
+}
 
 /* #define DEBUG_MCPX */
 
@@ -166,12 +178,63 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                 v | ((val << ctz32(mask)) & mask));
 }
 
+/* Blood Wake carried patch (lat-a, test aid; inert unless BW_LATLOG is set):
+ * press to sound, stage by stage. VOICE_ON logs a V event (the voice, its
+ * buffer address, the frame counter); the VP's first frame of that voice a W
+ * event, and its first frame with sound in it (any sample of its bin
+ * contribution above 1e-4 of full scale, -80 dBFS) a Y event, with the frame
+ * (ep_frame_div, which the A events also carry, so a frame maps to its place
+ * in the WAV dump) and the first sample over the mark. Read-only. */
+static volatile uint8_t s_lat_vs[MCPX_HW_MAX_VOICES];   /* 1 on, 2 seen, 0 done */
+static uint16_t s_lat_vn[MCPX_HW_MAX_VOICES];
+#define BW_LAT_SOUND_MARK 1e-4f
+#define BW_LAT_SOUND_FRAMES 375                       /* 250 ms: give up */
+
+static void bw_lat_voice_frame(MCPXAPUState *d, uint16_t v,
+                               float samples[][2], float g)
+{
+    int i, first = -1;
+    float pk = 0.0f;
+    for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float a = fabsf(samples[i][0]), b = fabsf(samples[i][1]);
+        float m = (a > b ? a : b) * g;
+        if (m > pk)
+            pk = m;
+        if (first < 0 && m > BW_LAT_SOUND_MARK)
+            first = i;
+    }
+    if (s_lat_vs[v] == 1) {
+        uint32_t ba = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                                     NV_PAVS_VOICE_CUR_PSL_START_BA);
+        bw_lat_ev(BW_LAT_VPMIX, bw_lat_now(), v, d->ep_frame_div, first, ba, 0, 0, pk, g);
+        s_lat_vs[v] = 2;
+        s_lat_vn[v] = 0;
+    }
+    if (first >= 0 || ++s_lat_vn[v] >= BW_LAT_SOUND_FRAMES) {
+        bw_lat_ev(BW_LAT_VPSOUND, bw_lat_now(), v, d->ep_frame_div, first, s_lat_vn[v], 0, 0, pk, g);
+        s_lat_vs[v] = 0;
+    }
+}
+
 /* ============================================================
  * Voice off / lock
  * ============================================================ */
 
+static __declspec(thread) int s_lat_off_by_game;   /* Blood Wake (au-orig): voice_off from the title's VOICE_OFF (its thread) */
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    if (g_bw_lat_on && v < MCPX_HW_MAX_VOICES &&
+        voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+        /* Blood Wake (lane au-orig, test aid): an active voice ends, where the
+         * title's status reads (DirectSound's GetStatus) first see it stopped:
+         * by the VP at its buffer's end (0) or by the title's VOICE_OFF (1),
+         * with its buffer (BA, EBO) and the frame divider, as BW_LAT_VOICEON */
+        bw_lat_ev(BW_LAT_VOICEOFF, bw_lat_now(), v, s_lat_off_by_game,
+                  voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START, NV_PAVS_VOICE_CUR_PSL_START_BA),
+                  voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                  d->ep_frame_div, 0, 0.0, 0.0);
+    }
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -190,8 +253,30 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
  * the frame thread holds d->lock across every voice of a frame, so taking
  * d->lock here made each lock wait out the whole frame. The title only has to
  * wait while the voice processor is working on the voice it locks. */
+/* au-vp (BW_APU_HOTSTAT, a test aid): the title's voice-lock waits, for the
+ * hand-off's 5 s line (apu_core.c) */
+volatile LONG64 g_bw_vlock_n, g_bw_vlock_spun, g_bw_vlock_us, g_bw_vlock_max;
+
 static void voice_spin_lock(MCPXAPUState *d, uint16_t v)
 {
+    if (g_bw_hot) {
+        LARGE_INTEGER f, a, b;
+        LONG64 us, m;
+        InterlockedIncrement64(&g_bw_vlock_n);
+        if (!InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+            return;
+        QueryPerformanceCounter(&a);
+        while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
+            SwitchToThread();
+        QueryPerformanceCounter(&b);
+        QueryPerformanceFrequency(&f);
+        us = (b.QuadPart - a.QuadPart) * 1000000 / f.QuadPart;
+        InterlockedIncrement64(&g_bw_vlock_spun);
+        InterlockedAdd64(&g_bw_vlock_us, us);
+        while ((m = g_bw_vlock_max) < us && InterlockedCompareExchange64(&g_bw_vlock_max, us, m) != m)
+            ;
+        return;
+    }
     while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
         SwitchToThread();
 }
@@ -1122,6 +1207,26 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         }
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
+        if (g_bw_lat_on && selected_handle < MCPX_HW_MAX_VOICES) {
+            /* Blood Wake (lat-a, test aid): the voice starts on the chip */
+            uint16_t h = (uint16_t)selected_handle;
+            bw_lat_ev(BW_LAT_VOICEON, bw_lat_now(), h,
+                      voice_get_mask(d, h, NV_PAVS_VOICE_CUR_PSL_START,
+                                     NV_PAVS_VOICE_CUR_PSL_START_BA),
+                      voice_get_mask(d, h, NV_PAVS_VOICE_PAR_NEXT, NV_PAVS_VOICE_PAR_NEXT_EBO),
+                      d->ep_frame_div, list,
+                      voice_get_mask(d, h, NV_PAVS_VOICE_CFG_FMT, NV_PAVS_VOICE_CFG_FMT_MULTIPASS),
+                      0.0, 0.0);
+            s_lat_vs[h] = 1;
+        }
+#ifdef _WIN32
+        {
+            /* Blood Wake (au-lat, BW_APU_VPWAKE, off by default): the frame
+             * thread makes the voice's period now (carried apu_xaudio2.c) */
+            extern void xa2_voice_wake(void);
+            xa2_voice_wake();
+        }
+#endif
         break;
     }
 
@@ -1160,7 +1265,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         uint16_t h = (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE);
         if (fe_spin_on() && h < MCPX_HW_MAX_VOICES)
             voice_spin_lock(d, h);
+        s_lat_off_by_game = 1;
         voice_off(d, h);
+        s_lat_off_by_game = 0;
         if (fe_spin_on() && h < MCPX_HW_MAX_VOICES)
             voice_spin_unlock(d, h);
         break;
@@ -2089,6 +2196,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
     bool adpcm =
         (container_size_index == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM);
+    if (g_bw_hot)
+        s_hot_vflags |= (adpcm ? BW_HOT_V_ADPCM : 0) | (stream ? BW_HOT_V_STREAM : 0);
 
     if (adpcm) {
         /* The block is 36 bytes per channel times the descriptor's 5-bit
@@ -2457,6 +2566,8 @@ static int voice_resample_sinc(MCPXAPUState *d, uint16_t v, float samples[][2],
         if (hi >= s->n)
             break;                       /* the source isn't there yet */
         if (lo < 0) lo = 0;
+        if (g_bw_hot)
+            s_hot_taps += hi - lo + 1;   /* au-hot */
         for (j = lo; j <= hi; j++) {
             float w = bw_sinc_k(fabs(p - j) * fc);
             acc0 += w * s->hist[j][0];
@@ -2490,6 +2601,200 @@ static int voice_resample_sinc(MCPXAPUState *d, uint16_t v, float samples[][2],
 }
 
 /* ============================================================
+ * Blood Wake (au-hot, docs/audio/hot.md): the HRTF filter without the
+ * denormal stalls. A port bug in every edition.
+ *
+ * The filter (xemu's hrtf.h) moves its current coefficients and ITD a
+ * hundredth of the way to their targets at every sample. Toward a target of
+ * zero (an HRIR tap that is 0, a source straight ahead) a value decays into
+ * the denormal range and stays there: below about 50 of the smallest
+ * denormals, a hundredth of it rounds to nothing (seen: BW_APU_HOTSTAT's
+ * census, thousands of stuck coefficients and ITDs per 5 s in a battle). On
+ * this x64 CPU every multiply or add that reads or makes a denormal takes a
+ * microcode assist of about 150 cycles, so a voice slot carrying one costs
+ * up to about 0.1 ms a frame, and the battle's slow periods were that.
+ *
+ * The cure: the filter runs with flush-to-zero and denormals-are-zero, and
+ * only the filter (the frame thread's MXCSR is restored right after; the
+ * guest's code and the rest of the VP keep the default mode). What it
+ * changes: a value under 2^-126 becomes 0. Every value it touches is a sum
+ * of terms whose gains are at most about 1, so a difference that small can
+ * only show in a result that is itself under about 2^-100, and every such
+ * result is 0 once the bins are made 24-bit for the DSP (float_to_24b), so
+ * the VP's output is the same, bit for bit (inferred; and proven in game by
+ * BW_APU_HRTF_PROOF below).
+ *
+ *   BW_APU_HRTF_FTZ=0       the exact float path (the undo); unset: on
+ *   BW_APU_HRTF_PROOF=1     test aid: beside every filter run, the exact path
+ *                           on a shadow filter of its own, and beside the
+ *                           bins a shadow set mixed from it; every frame the
+ *                           bins are compared as floats and as the 24-bit
+ *                           words the DSP gets ([APU-HRTF-PROOF] every 5 s)
+ * ============================================================ */
+#include <xmmintrin.h>
+static int s_hrtf_ftz = -1, s_hrtf_proof = -1;
+static HrtfFilter s_hp_f[MCPX_HW_MAX_3D_VOICES];
+static float s_hp_bins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
+static float s_hp_out[NUM_SAMPLES_PER_FRAME][2];  /* the voice's exact HRTF output */
+static int s_hp_cur;                    /* the voice being mixed has an exact output of its own */
+static struct {
+    unsigned long long frames, bins, bins24, binsf, calls, calls_diff, samp_diff, mp_reads, mp_incomplete;
+    double max_df;
+    int shown, shown_run;
+} s_hp;
+
+static int bw_hrtf_ftz(void)
+{
+    if (s_hrtf_ftz < 0) {
+        const char *e = getenv("BW_APU_HRTF_FTZ");
+        const char *pr = getenv("BW_APU_HRTF_PROOF");
+        s_hrtf_ftz = !(e && e[0] == '0');
+        s_hrtf_proof = pr && (pr[0] == '1' || pr[0] == '2') ? pr[0] - '0' : 0;
+        fprintf(stderr, "[APU] BW HRTF filter: %s (BW_APU_HRTF_FTZ)%s\n",
+                s_hrtf_ftz ? "flush-to-zero around it, so no denormal stalls (au-hot; the bins unchanged)"
+                           : "the exact float path, denormal stalls and all",
+                s_hrtf_proof == 1 ? "; BW_APU_HRTF_PROOF: the exact path beside it on the same targets, the bins"
+                                    " compared every frame"
+                : s_hrtf_proof == 2 ? "; BW_APU_HRTF_PROOF=2: the exact path beside it, the real filter reading its"
+                                      " targets live" : "");
+    }
+    return s_hrtf_ftz;
+}
+
+static int bw_f32_bits_eq(const float *a, const float *b, size_t n)
+{
+    return memcmp(a, b, n * sizeof(float)) == 0;
+}
+
+/* Never inlined, and compiled with the floating-point environment honoured,
+ * so no other float operation can move across the mode change (the compiled
+ * code: stmxcsr, ldmxcsr, the filter's call, ldmxcsr; no x87 anywhere in
+ * the VP, seen with dumpbin). */
+#pragma fenv_access (on)
+static __declspec(noinline) void bw_hrtf_run(HrtfFilter *f, int v, float samples[][2])
+{
+    float in[NUM_SAMPLES_PER_FRAME][2];
+    HrtfFilter snap, *run = f;
+    if (s_hrtf_proof > 0) {
+        /* the shadow takes the real filter's input history and targets (plain
+         * stores and copies, which the mode doesn't touch) and keeps its own
+         * current coefficients and ITD, which only the exact path moves.
+         * The game's thread writes a voice's targets (SET_VOICE_TAR_HRTF)
+         * without a lock, so they can change while the filter runs; for the
+         * proof both paths run on one snapshot of them (=1). =2 lets the real
+         * filter read them live, as it does without the proof (the race then
+         * shows as differences even with both paths exact). */
+        HrtfFilter *s = &s_hp_f[v];
+        if (s_hrtf_proof == 1) {
+            snap = *f;
+            run = &snap;
+        }
+        memcpy(in, samples, sizeof in);
+        s->buf_pos = run->buf_pos;
+        s->itd_tar = run->itd_tar;
+        for (int c = 0; c < 2; c++) {
+            memcpy(s->ch[c].buf, run->ch[c].buf, sizeof s->ch[c].buf);
+            memcpy(s->ch[c].hrir_coeff_tar, run->ch[c].hrir_coeff_tar, sizeof s->ch[c].hrir_coeff_tar);
+        }
+    }
+    if (s_hrtf_ftz) {
+        unsigned m = _mm_getcsr();
+        _mm_setcsr(m | 0x8040);          /* FTZ (bit 15) and DAZ (bit 6) */
+        hrtf_filter_process(run, samples, samples);
+        _mm_setcsr(m);
+    } else {
+        hrtf_filter_process(run, samples, samples);
+    }
+    if (run != f) {
+        /* the snapshot's moving parts back into the voice's filter (its
+         * targets stay whatever the game has written since) */
+        f->buf_pos = run->buf_pos;
+        f->itd_cur = run->itd_cur;
+        for (int c = 0; c < 2; c++) {
+            memcpy(f->ch[c].buf, run->ch[c].buf, sizeof f->ch[c].buf);
+            memcpy(f->ch[c].hrir_coeff_cur, run->ch[c].hrir_coeff_cur, sizeof f->ch[c].hrir_coeff_cur);
+        }
+        f = run;                         /* the diagnostics below compare what ran */
+    }
+    if (s_hrtf_proof > 0) {
+        int nd = 0;
+        hrtf_filter_process(&s_hp_f[v], in, s_hp_out);   /* the exact path, the default mode */
+        double mx = 0.0;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            for (int c = 0; c < 2; c++)
+                if (memcmp(&s_hp_out[i][c], &samples[i][c], 4)) {
+                    double df = fabs((double)s_hp_out[i][c] - (double)samples[i][c]);
+                    nd++;
+                    if (df > mx)
+                        mx = df;
+                }
+        if (mx > 1e-20 && s_hp.shown_run < 12) {
+            /* a difference that isn't denormal-sized: the two states, side by side */
+            HrtfFilter *s = &s_hp_f[v];
+            double dc = 0.0;
+            int kc = -1, cc = -1;
+            for (int c = 0; c < 2; c++)
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    double e = fabs((double)s->ch[c].hrir_coeff_cur[k] - (double)f->ch[c].hrir_coeff_cur[k]);
+                    if (e > dc)
+                        dc = e, kc = k, cc = c;
+                }
+            s_hp.shown_run++;
+            fprintf(stderr, "[APU-HRTF-PROOF] run %llu, voice %d: output differs by up to %.3g; the ITD %.9g"
+                            " (0x%08X) against the exact %.9g (0x%08X), target %.9g; coefficients differ by up to"
+                            " %.3g (ear %d tap %d: %.9g against %.9g, target %.9g); buf_pos %d; input[0] %.9g\n",
+                    s_hp.calls, v, mx, (double)f->itd_cur, *(uint32_t *)&f->itd_cur, (double)s->itd_cur,
+                    *(uint32_t *)&s->itd_cur, (double)f->itd_tar, dc, cc, kc,
+                    cc >= 0 ? (double)f->ch[cc].hrir_coeff_cur[kc] : 0.0,
+                    cc >= 0 ? (double)s->ch[cc].hrir_coeff_cur[kc] : 0.0,
+                    cc >= 0 ? (double)f->ch[cc].hrir_coeff_tar[kc] : 0.0, f->buf_pos, (double)in[0][0]);
+        }
+        s_hp.calls++;
+        s_hp.calls_diff += nd != 0;
+        s_hp.samp_diff += nd;
+        s_hp_cur = 1;
+    }
+}
+#pragma fenv_access (off)
+
+/* the proof's frame: the shadow bins start as the real ones (silence) */
+static void bw_hrtf_proof_begin(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    memcpy(s_hp_bins, mixbins, sizeof s_hp_bins);
+}
+
+/* and end: every bin sample compared, as floats and as the DSP's 24-bit words */
+static void bw_hrtf_proof_end(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    for (int b = 0; b < NUM_MIXBINS; b++)
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float r = mixbins[b][i], x = s_hp_bins[b][i];
+            s_hp.bins++;
+            if (memcmp(&r, &x, 4)) {
+                double df = fabs((double)r - (double)x);
+                s_hp.binsf++;
+                if (df > s_hp.max_df)
+                    s_hp.max_df = df;
+                if (float_to_24b(r) != float_to_24b(x)) {
+                    s_hp.bins24++;
+                    if (s_hp.shown++ < 20)
+                        fprintf(stderr, "[APU-HRTF-PROOF] DIFFERS: frame %llu bin %d sample %d: %.9g (0x%06X)"
+                                        " against the exact path's %.9g (0x%06X)\n", s_hp.frames, b, i,
+                                (double)r, float_to_24b(r), (double)x, float_to_24b(x));
+                }
+            }
+        }
+    if (++s_hp.frames % 7500 == 0)
+        fprintf(stderr, "[APU-HRTF-PROOF] %llu frames: %llu bin samples compared, %llu differ as the DSP's 24-bit"
+                        " words, %llu as floats (the largest %.3g); %llu filter runs, %llu with an output not"
+                        " bit-identical (%llu samples); multipass reads %llu (%llu of a shadow bin that differed)%s\n",
+                s_hp.frames, s_hp.bins, s_hp.bins24, s_hp.binsf, s_hp.max_df, s_hp.calls, s_hp.calls_diff,
+                s_hp.samp_diff, s_hp.mp_reads, s_hp.mp_incomplete,
+                s_hrtf_ftz ? "" : " (BW_APU_HRTF_FTZ=0: both paths exact)");
+    (void)d;
+}
+
+/* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
 
@@ -2506,6 +2811,7 @@ static void voice_process(MCPXAPUState *d,
                                  NV_PAVS_VOICE_PAR_STATE_PAUSED) != 0;
 
     struct McpxApuDebugVoice *dbg = &g_dbg.vp.v[v];
+    s_hp_cur = 0;                        /* au-hot's proof: no exact output of its own yet */
     dbg->active = true;
     dbg->stereo = stereo;
     dbg->paused = paused;
@@ -2552,6 +2858,9 @@ static void voice_process(MCPXAPUState *d,
     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS) != 0;
     dbg->multipass = multipass;
+    if (g_bw_hot)
+        s_hot_vflags |= (v < MCPX_HW_MAX_3D_VOICES ? BW_HOT_V_3D : 0) | (stereo ? BW_HOT_V_STEREO : 0) |
+                        (multipass ? BW_HOT_V_MP : 0);
 
     if (multipass) {
         /* Read from multipass bin */
@@ -2574,11 +2883,23 @@ static void voice_process(MCPXAPUState *d,
             if (pk > s_bw_mp_peak) s_bw_mp_peak = pk;
             s_bw_mp_lpf[v] = 1;
         }
+        if (s_hrtf_proof > 0) {
+            /* au-hot's proof: a multipass voice reads a bin; the shadow's would
+             * have to be the same for the proof to cover what follows */
+            s_hp.mp_reads++;
+            if (!bw_f32_bits_eq(mixbins[mp_bin], s_hp_bins[mp_bin], NUM_SAMPLES_PER_FRAME))
+                s_hp.mp_incomplete++;
+        }
         if (clear_mix) {
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
+            if (s_hrtf_proof > 0)
+                memset(&s_hp_bins[mp_bin][0], 0, sizeof(s_hp_bins[0]));
         }
     } else {
         int empty = 0;
+        int64_t hot_r0 = g_bw_hot ? bw_hot_t() : 0;   /* au-hot: the resampler's share */
+        if (hot_r0 && bw_sinc_on())
+            s_hot_vflags |= BW_HOT_V_SINC;
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
@@ -2596,6 +2917,8 @@ static void voice_process(MCPXAPUState *d,
             if (count == 0 && ++empty > 4) break;
             sample_count += count;
         }
+        if (hot_r0)
+            s_hot_vres += bw_hot_t() - hot_r0;
     }
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -2681,6 +3004,7 @@ static void voice_process(MCPXAPUState *d,
     if (voice_should_mute(v) || bw_solo_mute(d, v, multipass)) return;
 
     /* Low-pass filter */
+    uint64_t hot_p0 = g_bw_hot ? __rdtsc() : 0, hot_p1 = 0, hot_p2 = 0, hot_p3 = 0;   /* au-hot */
     int fmode = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
     bw_audit_voice(d, v, stereo, multipass, fmode, rate, bin, vol);
@@ -2733,6 +3057,8 @@ static void voice_process(MCPXAPUState *d,
      * side goes, and the room filter comes in.
      * BW_APU_I3DL2_SEND=<x> sets the send's scale (1 = the voice's signal at
      * unity). BW_APU_I3DL2=toolkit restores the old path. */
+    if (hot_p0)
+        hot_p1 = __rdtsc();
     static int i3dl2_on = -1;
     static float i3dl2_send = BW_I3DL2_SEND_DEFAULT;
     float bw_room[NUM_SAMPLES_PER_FRAME];
@@ -2769,6 +3095,8 @@ static void voice_process(MCPXAPUState *d,
         bw_room_ok = 1;
     }
 
+    if (hot_p0)
+        hot_p2 = __rdtsc();
     /* HRTF processing for 3D voices. RECOMP_APU_HRTF=0 turns it off: it is
      * on by default (xemu's), and so far checked on one title. */
     static int hrtf_on = -1;
@@ -2792,7 +3120,10 @@ static void voice_process(MCPXAPUState *d,
                     s_bw_cal_in += w * samples[i][0] * samples[i][0];
                 hrtf_filter_process(&s_bw_cal_f[v], samples, cal);
             }
-            hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+            /* au-hot: flush-to-zero around the filter (BW_APU_HRTF_FTZ) */
+            bw_hrtf_run(&d->vp.filters[v].hrtf, v, samples);
+            if (g_bw_hot)
+                s_hot_vflags |= BW_HOT_V_HRTF;   /* au-hot */
             if (bw_cal_on())
                 for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                     s_bw_cal_tk[0] += w * cal[i][0] * cal[i][0];
@@ -2828,7 +3159,10 @@ static void voice_process(MCPXAPUState *d,
             bw_ears = 0;
     }
 
+    if (hot_p0)
+        hot_p3 = __rdtsc();
     /* Mix into bins */
+    float bw_lat_g = 0.0f;              /* Blood Wake (lat-a): the loudest slot's gain */
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -2838,6 +3172,8 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        if (g_bw_lat_on && g > bw_lat_g)
+            bw_lat_g = g;
         /* The volumes are target registers: the hardware moves the level
          * toward them rather than jumping. Stepping to each frame's level
          * every 32 samples turned a voice whose volume the title changes
@@ -2863,9 +3199,45 @@ static void voice_process(MCPXAPUState *d,
              * (room-filtered) signal, not an ear */
             float x = (bw_room_ok && b >= 4) ? bw_room[i] : samples[i][ch];
             mixbins[bin[b]][i] += (g0 + step * (i + 1)) * x;
+            if (s_hrtf_proof > 0) {
+                /* au-hot's proof: the same mix from the exact path's output */
+                float xe = (bw_room_ok && b >= 4) ? bw_room[i] : s_hp_cur ? s_hp_out[i][ch] : samples[i][ch];
+                s_hp_bins[bin[b]][i] += (g0 + step * (i + 1)) * xe;
+            }
         }
     }
     d->vp.filters[v].gain_valid = true;
+    if (hot_p0) {
+        /* au-hot: the parts, and a census of the voice's float state */
+        uint64_t hot_p4 = __rdtsc();
+        int64_t part[BW_HOT_NPART];
+        int den[BW_HOT_NDEN];
+        memset(den, 0, sizeof den);
+        part[BW_HOT_P_LPF] = (int64_t)(hot_p1 - hot_p0);
+        part[BW_HOT_P_I3DL2] = (int64_t)(hot_p2 - hot_p1);
+        part[BW_HOT_P_HRTF] = (int64_t)(hot_p3 - hot_p2);
+        part[BW_HOT_P_MIX] = (int64_t)(hot_p4 - hot_p3);
+        if (v < MCPX_HW_MAX_3D_VOICES) {
+            HrtfFilter *hf = &d->vp.filters[v].hrtf;
+            for (int c = 0; c < 2; c++) {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++)
+                    den[BW_HOT_D_COEFF] += bw_hot_isden(hf->ch[c].hrir_coeff_cur[k]);
+                for (int k = 0; k < HRTF_BUFLEN; k++)
+                    den[BW_HOT_D_HIST] += bw_hot_isden(hf->ch[c].buf[k]);
+            }
+            den[BW_HOT_D_ITD] = bw_hot_isden(hf->itd_cur);
+            den[BW_HOT_D_ROOM] = bw_hot_isden(s_bw_i3dl2[v][0]) + bw_hot_isden(s_bw_i3dl2[v][1]);
+        }
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            den[BW_HOT_D_OUT] += bw_hot_isden(samples[i][0]) + bw_hot_isden(samples[i][1]);
+        if (s_bw_sinc && d->ep_frame_div % 8 == 0)
+            for (int i = 0; i < s_bw_sinc[v].n; i++)
+                den[BW_HOT_D_SINC] += bw_hot_isden(s_bw_sinc[v].hist[i][0]) +
+                                      bw_hot_isden(s_bw_sinc[v].hist[i][1]);
+        bw_hot_voice_parts(part, den);
+    }
+    if (g_bw_lat_on && s_lat_vs[v])
+        bw_lat_voice_frame(d, v, samples, bw_lat_g);   /* Blood Wake (lat-a), test aid */
 
     /* VP monitor mix */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
@@ -2929,6 +3301,9 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     memset(bwd3_reached, 0, sizeof bwd3_reached);
     bw_audit_frame();                    /* Blood Wake: BW_APU_AUDIT */
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    bw_hrtf_ftz();                       /* au-hot: the switches, read once */
+    if (s_hrtf_proof > 0)
+        bw_hrtf_proof_begin(mixbins);
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -2962,14 +3337,32 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_spin_lock(d, v);
+                if (g_bw_hot) {
+                    /* au-hot (BW_APU_HOTSTAT): the same call, timed */
+                    int64_t h0 = bw_hot_t();
+                    s_hot_vflags = s_hot_taps = 0;
+                    s_hot_vres = 0;
+                    voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                    bw_hot_voice(s_hot_vflags, bw_hot_t() - h0, s_hot_vres, s_hot_taps);
+                } else {
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                }
                 voice_spin_unlock(d, v);
             }
             d->regs[current] = d->regs[next];
         }
     }
     bwd3_orphan_check(d, bwd3_reached);
+    if (s_hrtf_proof > 0)
+        bw_hrtf_proof_end(d, mixbins);   /* au-hot: the bins against the exact path's */
     bw_audit_bins(mixbins);              /* Blood Wake: BW_APU_AUDIT */
+    if (g_bw_hot) {
+        int n = 0;                       /* au-hot: denormals in the bins */
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                n += bw_hot_isden(mixbins[b][i]);
+        bw_hot_bins_den(n);
+    }
 
     vp_trace_positions(d);
     vp_stat_report();
@@ -3039,4 +3432,5 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
     }
+    memset(s_hp_f, 0, sizeof s_hp_f);   /* au-hot's proof: the shadow filters as well */
 }

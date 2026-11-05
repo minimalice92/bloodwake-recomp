@@ -14,6 +14,14 @@ void bw_d3d11_present_config(unsigned sync_interval, int allow_tearing, int read
 /* P2b: at most max_frames flipped frames unfinished on the GPU (0 = no limit);
  * BW_GPU_LATENCY overrides. Remastered's high frame rate sets it. */
 void bw_d3d11_latency_config(int max_frames);
+/* lat-q: the limit while the frame cap is being reached (0 = the same). */
+void bw_d3d11_latency_capped(int max_frames);
+/* lat-q: watch whether the frame cap is being reached (g_bw_cap_reached,
+ * transitions logged); BW_HIFPS_JIT=3 sets it. Original never calls it. */
+void bw_d3d11_cap_watch(int on);
+/* lat-q: the present schedule's period follows what the frames sustain
+ * (BW_HIFPS_JIT=4, the head start; a test switch). Original never calls it. */
+void bw_d3d11_beat_auto(int on);
 /* P2b: presents no sooner than 1/hz s apart (0 = off); BW_HIFPS_PACE=0 overrides. */
 void bw_d3d11_pace_config(unsigned hz);
 /* Remastered widescreen (bw_widescreen.h): take this boot's factor and, when

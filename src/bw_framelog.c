@@ -103,6 +103,90 @@ void bw_fl_event_(unsigned type, unsigned a, unsigned b, unsigned c)
     s_ev[i].tid = GetCurrentThreadId();
 }
 
+/* 0.2.5 (V's RC6 freeze, after the release with the latency batch): a
+ * frame's unwind entry found without the loader's locks. The sampler used
+ * RtlLookupFunctionEntry, which takes the loader's function-table lock,
+ * with the sampled thread suspended. At its first draw the NV2A thread
+ * loads D3D11, DXGI and the driver, and the loader holds that lock while it
+ * maps them: suspended there, the thread held the lock the sampler then
+ * waited on, so it was never resumed, the device was never made, and
+ * bw_fl_dump (SymInitialize) hung too, so the run never ended (inferred from
+ * run 20261103-110553-r6-gpu-pace-vsync). Here the module comes from
+ * VirtualQuery (a system call, no user-mode lock) and its own exception
+ * table is searched; nothing that can wait on the suspended thread runs
+ * while it is suspended. */
+/* The modules seen so far ([lo, hi) = the image), so most frames need no
+ * VirtualQuery (only the sampler thread uses it). A module unloaded since
+ * is only a stale entry: reading it is guarded below. */
+#define FL_MODS 32
+static struct { DWORD64 lo, hi; } s_mod[FL_MODS];
+static int s_nmod;
+
+static const uint8_t *fl_module(DWORD64 pc)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    int i;
+    for (i = 0; i < s_nmod; i++)
+        if (pc >= s_mod[i].lo && pc < s_mod[i].hi)
+            return (const uint8_t *)(uintptr_t)s_mod[i].lo;
+    if (!VirtualQuery((LPCVOID)(uintptr_t)pc, &mbi, sizeof mbi) || mbi.Type != MEM_IMAGE
+            || !mbi.AllocationBase)
+        return NULL;
+    __try {
+        const uint8_t *m = (const uint8_t *)mbi.AllocationBase;
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)m;
+        const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)(m + dos->e_lfanew);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE && nt->Signature == IMAGE_NT_SIGNATURE) {
+            DWORD64 lo = (DWORD64)(uintptr_t)m, hi = lo + nt->OptionalHeader.SizeOfImage;
+            if (pc < hi) {
+                i = s_nmod < FL_MODS ? s_nmod++ : (int)((pc >> 12) % FL_MODS);
+                s_mod[i].lo = lo;
+                s_mod[i].hi = hi;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return (const uint8_t *)mbi.AllocationBase;
+}
+
+static PRUNTIME_FUNCTION fl_lookup(DWORD64 pc, DWORD64 *base)
+{
+    PRUNTIME_FUNCTION fn = NULL;
+    const uint8_t *mod = fl_module(pc);
+    if (!mod)
+        return NULL;
+    __try {
+        const uint8_t *m = mod;
+        const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)m;
+        const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)(m + dos->e_lfanew);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE && nt->Signature == IMAGE_NT_SIGNATURE
+                && nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC
+                && nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXCEPTION) {
+            const IMAGE_DATA_DIRECTORY *dd = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+            if (dd->VirtualAddress && dd->Size >= sizeof(RUNTIME_FUNCTION)) {
+                PRUNTIME_FUNCTION t = (PRUNTIME_FUNCTION)(uintptr_t)(m + dd->VirtualAddress);
+                DWORD lo = 0, hi = dd->Size / (DWORD)sizeof(RUNTIME_FUNCTION);
+                DWORD rva = (DWORD)(pc - (DWORD64)(uintptr_t)m);
+                while (lo < hi) {
+                    DWORD mid = lo + (hi - lo) / 2;
+                    if (rva < t[mid].BeginAddress)
+                        hi = mid;
+                    else if (rva >= t[mid].EndAddress)
+                        lo = mid + 1;
+                    else {
+                        fn = &t[mid];
+                        *base = (DWORD64)(uintptr_t)m;
+                        break;
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        fn = NULL;
+    }
+    return fn;
+}
+
 static void sample_one(int role)
 {
     CONTEXT ctx;
@@ -131,22 +215,26 @@ static void sample_one(int role)
     {
         CONTEXT c = ctx;
         int depth;
-        for (depth = 0; depth < 48 && c.Rip && s->n < FL_DEPTH; depth++) {
-            DWORD64 base = 0;
-            PRUNTIME_FUNCTION fn;
-            if (depth)
-                s->pc[s->n++] = c.Rip;
-            fn = RtlLookupFunctionEntry(c.Rip, &base, NULL);
-            if (!fn) {
-                if (!c.Rsp)
-                    break;
-                c.Rip = *(const DWORD64 *)(uintptr_t)c.Rsp;     /* a leaf: return address on top */
-                c.Rsp += 8;
-            } else {
-                PVOID hd = NULL;
-                DWORD64 ef = 0;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, fn, &c, &hd, &ef, NULL);
+        __try {                         /* a bad stack word must not take the sampler down */
+            for (depth = 0; depth < 48 && c.Rip && s->n < FL_DEPTH; depth++) {
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION fn;
+                if (depth)
+                    s->pc[s->n++] = c.Rip;
+                fn = fl_lookup(c.Rip, &base);       /* not RtlLookupFunctionEntry: see fl_lookup */
+                if (!fn) {
+                    if (!c.Rsp)
+                        break;
+                    c.Rip = *(const DWORD64 *)(uintptr_t)c.Rsp; /* a leaf: return address on top */
+                    c.Rsp += 8;
+                } else {
+                    PVOID hd = NULL;
+                    DWORD64 ef = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, fn, &c, &hd, &ef, NULL);
+                }
             }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            /* keep the frames found so far */
         }
     }
     ResumeThread(s_th[role]);
@@ -287,8 +375,8 @@ void bw_fl_dump(const char *why)
             why, (long)n, (long)(s_nev - n), (long)ns, s_sample_us);
     fprintf(f, "# game thread %lu, NV2A thread %lu, image base %llx\n", (unsigned long)s_tid[0],
             (unsigned long)s_tid[1], (unsigned long long)s_img_lo);
-    fprintf(f, "# E t thread type a b c; types: 1 frame 2 frame_end(steps) 3 upd 4 upd_end"
-               " 5 kick(us,out,seq) 6 bot(us,fence,gputime) 10 walk(put,us,get) 11 flip(us,presented)"
+    fprintf(f, "# E t thread type a b c; types: 1 frame 2 frame_end(steps,last_put) 3 upd 4 upd_end"
+               " 5 kick(us,out,seq) 6 bot(us,fence,gputime) 7 jit(us,what,guard) 10 walk(put,us,get) 11 flip(us,presented)"
                " 12 hold 13 hold_end(us) 14 gpudone(flip,us,inflight) 15 gpuwait(us,inflight)\n");
     fprintf(f, "# S t role leaf frames... (role 0 game, 1 NV2A; leaf and frames as absolute hex addresses,"
                " frames innermost first); Y address symbol\n");

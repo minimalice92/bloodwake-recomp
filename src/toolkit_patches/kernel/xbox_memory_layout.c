@@ -1446,6 +1446,14 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
 
 #include "../../bw_wait.h"   /* Blood Wake carried patch: bw_ack_idle */
 #include "../../bw_framelog.h" /* Blood Wake carried patch (P2b): BW_FRAMELOG test aid */
+/* Blood Wake carried patch (lat-q): 1 while this thread walks a segment (its
+ * flip, present, GPU wait included), so Remastered's just-in-time wait can
+ * tell a busy walk from an idle one (bw_hifps_hooks.c). Host-side only. */
+volatile long g_bw_nv2a_walking;
+/* ... and what its last pass saw, for the just-in-time wait's diagnostics:
+ * the PUT register, the last PUT walked, GET as last written, a held flip. */
+volatile uint32_t g_bw_ack_put_reg, g_bw_ack_last_put, g_bw_ack_get_written;
+volatile long g_bw_ack_flip_held;
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
@@ -1528,10 +1536,15 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
             /* Blood Wake carried patch (P1): one KickOff segment at a time
              * when BW_PB_SEGWALK is on (bw_wait.c); else the register's PUT */
+            g_bw_ack_put_reg = put;             /* Blood Wake (lat-q): host-side mirrors */
             if (!flip_held)
                 put = bw_put_queue_take(last_put, put);
+            g_bw_ack_last_put = last_put;
+            g_bw_ack_get_written = get_written;
+            g_bw_ack_flip_held = flip_held;
             if (!flip_held
                     && (put != last_put || (now_ms - last_put_ms) > 2000)) {
+                g_bw_nv2a_walking = 1;          /* Blood Wake (lat-q) */
                 if (g_bw_fl_on)
                     bw_fl_w0 = bw_fl_ticks();
                 /* Survey the segment the title just submitted, once. */
@@ -1601,6 +1614,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                                   XBOX_CONTIG_BASE | (put     & 0x0FFFFFFFu));
                             first = 1;
                         } else if (get_written != 0xFFFFFFFFu && get_now != get_written) {
+                            /* Blood Wake (lat-q, BW_PB_GETLOG=1, test aid): the
+                             * title moved GET; the first twenty, with the time */
+                            static int getlog = -1;
+                            static unsigned getlog_n;
+                            if (getlog < 0) {
+                                const char *e = getenv("BW_PB_GETLOG");
+                                getlog = e && e[0] == '1';
+                            }
+                            if (getlog && getlog_n++ < 20)
+                                fprintf(stderr, "[PB] t=%lu the title moved GET to %08X (we left %08X); PUT %08X,"
+                                                " last walked %08X\n", (unsigned long)now_ms, get_now,
+                                        get_written, put, last_put);
                             from = get_now;
                             nv2a_pb_ring_reset();
                         }
@@ -1660,6 +1685,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         bw_fl_event(BW_FL_N_WALK, put, bw_fl_us_since(bw_fl_w0), get_written);
                     *get = put;
                     get_written = put;
+                    g_bw_ack_last_put = put;        /* Blood Wake (lat-q): before the flag */
+                    g_bw_ack_get_written = put;
+                    g_bw_nv2a_walking = 0;          /* Blood Wake (lat-q) */
                     bw_flush_acked();   /* Blood Wake: wake a KickOff waiting on GET */
                 }
                 last_put = put; last_put_ms = now_ms;

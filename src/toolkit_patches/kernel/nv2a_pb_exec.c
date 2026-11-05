@@ -5073,6 +5073,33 @@ int nv2a_pb_exec_flip_poll(void)
     return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
 }
 
+/* Blood Wake carried patch (lat-q): when the pending hold will release, on
+ * the host clock (xbox_HostNowNs), for Remastered's just-in-time frames
+ * (bw_hifps_hooks.c). 1 with *due_ns while a host-paced hold is pending
+ * (*due_ns = now if it is already due and the walk hasn't polled yet); 0
+ * when nothing is held or the hold isn't host-paced. Read from the game
+ * thread without a lock: a stale answer only makes the caller look again. */
+int bw_flip_hold_due(uint64_t *due_ns)
+{
+    unsigned hz = s_bw_pace_hz;
+    uint64_t now, k;
+    int32_t d;
+
+    if (!hz || !s_flip_hold.held)
+        return 0;
+    now = xbox_HostNowNs();
+    k = now * (uint64_t)hz / 1000000000ull;           /* bw_pace_count, unwrapped */
+    d = (int32_t)(s_flip_hold.target - (uint32_t)k);
+    if (!s_flip_hold.held)
+        return 0;
+    if (d <= 0) {
+        *due_ns = now;
+        return 1;
+    }
+    *due_ns = ((k + (uint64_t)d) * 1000000000ull + hz - 1) / hz;
+    return 1;
+}
+
 /* The hold's line in the periodic [GPU] report, then reset. */
 static void flip_hold_report(void)
 {

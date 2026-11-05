@@ -297,6 +297,8 @@ void bw_edition_apply_image_fixes(const void *xbe, size_t xbe_size)
  *   Original    %LOCALAPPDATA%\xboxrecomp                  (as always; untouched)
  *   Remastered  %LOCALAPPDATA%\xboxrecomp\editions\remastered
  *   (and so on: <root>\editions\<name> for every edition after Original)
+ * Test runs move the root with BW_EDITION_SAVE_ROOT, Original's too (lane
+ * au-iso; before, Original ignored it and tests rewrote the player's images).
  * Each holds its own UDATA (saves), TDATA (settings), Z: cache and partition
  * images. Original keeps the root, so its saves are never moved; the
  * "editions" folder beside them is invisible to the guest (only UDATA, TDATA,
@@ -556,6 +558,27 @@ const char *bw_edition_prepare_saves(void)
     char a[3 * MAX_PATH], b[3 * MAX_PATH];
 
     if (s_edition == BW_ED_ORIGINAL) {
+        if (ov) {
+            /* Test runs (lane au-iso, docs/audio/iso.md): Original's whole disk
+             * under the test root, as the other editions' already is, never
+             * %LOCALAPPDATA%\xboxrecomp. The disk is what xbox_path_init keeps
+             * in its save folder and RECOMP_SAVE_DIR doesn't move: the partition
+             * images (rewritten at every boot), the Z: unpack cache, TitleData,
+             * UserData and SystemData. Original sits at the base, the others
+             * under <base>\editions, the layout of the player's own folder.
+             * Unset (every player's boot), nothing changes. */
+            SHCreateDirectoryExW(NULL, ov, NULL);
+            if (!WideCharToMultiByte(CP_UTF8, 0, ov, -1, root8, sizeof root8, NULL, NULL)) {
+                /* Not expected for a path Windows gave us. Never the player's
+                 * folder: one of the test's own beside the game instead. */
+                _snprintf(root8, sizeof root8, "SaveData\\test-original");
+                root8[sizeof root8 - 1] = 0;
+            }
+            fprintf(stderr, "[ED] saves: Original's disk %s (BW_EDITION_SAVE_ROOT; saves and "
+                    "settings in %s)\n", root8, rs ? u8(rs, a, sizeof a) : root8);
+            fflush(stderr);
+            return root8;
+        }
         fprintf(stderr, "[ED] saves: Original's folder, as before the switch (%s)\n",
                 rs ? u8(rs, a, sizeof a) : "%LOCALAPPDATA%\\xboxrecomp");
         return NULL;                  /* the toolkit's default, exactly as today */

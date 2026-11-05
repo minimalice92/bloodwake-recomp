@@ -184,6 +184,384 @@ static void bw_fail(const char *msg)
 
 /* Everything a run should leave behind when it ends abnormally. Safe to call
  * more than once. */
+/* ==== Blood Wake (lane au-vp, docs/audio/vp.md): the log off every game thread ====
+ *
+ * The game's log (stderr: play.log for a player, the run's stderr.log in a
+ * test) was written by whichever thread printed or flushed it. A file write
+ * can block (seen on this PC: 6 ms to over a second, "waiting on Executive"),
+ * and the toolkit flushes the log every 2 s from inside whatever kernel call
+ * comes next (kernel_thunk_dispatch_body's "[KERNEL] summary"): the APU
+ * frame thread inside the guest's sound interrupt (58.8 ms, a short pass),
+ * the USB controller's thread inside its interrupt with the one-CPU dispatch
+ * gate held (117 ms: no sound made for 88 ms). So now stderr is a pipe
+ * inside the process: a reader thread (highest priority) moves what arrives
+ * into an 8 MB ring and never waits for the disk; a writer thread writes the
+ * ring to the real log. A game thread's print costs a pipe write. If the
+ * ring is ever full (the disk 8 MB behind), what doesn't fit is dropped and
+ * counted, and one line in the log says how many bytes; nothing waits.
+ *   - The order is the order the pipe received the bytes: as before.
+ *   - Drained (bw_log_drain) on every way out: bw_dump_evidence (the run
+ *     limit, the crash filter), the game's relaunch and its own exits
+ *     (HalReturnToFirmware, HalInitiateShutdown in kernel_bridge.c), the
+ *     menu's Quit, a normal exit (atexit), and, for an ExitProcess nobody
+ *     drained (KeBugCheck), a last pass from the exe's TLS callback.
+ *   - A console (an interactive run) is left as it was.
+ *   - BW_LOG_ASYNC=0: written by the printing thread, as before (the undo).
+ *   - Test aids: BW_TEST_LOG_STALL=<s>[,<ms>] stalls the writer once (2000 ms
+ *     by default) s seconds in; BW_TEST_CRASH_AT=<s> crashes on purpose s
+ *     seconds in (the crash filter's path, with the drain);
+ *     BW_TEST_LOG_QUIET_DRAIN=<s> drains with every other thread stopped.
+ */
+#include <io.h>
+#include <fcntl.h>
+#include <tlhelp32.h>
+
+#define BW_LOG_RING (8u << 20)
+static char *s_lg_ring;
+static volatile LONG64 s_lg_w, s_lg_r, s_lg_lost, s_lg_lost_said;
+static HANDLE s_lg_rd, s_lg_out, s_lg_ev;
+static volatile LONG s_lg_on, s_lg_rbusy, s_lg_wbusy, s_lg_final;
+/* The drain's marker: a NUL byte written into the pipe after everything
+ * printed so far; the reader strips it and notes where the ring stood
+ * (nothing peeks at the pipe while the reader is blocked on it: a
+ * synchronous handle's I/O is serialized). */
+static volatile LONG64 s_lg_sync_w, s_lg_sync_n;
+static HANDLE s_lg_wr;                   /* the pipe's write end, as fd 2 has it */
+/* The writer is inside a write to the file; the drain has taken over. */
+static volatile LONG s_lg_inwrite, s_lg_takeover;
+static unsigned s_lg_stall_at_ms, s_lg_stall_ms;
+static ULONGLONG s_lg_t0;
+
+static void bw_lg_put(const char *p, DWORD n)   /* the real log, whole */
+{
+    while (n) {
+        DWORD done = 0;
+        if (!WriteFile(s_lg_out, p, n, &done, NULL) || !done)
+            return;
+        p += done;
+        n -= done;
+    }
+}
+
+static void bw_lg_lost_line(void)
+{
+    LONG64 lost = s_lg_lost;
+    if (lost != s_lg_lost_said) {
+        char line[200];
+        int k = _snprintf(line, sizeof line, "\r\n[LOG] %lld bytes of the log were dropped here (its writer fell"
+                                             " 8 MB behind the game); no game thread waited for it\r\n",
+                          lost - s_lg_lost_said);
+        if (k > 0)
+            bw_lg_put(line, (DWORD)k);
+        s_lg_lost_said = lost;
+    }
+}
+
+/* the ring's bytes to the log, all that is there; 1 if it wrote any. The
+ * writer thread (writer = 1) stops when the drain has taken over. */
+static int bw_lg_write_ring(int writer)
+{
+    int any = 0;
+    for (;;) {
+        LONG64 r = s_lg_r, w = InterlockedCompareExchange64(&s_lg_w, 0, 0);
+        DWORD at, n;
+        if (r == w)
+            return any;
+        at = (DWORD)(r % BW_LOG_RING);
+        n = (DWORD)(w - r);
+        if (n > BW_LOG_RING - at) n = BW_LOG_RING - at;
+        if (n > 4096) n = 4096;          /* small steps: an abrupt end repeats at most 4 KB */
+        if (writer) {
+            InterlockedExchange(&s_lg_inwrite, 1);
+            if (s_lg_takeover) {
+                InterlockedExchange(&s_lg_inwrite, 0);
+                return any;
+            }
+        }
+        bw_lg_put(s_lg_ring + at, n);
+        InterlockedExchange64(&s_lg_r, r + n);
+        if (writer)
+            InterlockedExchange(&s_lg_inwrite, 0);
+        any = 1;
+    }
+}
+
+/* the pipe's bytes into the ring; never waits for room */
+static void bw_lg_take_raw(const char *buf, DWORD n)
+{
+    if (!n)
+        return;
+    LONG64 w = s_lg_w, r = InterlockedCompareExchange64(&s_lg_r, 0, 0);
+    if ((LONG64)BW_LOG_RING - (w - r) < (LONG64)n) {
+        InterlockedAdd64(&s_lg_lost, (LONG64)n);
+        return;
+    }
+    {
+        DWORD at = (DWORD)(w % BW_LOG_RING), k = n < BW_LOG_RING - at ? n : BW_LOG_RING - at;
+        memcpy(s_lg_ring + at, buf, k);
+        memcpy(s_lg_ring, buf + k, n - k);
+        InterlockedExchange64(&s_lg_w, w + n);
+    }
+}
+
+/* the same, a drain's NUL marker taken out and noted */
+static void bw_lg_take(const char *buf, DWORD n)
+{
+    for (;;) {
+        const char *z = (const char *)memchr(buf, 0, n);
+        if (!z) {
+            bw_lg_take_raw(buf, n);
+            return;
+        }
+        bw_lg_take_raw(buf, (DWORD)(z - buf));
+        InterlockedExchange64(&s_lg_sync_w, InterlockedCompareExchange64(&s_lg_w, 0, 0));
+        InterlockedIncrement64(&s_lg_sync_n);
+        n -= (DWORD)(z - buf) + 1;
+        buf = z + 1;
+    }
+}
+
+static DWORD WINAPI bw_lg_reader(LPVOID a)
+{
+    static char buf[64 * 1024];
+    (void)a;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    for (;;) {
+        DWORD n = 0;
+        if (!ReadFile(s_lg_rd, buf, sizeof buf, &n, NULL) || !n)
+            return 0;
+        InterlockedExchange(&s_lg_rbusy, 1);
+        bw_lg_take(buf, n);
+        InterlockedExchange(&s_lg_rbusy, 0);
+        SetEvent(s_lg_ev);
+    }
+}
+
+static DWORD WINAPI bw_lg_writer(LPVOID a)
+{
+    (void)a;
+    for (;;) {
+        WaitForSingleObject(s_lg_ev, 50);
+        if (s_lg_stall_ms && GetTickCount64() - s_lg_t0 >= s_lg_stall_at_ms) {
+            unsigned ms = s_lg_stall_ms;     /* BW_TEST_LOG_STALL: the disk "stalls" once */
+            s_lg_stall_ms = 0;
+            InterlockedExchange(&s_lg_wbusy, 1);
+            Sleep(ms);
+            InterlockedExchange(&s_lg_wbusy, 0);
+        }
+        InterlockedExchange(&s_lg_wbusy, 1);
+        if (bw_lg_write_ring(1) && !s_lg_takeover)
+            bw_lg_lost_line();
+        InterlockedExchange(&s_lg_wbusy, 0);
+    }
+}
+
+/* Everything printed so far into the log, waiting at most wait_ms: the C
+ * library's buffer into the pipe, the pipe into the ring, the ring to the
+ * file. Called on the ways out; harmless anywhere else. */
+static int bw_log_drain_core(int wait_ms);
+
+void bw_log_drain(int wait_ms)
+{
+    if (!s_lg_on || s_lg_final)
+        return;
+    fflush(stdout);
+    fflush(stderr);
+    bw_log_drain_core(wait_ms);
+}
+
+/* The drain past the C library's flush; 1 when it got there in time. */
+static int bw_log_drain_core(int wait_ms)
+{
+    static const char nul = 0;
+    ULONGLONG t0, lim = (ULONGLONG)(wait_ms > 0 ? wait_ms : 0);
+    LONG64 n0, target, left;
+    DWORD done = 0;
+    t0 = GetTickCount64();
+    n0 = s_lg_sync_n;
+    WriteFile(s_lg_wr, &nul, 1, &done, NULL);   /* the marker, after everything printed so far */
+    SetEvent(s_lg_ev);
+    while (s_lg_sync_n == n0) {          /* the reader reaches it */
+        if (GetTickCount64() - t0 >= lim)
+            goto late;
+        Sleep(1);
+    }
+    target = s_lg_sync_w;
+    while (InterlockedCompareExchange64(&s_lg_r, 0, 0) < target) {   /* the writer writes up to it */
+        SetEvent(s_lg_ev);
+        if (GetTickCount64() - t0 >= lim)
+            goto late;
+        Sleep(1);
+    }
+    return 1;
+late:
+    /* Not in time. If the writer isn't inside a file write (a stalled
+     * thread, not a stalled disk), the drain writes the rest itself and
+     * says so; inside one, nothing more can be written without waiting for
+     * the disk, and the bound wins. Then the writer may go on. */
+    InterlockedExchange(&s_lg_takeover, 1);
+    if (!s_lg_inwrite) {
+        char line[260];
+        int k;
+        left = InterlockedCompareExchange64(&s_lg_w, 0, 0) - s_lg_r;
+        bw_lg_write_ring(0);
+        bw_lg_lost_line();
+        k = _snprintf(line, sizeof line, "\r\n[LOG] the log's writer thread was held when the game ended; the last %lld"
+                                         " bytes were written by the drain itself (%lld bytes of the log dropped in"
+                                         " all)\r\n", left, s_lg_lost);
+        if (k > 0)
+            bw_lg_put(line, (DWORD)k);
+    }
+    InterlockedExchange(&s_lg_takeover, 0);
+    return 0;
+}
+
+static void bw_lg_atexit(void)
+{
+    bw_log_drain(1000);
+}
+
+/* An ExitProcess nobody drained: the other threads are gone by now. What
+ * the pipe and the ring still hold goes to the file from here, without the
+ * C library (its locks may have died with a thread). */
+static void NTAPI bw_lg_tls(PVOID h, DWORD reason, PVOID r)
+{
+    (void)h; (void)r;
+    if (reason != DLL_PROCESS_DETACH || !s_lg_on || s_lg_final)
+        return;
+    s_lg_final = 1;
+    for (;;) {
+        static char buf[64 * 1024];
+        DWORD avail = 0, n = 0;
+        if (!PeekNamedPipe(s_lg_rd, NULL, 0, NULL, &avail, NULL) || !avail)
+            break;
+        if (!ReadFile(s_lg_rd, buf, avail < sizeof buf ? avail : sizeof buf, &n, NULL) || !n)
+            break;
+        bw_lg_take(buf, n);
+    }
+    bw_lg_write_ring(0);
+    bw_lg_lost_line();
+}
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma comment(linker, "/INCLUDE:bw_lg_tls_ptr")
+#pragma const_seg(".CRT$XLB")
+#ifdef __cplusplus
+extern "C"
+#endif
+const PIMAGE_TLS_CALLBACK bw_lg_tls_ptr = bw_lg_tls;
+#pragma const_seg()
+
+static DWORD s_lg_reader_tid, s_lg_writer_tid;
+
+/* BW_TEST_LOG_QUIET_DRAIN=<s> (a test aid): at s seconds, every thread of the
+ * game but this one and the log's two is suspended, so nothing else can
+ * print, and the drain runs (past the C library: a suspended thread may hold
+ * its lock); its time is logged after they are resumed. The condition a
+ * drain that peeked at the pipe could not leave. */
+static DWORD WINAPI bw_lg_quiet_thread(LPVOID a)
+{
+    HANDLE snap, held[512];
+    THREADENTRY32 te;
+    DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    int n = 0, i, ok;
+    LARGE_INTEGER f, c0, c1;
+    static const char line[] = "[LOG] BW_TEST_LOG_QUIET_DRAIN: every other thread is stopped now; this line and"
+                               " everything before it must reach the log by the drain alone\n";
+    DWORD done;
+    Sleep((DWORD)(uintptr_t)a);
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return 0;
+    te.dwSize = sizeof te;
+    for (ok = Thread32First(snap, &te); ok && n < 512; ok = Thread32Next(snap, &te)) {
+        HANDLE h;
+        if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || te.th32ThreadID == s_lg_reader_tid ||
+            te.th32ThreadID == s_lg_writer_tid)
+            continue;
+        h = OpenThread(THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID);
+        if (h && SuspendThread(h) != (DWORD)-1)
+            held[n++] = h;
+        else if (h)
+            CloseHandle(h);
+    }
+    CloseHandle(snap);
+    WriteFile(s_lg_wr, line, sizeof line - 1, &done, NULL);   /* straight into the pipe: no C library */
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c0);
+    ok = bw_log_drain_core(500);
+    QueryPerformanceCounter(&c1);
+    for (i = 0; i < n; i++) {
+        ResumeThread(held[i]);
+        CloseHandle(held[i]);
+    }
+    fprintf(stderr, "[LOG] BW_TEST_LOG_QUIET_DRAIN: with %d other threads stopped, the drain %s in %.2f ms (bound 500)\n",
+            n, ok ? "got there" : "did NOT get there", (double)(c1.QuadPart - c0.QuadPart) * 1000.0 / f.QuadPart);
+    return 0;
+}
+
+static DWORD WINAPI bw_lg_crash_thread(LPVOID a)
+{
+    Sleep((DWORD)(uintptr_t)a);
+    fprintf(stderr, "[BW] BW_TEST_CRASH_AT: crashing on purpose now (a test switch); the lines up to here must"
+                    " reach the log\n");
+    *(volatile uint32_t *)(uintptr_t)8 = 0;
+    return 0;
+}
+
+static void bw_log_pipe_init(void)
+{
+    const char *e = getenv("BW_LOG_ASYNC"), *t = getenv("BW_TEST_LOG_STALL"), *c = getenv("BW_TEST_CRASH_AT");
+    HANDLE cur = GetStdHandle(STD_ERROR_HANDLE), wr = NULL;
+    DWORD type;
+    int fd;
+    if (e && e[0] == '0')
+        return;
+    if (!cur || cur == INVALID_HANDLE_VALUE)
+        return;
+    type = GetFileType(cur);
+    if (type != FILE_TYPE_DISK && type != FILE_TYPE_PIPE)
+        return;                          /* a console (an interactive run): as before */
+    if (!DuplicateHandle(GetCurrentProcess(), cur, GetCurrentProcess(), &s_lg_out, 0, FALSE, DUPLICATE_SAME_ACCESS))
+        return;
+    s_lg_ring = (char *)VirtualAlloc(NULL, BW_LOG_RING, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    s_lg_ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!s_lg_ring || !s_lg_ev || !CreatePipe(&s_lg_rd, &wr, NULL, 4u << 20)) {
+        CloseHandle(s_lg_out);
+        return;
+    }
+    fflush(stderr);
+    fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_TEXT);
+    if (fd < 0 || _dup2(fd, 2) != 0) {
+        fprintf(stderr, "[LOG] the writer thread could not take the log (fd %d): written as before\n", fd);
+        return;
+    }
+    _close(fd);
+    s_lg_wr = (HANDLE)_get_osfhandle(2);
+    SetStdHandle(STD_ERROR_HANDLE, s_lg_wr);
+    s_lg_t0 = GetTickCount64();
+    if (t && *t) {
+        double at = atof(t), ms = 2000;
+        const char *k = strchr(t, ',');
+        if (k && atof(k + 1) > 0)
+            ms = atof(k + 1);
+        s_lg_stall_at_ms = (unsigned)(at * 1000.0);
+        s_lg_stall_ms = (unsigned)ms;
+    }
+    s_lg_on = 1;
+    CloseHandle(CreateThread(NULL, 0, bw_lg_reader, NULL, 0, &s_lg_reader_tid));
+    CloseHandle(CreateThread(NULL, 0, bw_lg_writer, NULL, 0, &s_lg_writer_tid));
+    atexit(bw_lg_atexit);
+    fprintf(stderr, "[LOG] the game's log goes through a writer thread of its own (BW_LOG_ASYNC; au-vp): no game"
+                    " thread writes the disk%s\n", s_lg_stall_ms ? "; BW_TEST_LOG_STALL: the writer stalls once" : "");
+    if (c && atof(c) > 0)
+        CloseHandle(CreateThread(NULL, 0, bw_lg_crash_thread, (LPVOID)(uintptr_t)(atof(c) * 1000.0), 0, NULL));
+    {
+        const char *q = getenv("BW_TEST_LOG_QUIET_DRAIN");
+        if (q && atof(q) > 0)
+            CloseHandle(CreateThread(NULL, 0, bw_lg_quiet_thread, (LPVOID)(uintptr_t)(atof(q) * 1000.0), 0, NULL));
+    }
+}
+
 static void bw_dump_evidence(const char *why)
 {
     fprintf(stderr, "[BW] dumping evidence (%s)\n", why);
@@ -193,12 +571,21 @@ static void bw_dump_evidence(const char *why)
         extern void bw_fl_dump(const char *why);   /* P2b: BW_FRAMELOG */
         bw_fl_dump(why);
     }
+    {
+        extern void bw_lat_dump(const char *why);  /* lat-m: BW_LATLOG */
+        bw_lat_dump(why);
+    }
     xbox_missing_summary(why);
     bw_unimpl_summary();
     bw_edition_summary();
+    {
+        extern void bw_wav_close_nowait(int wait_ms);   /* au-vp: the WAV writer's ring first */
+        bw_wav_close_nowait(400);
+    }
     apu_wav_close_nowait(500);
     fflush(stdout);
     fflush(stderr);
+    bw_log_drain(500);                   /* au-vp: the log's ring to the file before the process ends */
 }
 
 static LONG WINAPI bw_unhandled_filter(PEXCEPTION_POINTERS ep)
@@ -523,6 +910,10 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         /* A title that dies mid-boot is the one whose indirect-call targets
          * are most worth having. No-op unless RECOMP_ICALL_FEEDBACK. */
         RECOMP_ICALL_FEEDBACK_DUMP();
+        /* au-vp: the log's ring to the file now. A player's run has no
+         * unhandled-exception filter (that is for unattended runs), so
+         * Windows ends the process straight after this. */
+        bw_log_drain(300);
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
@@ -588,6 +979,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (n)
             setvbuf(stderr, errbuf, _IOFBF, n < sizeof(errbuf) ? n : sizeof(errbuf));
     }
+    bw_log_pipe_init();                  /* au-vp: the log off every game thread (BW_LOG_ASYNC) */
 
     printf("=== Blood Wake - Static Recompilation ===\n");
     bw_run_control_init();
@@ -606,7 +998,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     bw_profile_init();
     {
         extern void bw_fl_init(void);   /* P2b: BW_FRAMELOG test aid (bw_framelog.c) */
+        extern void bw_lat_init(void);  /* lat-m: BW_LATLOG test aid (bw_latlog.c) */
+        extern void bw_padwatch_init(void);  /* au-iso: BW_PADWATCH test aid (bw_padwatch.c) */
         bw_fl_init();
+        bw_lat_init();
+        bw_padwatch_init();
     }
     bw_d3d11_register();      /* BW_GPU=d3d11: GPU back end (D-003 B prototype) */
     printf("Loading XBE...\n");

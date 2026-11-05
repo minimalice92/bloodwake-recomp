@@ -438,6 +438,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             recomp_exit_hook_run("window");
             fflush(stdout);
             fflush(stderr);
+            {
+                /* Blood Wake carried patch (au-vp): the game's log goes
+                 * through a ring and a writer thread (src/main.c); what is
+                 * still in them reaches the file before the process ends.
+                 * Every closing of the window comes here: its close box, the
+                 * play host's quit and the menu's Quit Game. */
+                extern void bw_log_drain(int wait_ms);
+                bw_log_drain(500);
+            }
             TerminateProcess(GetCurrentProcess(), 0);
         }
         return 0;

@@ -14,24 +14,82 @@
   * ohci.c -- OHCI 1.0a host controller registers for the MCPX.
   *
   * See ohci.h for what this is and is not. The short version: enough for a
-@@ -13,6 +22,7 @@
+@@ -13,6 +22,9 @@
  #include "../kernel/kernel.h"
  #include "usb_gamepad.h"
  #include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
 +#include "../input/bw_input_ext.h"  /* Blood Wake: controller count, rumble off (0.2.5) */
++#include "../../bw_latlog.h"         /* Blood Wake (lat-m): BW_LATLOG test aid */
++#include "../../bw_edition.h"        /* Blood Wake (lat-m): BW_USB_TICK_MS, Remastered only */
  
  #include <stdio.h>
  #include <stdlib.h>
-@@ -182,6 +192,8 @@
+@@ -159,6 +171,18 @@
+  * cheap -- this thread does nothing but read a few guest dwords per pass. */
+ #define OHCI_TICK_MS            4u
+ 
++/* Blood Wake carried patch (lat-m, D-027): the pass length actually used.
++ * OHCI_TICK_MS (4 ms) everywhere, which is also the pad's own interrupt
++ * interval (its endpoint descriptor says 4 ms) and so what a console polls.
++ * Remastered and later use 1 ms by default (BW_FIX USB_TICK_1MS, au-usb), and
++ * BW_USB_TICK_MS=1..4 picks it there (Original keeps 4 always): a pad's change
++ * then waits less for the next report, as with
++ * a faster-polling controller; the game reads the latest state either way.
++ * Everything counted in passes (the frame counter, the hold-off, the start-up
++ * and arrival waits) is scaled so it keeps its length in milliseconds. */
++static unsigned s_tick_ms = OHCI_TICK_MS;
++#define OHCI_PASSES(n) ((unsigned)(((unsigned long long)(n) * OHCI_TICK_MS + s_tick_ms - 1) / s_tick_ms))
++
+ typedef struct {
+     uint32_t base;                      /* Xbox VA of the register block   */
+     uint32_t reg[OHCI_REG_MAX / 4];
+@@ -182,6 +206,21 @@
   * 1-4). Which slot XAPI gives a pad is decided by its port: see OHCI_PORTS. */
  static unsigned s_ndp = OHCI_PORTS;
  static int s_npads = 1;          /* RECOMP_USB_PADS */
 +static int s_auto_pads;          /* Blood Wake: RECOMP_USB_PADS=auto (item 73) */
++/* Blood Wake carried patch (lane au-iso): the pads there at boot are plugged
++ * in together, as on a console, and the title's USB stack enumerates them in
++ * turn (USBD_DeviceConnected queues a device that connects during another's
++ * enumeration). The old order -- each pad 50 passes after the previous one is
++ * configured, about 0.2 s apart -- left a 2-player boot straight into a battle
++ * opening on the game's own controller-missing pause 9 times in 10
++ * (docs/audio/iso.md). BW_USB_ATTACH_SERIAL=1 puts it back. With several pads
++ * at the default address at once, address 0 is the pad on the port the
++ * driver reset last (s_reset_port), as on the wire, where only the enabled
++ * port's device hears it. */
++static int s_attach_serial;
++static int s_reset_port = -1;    /* the root port the driver reset last */
++static unsigned s_first_port;    /* pad d is on root port (s_first_port + d) % s_ndp */
 +static unsigned s_auto_tick;
  static int s_enabled;
  static int s_trace;
  
-@@ -513,6 +525,18 @@
+@@ -351,6 +390,8 @@
+             if (*ps & PORT_CCS)
+                 *ps |= PORT_PES;
+             *ps |= PORT_PRSC;
++            if (hc == &s_hc[s_device_hc])
++                s_reset_port = (int)port;    /* Blood Wake (au-iso): see s_attach_serial */
+             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+         }
+         return;
+@@ -443,6 +484,14 @@
+ {
+     uint32_t fa = ed0 & 0x7Fu;
+     int d;
++    /* Blood Wake carried patch (au-iso): pads plugged in together share the
++     * default address until each is given one; the one that answers it is
++     * the pad on the port the driver reset last (s_attach_serial). */
++    if (!fa && !s_attach_serial && s_reset_port >= 0)
++        for (d = 0; d < s_plugged_pads; d++)
++            if ((int)((s_first_port + (unsigned)d) % s_ndp) == s_reset_port
++                && usb_gamepad_address(d) == 0)
++                return d;
+     for (d = 0; d < s_plugged_pads; d++)
+         if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+             return d;
+@@ -513,6 +562,18 @@
  {
      if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
          return addr;
@@ -50,10 +108,176 @@
      if (addr && addr < xbox_ContiguousAllocatedBytes())
          return OHCI_CONTIG_BASE + addr;
      return addr;
-@@ -1121,6 +1145,25 @@
-             fflush(stderr);
-         }
+@@ -889,6 +950,11 @@
+  * Returns what the routine returned: an ISR that does not claim the interrupt
+  * returns FALSE, and that is worth seeing rather than assuming.
+  */
++/* Blood Wake carried patch (au-usb, test aid): with BW_LATLOG set, each run
++ * of the title's USB ISR is counted and timed (host counter ticks). */
++static volatile LONG s_lat_isr_n;
++static volatile LONGLONG s_lat_isr_qpc;
++
+ static int ohci_isr_call(int index)
+ {
+     uint32_t kinterrupt = xbox_GetConnectedInterrupt(OHCI_VECTOR);
+@@ -917,6 +983,18 @@
+     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
+     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
  
++    if (g_bw_lat_on) {
++        /* Blood Wake (lat-m): when the ISR runs; (au-usb) and how long it and
++         * the IRQL drop after it take, with running totals for the C events
++         * (BW_USB_TICK_MS's cost, measured). The same work in the same order. */
++        int64_t t0 = bw_lat_now(), t1;
++        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
++        t1 = bw_lat_now();
++        InterlockedIncrement(&s_lat_isr_n);
++        InterlockedExchangeAdd64(&s_lat_isr_qpc, t1 - t0);
++        bw_lat_ev(BW_LAT_ISR, t0, index, t1 - t0, 0, 0, 0, 0, 0.0, 0.0);
++        return (int)(g_eax & 1u);
++    }
+     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+     return (int)(g_eax & 1u);
+ }
+@@ -1047,6 +1125,24 @@
+  * the interrupt it has been waiting for. Repeat delivery and the transfer
+  * lists come after that answer, not before it.
+  */
++/* Blood Wake carried patch (lane au-iso): an arrival line with when it
++ * happened -- ms since the controller thread started, the passes so far and
++ * their mean length, and the host counter in ms (h=, as BW_STEPLOG prints
++ * it) -- so a pad that arrives late can be measured against the game. One
++ * fprintf, so another thread's line can't land in the middle. */
++static void ohci_arrival_line(const char *what, unsigned long passes,
++                              const LARGE_INTEGER *start, const LARGE_INTEGER *freq)
++{
++    LARGE_INTEGER now;
++    double ms, f = freq->QuadPart ? (double)freq->QuadPart : 1.0;
++
++    QueryPerformanceCounter(&now);
++    ms = (double)(now.QuadPart - start->QuadPart) * 1000.0 / f;
++    fprintf(stderr, "  [OHCI0] %s (t=%.0f ms, pass %lu, %.2f ms a pass, h=%.1f)\n", what, ms,
++            passes, passes ? ms / (double)passes : 0.0, (double)now.QuadPart * 1000.0 / f);
++    fflush(stderr);
++}
++
+ static DWORD WINAPI ohci_thread(LPVOID unused)
+ {
+     /* This thread calls recompiled code, so it needs what any thread running
+@@ -1065,8 +1161,43 @@
+     int      held_off_warned = 0, held_off_forced = 0, gated = 0;
+     unsigned last_ack = 0;
+     unsigned first_port = 0, settle = 0;
++    /* Blood Wake carried patch (lane au-iso): the arrival lines carry real
++     * time, the passes behind it and the host counter in ms (h=, the step
++     * log's clock). The waits here are counted in passes, and a pass is
++     * Sleep(s_tick_ms) plus the work, so their length in milliseconds is the
++     * host's to decide; "operational after" below still prints passes x 20. */
++    unsigned long passes = 0;
++    unsigned cfg_logged = 0;
++    char line[96];
++    LARGE_INTEGER t_freq, t_start;
+ 
+     (void)unused;
++    QueryPerformanceFrequency(&t_freq);
++    QueryPerformanceCounter(&t_start);
++    {
++        /* Blood Wake (au-usb): Remastered and later pass every 1 ms by default
++         * (BW_FIX USB_TICK_1MS); BW_USB_TICK_MS=1..4 picks the pass itself,
++         * 4 being the console's (the undo). Original keeps 4 always. */
++        const char *e = getenv("BW_USB_TICK_MS");
++        if (!bw_edition_at_least(BW_ED_REMASTERED)) {
++            if (e && *e)
++                fprintf(stderr, "  [OHCI0] BW_USB_TICK_MS=%s ignored: Original keeps the pad's 4 ms\n", e);
++        } else {
++            unsigned v = bw_fix_enabled(BW_FIX_USB_TICK_1MS) ? 1u : OHCI_TICK_MS;
++            const char *why = v == 1u ? "Remastered USB_TICK_1MS" : "the pad's own";
++            if (e && *e) {
++                unsigned u = (unsigned)atoi(e);
++                if (u >= 1 && u <= OHCI_TICK_MS) {
++                    v = u;
++                    why = "BW_USB_TICK_MS";
++                } else
++                    fprintf(stderr, "  [OHCI0] BW_USB_TICK_MS=%s is not 1-%u; keeping %u ms\n", e, OHCI_TICK_MS, v);
++            }
++            s_tick_ms = v;
++            fprintf(stderr, "  [OHCI0] report interval %u ms (%s; the pad's own is %u)\n",
++                    s_tick_ms, why, OHCI_TICK_MS);
++        }
++    }
+     {
+         uint32_t tib = xbox_AllocThreadTib();
+         if (!tib) {
+@@ -1083,14 +1214,35 @@
+         uint32_t control, enable, status;
+         uint32_t pass_done = 0;     /* this pass's done queue, newest first */
+ 
+-        Sleep(OHCI_TICK_MS);
++        Sleep(s_tick_ms);
++        passes++;
++        if (g_bw_lat_on) {
++            /* Blood Wake carried patch (au-usb, test aid): about once a second,
++             * this thread's CPU time and the whole process's (100 ns units,
++             * kernel + user), the passes so far, and the ISR's count and time
++             * (tools/bw_usbtick.py: what BW_USB_TICK_MS costs). Read-only. */
++            static int64_t s_lat_cpu_next;
++            int64_t now = bw_lat_now();
++            if (now >= s_lat_cpu_next) {
++                FILETIME c0, e0, k0, u0, c1, e1, k1, u1;
++                s_lat_cpu_next = now + t_freq.QuadPart;
++                if (GetThreadTimes(GetCurrentThread(), &c0, &e0, &k0, &u0)
++                    && GetProcessTimes(GetCurrentProcess(), &c1, &e1, &k1, &u1)) {
++#define BW_FT64(f) ((int64_t)(((uint64_t)(f).dwHighDateTime << 32) | (f).dwLowDateTime))
++                    bw_lat_ev(BW_LAT_CPU, now, BW_FT64(k0) + BW_FT64(u0), BW_FT64(k1) + BW_FT64(u1),
++                              (int64_t)passes, (int64_t)s_lat_isr_n, (int64_t)s_lat_isr_qpc,
++                              (int64_t)s_tick_ms, (double)BW_FT64(k0), (double)BW_FT64(k1));
++#undef BW_FT64
++                }
++            }
++        }
+         control = hc->reg[HcControl / 4];
+         enable  = hc->reg[HcInterruptEnable / 4];
+ 
+         /* Operational is HCFS == 10b in bits 7:6. Interrupting a controller
+          * the driver has not started yet is not a test of anything. */
+         if ((control & 0xC0u) != 0x80u) {
+-            if (++waited > 1500)              /* 30 s and it never started */
++            if (++waited > OHCI_PASSES(1500)) /* 30 s and it never started */
+                 break;
+             continue;
+         }
+@@ -1116,9 +1268,48 @@
+             plugged = 1;
+             s_plugged_pads = 1;
+             first_port = port;
+-            fprintf(stderr, "  [OHCI0] operational after %u ms; device "
+-                            "arriving on port %u\n", waited * 20, port + 1);
+-            fflush(stderr);
++            s_first_port = port;
++            snprintf(line, sizeof line, "operational after %u ms; device arriving on port %u",
++                     waited * 20, port + 1);
++            ohci_arrival_line(line, passes, &t_start, &t_freq);
++            /* Blood Wake carried patch (au-iso): the rest of the boot's pads
++             * at the same moment, each on its own port (s_attach_serial). */
++            while (!s_attach_serial && s_plugged_pads < s_npads) {
++                unsigned p = (first_port + (unsigned)s_plugged_pads) % s_ndp;
++                hc->reg[(HcRhPortStatus1 + p * 4) / 4] |= PORT_CCS | PORT_CSC;
++                s_plugged_pads++;
++                snprintf(line, sizeof line, "pad %d arriving on port %u with it",
++                         s_plugged_pads, p + 1);
++                ohci_arrival_line(line, passes, &t_start, &t_freq);
++            }
++        }
++
++        /* Blood Wake carried patch (au-iso): when each pad is configured
++         * (SET_CONFIGURATION done), once, for the arrival timing. */
++        for (int d = 0; d < s_plugged_pads && d < 4; d++)
++            if (!(cfg_logged & (1u << d)) && usb_gamepad_configured(d)) {
++                cfg_logged |= 1u << d;
++                snprintf(line, sizeof line, "pad %d configured", d + 1);
++                ohci_arrival_line(line, passes, &t_start, &t_freq);
++            }
++
 +        /* Blood Wake carried patch (0.2.5 item 73): with RECOMP_USB_PADS=auto,
 +         * a controller connected after the boot started joins too: once a
 +         * second the count is checked, and a new one is plugged in on the
@@ -62,7 +286,7 @@
 +         * controller that goes away leaves its port in place, reading
 +         * nothing pressed, until one connects again. */
 +        if (plugged && s_auto_pads && s_npads < USB_GAMEPAD_MAX
-+            && ++s_auto_tick >= 50) {          /* ~1 s */
++            && ++s_auto_tick >= OHCI_PASSES(50)) {  /* ~1 s */
 +            int now = xbox_InputConnectedCount();
 +            s_auto_tick = 0;
 +            if (now > s_npads) {
@@ -71,12 +295,55 @@
 +                fflush(stderr);
 +                s_npads = now;
 +            }
-+        }
-+
+         }
+ 
          /* More pads, one at a time: each arrives after the previous one is
-          * configured, on the next port, so the driver enumerates them in
-          * turn and there is only ever one device at the default address.
-@@ -1349,10 +1392,23 @@
+@@ -1127,13 +1318,13 @@
+          * RECOMP_USB_PADS sets how many (1-4). */
+         if (plugged && s_plugged_pads < s_npads
+             && usb_gamepad_configured(s_plugged_pads - 1)) {
+-            if (++settle > 50) {                 /* ~1 s after the last */
++            if (++settle > OHCI_PASSES(50)) {    /* 50 passes after the last */
+                 unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
+                 hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
+                 hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+-                fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
+-                        s_plugged_pads + 1, port + 1, 10);
+-                fflush(stderr);
++                snprintf(line, sizeof line, "pad %d arriving on port %u",
++                         s_plugged_pads + 1, port + 1);
++                ohci_arrival_line(line, passes, &t_start, &t_freq);
+                 s_plugged_pads++;
+                 settle = 0;
+             }
+@@ -1157,7 +1348,7 @@
+             uint32_t hcca = hc->reg[HcHCCA / 4];
+ 
+             hc->reg[HcFmNumber / 4] =
+-                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
++                (hc->reg[HcFmNumber / 4] + s_tick_ms) & 0xFFFFu;
+             /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
+              * controller zeroes, so a dword write is what hardware does. */
+             if (hcca)
+@@ -1268,7 +1459,7 @@
+              * the gate the try always succeeds and the leave takes nothing. */
+             gated = xbox_DispatchGateOn() ? xbox_DispatchGateTryEnter()
+                                           : !xbox_IrqlBlocksInterrupts();
+-            if (!gated && ++held_off <= OHCI_IRQ_HOLDOFF) {
++            if (!gated && ++held_off <= OHCI_PASSES(OHCI_IRQ_HOLDOFF)) {
+                 if (!held_off_warned) {
+                     held_off_warned = 1;
+                     fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
+@@ -1278,7 +1469,7 @@
+                 }
+                 continue;
+             }
+-            if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
++            if (held_off > OHCI_PASSES(OHCI_IRQ_HOLDOFF) && !held_off_forced) {
+                 held_off_forced = 1;
+                 fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
+                         "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
+@@ -1349,10 +1540,32 @@
              int n = atoi(ndpspec);
              if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
          }
@@ -94,6 +361,15 @@
              int n = atoi(padspec);
              if (n >= 1 && n <= USB_GAMEPAD_MAX) s_npads = n;
          }
++        {
++            /* Blood Wake carried patch (au-iso): BW_USB_ATTACH_SERIAL=1, the
++             * boot's pads one at a time as before (the undo; s_attach_serial). */
++            const char *ser = getenv("BW_USB_ATTACH_SERIAL");
++            s_attach_serial = ser && ser[0] == '1';
++            if (s_attach_serial && s_npads > 1)
++                fprintf(stderr, "  OHCI: BW_USB_ATTACH_SERIAL=1: the boot's pads one at a "
++                        "time, each 50 passes after the previous is configured\n");
++        }
 +        /* Blood Wake carried patch (0.2.5 item 74): a boot that ended with a
 +         * pad rumbling (a reboot in the middle of an explosion, a crash)
 +         * leaves it on; each boot starts with every motor off. */

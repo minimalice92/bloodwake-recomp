@@ -26,10 +26,12 @@
 #define COBJMACROS
 /* WIN32_LEAN_AND_MEAN comes from the build */
 #include "../bw_framelog.h"   /* P2b: BW_FRAMELOG test aid */
+#include "../bw_latlog.h"     /* lat-m: BW_LATLOG test aid */
 #include <math.h>   /* fabsf (flash_watch): an implicit declaration fails to link on newer toolsets */
 #include <windows.h>
 #include <intrin.h> /* __rdtsc (item 43's draw cpu measure) */
 #include <d3d11.h>
+#include <d3d11_4.h>   /* lat-m: ID3D11Fence for BW_LATLOG's GPU-done times */
 #include <dxgi1_6.h>   /* IDXGISwapChain2 (frame-latency waitable), IDXGIFactory5 (tearing),
                           IDXGIFactory6 (the high-performance adapter, item 27) */
 #include <d3dcompiler.h>
@@ -495,6 +497,10 @@ static void gpu_fatal(unsigned code, const char *msg)
                     MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
     fflush(stdout);
     fflush(stderr);
+    {
+        extern void bw_log_drain(int wait_ms);   /* au-vp: the log's ring to the file first (main.c) */
+        bw_log_drain(500);
+    }
     TerminateProcess(GetCurrentProcess(), code);
 }
 
@@ -6283,9 +6289,11 @@ static int s_present_wait_mode = -1; /* BW_GPU_PRESENT_WAIT=1: the old blocking 
 static unsigned s_cfg_sync;
 static int s_cfg_tear;
 static int s_cfg_readback = 1;
+static int s_cfg_hifps;             /* lat-q: this boot has Remastered's high frame rate */
 
 void bw_d3d11_present_config(unsigned sync_interval, int allow_tearing, int readback)
 {
+    s_cfg_hifps = 1;
     s_cfg_sync = sync_interval > 1 ? 1 : sync_interval;
     s_cfg_tear = allow_tearing;
     s_cfg_readback = readback;
@@ -6631,7 +6639,19 @@ static int swap_ensure(void)
             IDXGISwapChain2 *s2 = NULL;
             if (SUCCEEDED(IDXGISwapChain1_QueryInterface(s_swap, &IID_IDXGISwapChain2,
                                                          (void **)&s2))) {
-                IDXGISwapChain2_SetMaximumFrameLatency(s2, 2);
+                /* lat-q: BW_GPU_FRAMELAT=<1..3> (Remastered high frame rate
+                 * only; unset = 2, as always): how many presents may queue
+                 * before the waitable stops signalling. 1 = the screen takes
+                 * each frame before the next is presented. */
+                UINT ml = 2;
+                const char *fe = s_cfg_hifps ? getenv("BW_GPU_FRAMELAT") : NULL;
+                if (fe && *fe) {
+                    ml = (UINT)atoi(fe);
+                    if (ml < 1) ml = 1;
+                    if (ml > 3) ml = 3;
+                    fprintf(stderr, "[GPU-PRESENT] maximum frame latency %u (BW_GPU_FRAMELAT)\n", ml);
+                }
+                IDXGISwapChain2_SetMaximumFrameLatency(s2, ml);
                 s_swap_wait = IDXGISwapChain2_GetFrameLatencyWaitableObject(s2);
                 IDXGISwapChain2_Release(s2);
             }
@@ -7057,6 +7077,30 @@ static ID3D11ShaderResourceView *shown_picture(BwSurf *sf)
  * made meanwhile (with variable refresh, one per frame shown). Not every
  * mode reports them (a composed window may not): the line then says so. */
 static DWORD s_screen_wait_ms;          /* P2b: bw_d3d11_pace_config */
+/* lat-q: 1 while the NV2A thread waits on the present side (the present
+ * pacing, the screen, the GPU limit): BW_HIFPS_JIT=2 waits only then. */
+volatile LONG g_bw_present_waiting;
+/* ... and whether the last finished flip waited there at all (BW_HIFPS_JIT=2
+ * reads it: a flip that waited means the next frame would queue). */
+volatile LONG g_bw_last_flip_waited;
+/* ... and when the last flip reached the back end, before any of those
+ * waits (qpc ms): BW_HIFPS_JIT learns from it how long a pass takes to
+ * get its frame to the present. */
+volatile double g_bw_flip_ready_ms;
+/* ... and 1 while the present pacing itself waits (that frame's present
+ * hasn't happened yet: the next beat is one period after its slot). */
+volatile LONG g_bw_pace_waiting;
+/* ... and 1 while the frame cap is being reached (cap_watch, below:
+ * BW_HIFPS_JIT=3 turns just-in-time frames on only then). */
+volatile LONG g_bw_cap_reached;
+static int s_cap_watch;                 /* bw_d3d11_cap_watch */
+/* ... and the flips the back end has finished (after the GPU limit's wait):
+ * BW_HIFPS_JIT=4 counts the frames not yet through the NV2A thread. */
+volatile LONG g_bw_flips_done;
+/* ... and the presents the pacing has let through (its schedule advanced):
+ * BW_HIFPS_JIT=4 aims a pass at the slot after the ones still to come. */
+volatile LONG g_bw_paced_n;
+static int s_flip_waited;
 static unsigned s_screen_timeouts, s_screen_st_n;
 static double s_screen_st_ms;
 #define PST_N 256
@@ -7253,6 +7297,7 @@ static int gpu_present(BwSurf *sf)
          * until it signals again. BW_HIFPS_SCREENWAIT=0 restores. */
         DWORD to = (s_screen_wait_ms && s_screen_timeouts < 4) ? s_screen_wait_ms : 0, r;
         double tw = to ? qpc_ms() : 0.0;
+        g_bw_present_waiting = to != 0;     /* lat-q */
         if (screen_test_timeout()) {    /* BW_TEST_SCREENWAIT (test aid): as if timed out */
             if (to)
                 Sleep(to);
@@ -7260,12 +7305,15 @@ static int gpu_present(BwSurf *sf)
         } else {
             r = WaitForSingleObject(s_swap_wait, to);
         }
+        g_bw_present_waiting = 0;
         if (to) {
             double w = qpc_ms() - tw;
             if (w > 0.05) {
                 s_screen_st_n++;
                 s_screen_st_ms += w;
             }
+            if (w > 0.2)
+                s_flip_waited = 1;      /* lat-q */
         }
         if (r != WAIT_OBJECT_0) {
             if (to && ++s_screen_timeouts == 4)
@@ -7400,10 +7448,38 @@ static int s_lat_cfg;               /* the edition's default (bw_d3d11_latency_c
 static unsigned long s_lat_st_n, s_lat_st_sum, s_lat_st_most, s_lat_st_waits;
 static double s_lat_st_wait_ms, s_lat_st_wait_max;
 static HANDLE s_lat_timer;
+/* lat-q: the limit holds at any frame time (on by default since the audio
+ * release's gate, call INT-1; BW_GPU_LATENCY_HOLD=0 is 0.2.5's wait, given
+ * up after 100 ms, with its 100 us naps). Seen by lat-m under heavy
+ * GPU contention: with frames over 100 ms the old wait gave up every flip,
+ * so ~21 frames queued and each reached the GPU ~3 s after its present (7
+ * fps). Now the wait goes on while frames keep finishing; it ends only when
+ * none has finished for LAT_STALL_MS (a stalled GPU or a lost query: the
+ * old "never hang" guarantee, logged) or the device is lost (item 28's
+ * fatal path: checked every 50 ms of waiting). BW_TEST_LATSLOW=<ms> (test
+ * aid, never in a preset): a GPU that takes <ms> per frame, one frame after
+ * another (a frame counts as finished no sooner than <ms> after the later of
+ * its submit and the previous frame's simulated finish). */
+#define LAT_STALL_MS 3000.0
+static int s_lat_hold = -1;
+static int s_lat_serial;            /* lat-q: BW_GPU_LATENCY=s */
+static unsigned s_lat_slow_ms;
+static LONGLONG s_lat_sim[LAT_Q], s_lat_sim_last;     /* BW_TEST_LATSLOW, QPC ticks */
+static unsigned long s_lat_st_long, s_lat_st_stall;
+static int s_lat_env;               /* BW_GPU_LATENCY was set */
+static int s_lat_capped;            /* lat-q: the limit while the frame cap is reached */
 
 void bw_d3d11_latency_config(int max_frames)
 {
     s_lat_cfg = max_frames;
+}
+
+/* lat-q: the edition's limit while the frame cap is being reached
+ * (g_bw_cap_reached; 0 = the same as otherwise). BW_GPU_LATENCY overrides
+ * both. With BW_HIFPS_JIT=3 the cap's slack pays for the shorter queue. */
+void bw_d3d11_latency_capped(int max_frames)
+{
+    s_lat_capped = max_frames;
 }
 
 static int lat_max(void)
@@ -7412,15 +7488,32 @@ static int lat_max(void)
         const char *e = getenv("BW_GPU_LATENCY");
         if (e && *e == 'm')
             s_lat_max = LAT_Q - 2;              /* measure only */
-        else if (e && *e)
+        else if (e && *e == 's') {
+            /* lat-q: "serial", each flip waits until the GPU has finished
+             * that very frame (no frame left on the GPU: D-027's lowest
+             * latency, at a frame-rate cost where the GPU is the limit) */
+            s_lat_max = 1;
+            s_lat_serial = 1;
+        } else if (e && *e)
             s_lat_max = atoi(e);
         else
             s_lat_max = s_lat_cfg;
+        s_lat_env = e && *e;
         if (s_lat_max < 0) s_lat_max = 0;
         if (s_lat_max > LAT_Q - 2) s_lat_max = LAT_Q - 2;
         if (s_lat_max)
             fprintf(stderr, "[GPU-LAT] at most %d flipped frames unfinished on the GPU%s (BW_GPU_LATENCY)\n",
-                    s_lat_max, s_lat_max >= LAT_Q - 2 ? " (measuring only)" : "");
+                    s_lat_serial ? 0 : s_lat_max, s_lat_max >= LAT_Q - 2 ? " (measuring only)"
+                    : s_lat_serial ? ": each flip waits for its own frame (serial)" : "");
+        e = getenv("BW_GPU_LATENCY_HOLD");
+        s_lat_hold = !(e && e[0] == '0');       /* on (the audio release's gate, call INT-1); =0 is 0.2.5's wait */
+        e = getenv("BW_TEST_LATSLOW");
+        s_lat_slow_ms = e && *e ? (unsigned)atoi(e) : 0u;
+        if (s_lat_max && s_lat_max < LAT_Q - 2)
+            fprintf(stderr, "[GPU-LAT] the limit %s (BW_GPU_LATENCY_HOLD)%s\n",
+                    s_lat_hold ? "holds at any frame time; a wait ends only if no frame finishes for 3 s"
+                               : "is given up after 100 ms of waiting (the old wait)",
+                    s_lat_slow_ms ? "; BW_TEST_LATSLOW: as if the GPU took that long per frame (test aid)" : "");
     }
     return s_lat_max;
 }
@@ -7439,6 +7532,13 @@ static void lat_poll(int flush)
             if (FAILED(hr))
                 gpu_lost(hr, "the frame query");
             break;
+        }
+        if (s_lat_slow_ms) {
+            /* BW_TEST_LATSLOW (test aid, above): not finished until then */
+            LARGE_INTEGER c;
+            QueryPerformanceCounter(&c);
+            if (c.QuadPart < s_lat_sim[i])
+                break;
         }
         if (g_bw_fl_on)
             bw_fl_event(BW_FL_N_GPUDONE, s_lat_tail, bw_fl_us_since((unsigned long long)s_lat_t[i].QuadPart),
@@ -7469,34 +7569,88 @@ static void lat_flip(void)
     }
     ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_lat_q[i]);
     QueryPerformanceCounter(&s_lat_t[i]);
+    if (s_lat_slow_ms) {                        /* BW_TEST_LATSLOW: a serial GPU that slow */
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_lat_sim_last = (s_lat_sim_last > s_lat_t[i].QuadPart ? s_lat_sim_last : s_lat_t[i].QuadPart)
+                         + f.QuadPart * (LONGLONG)s_lat_slow_ms / 1000;
+        s_lat_sim[i] = s_lat_sim_last;
+    }
     s_lat_head++;
     s_lat_st_n++;
     s_lat_st_sum += s_lat_head - s_lat_tail;
     if (s_lat_head - s_lat_tail > s_lat_st_most)
         s_lat_st_most = s_lat_head - s_lat_tail;
+    if (s_lat_serial)
+        max = 0;                                /* lat-q: wait for this frame too */
+    else if (s_lat_capped && !s_lat_env && g_bw_cap_reached && max > s_lat_capped)
+        max = s_lat_capped;                     /* lat-q: the cap's limit, while it is reached */
     if (s_lat_head - s_lat_tail > (unsigned)max) {
         double t0 = qpc_ms(), w;
         unsigned before = s_lat_head - s_lat_tail, n = 0;
+        double t_prog = t0, t_dev = t0, now;
+        unsigned tail0 = s_lat_tail;
         if (!s_lat_timer)
             s_lat_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
                                                  TIMER_ALL_ACCESS);
-        lat_poll(1);                            /* submit what is queued */
+        lat_poll(1);                           /* submit what is queued */
+        g_bw_present_waiting = 1;               /* lat-q */
+        s_flip_waited = 1;
         while (s_lat_head - s_lat_tail > (unsigned)max) {
             LARGE_INTEGER due;
             if (++n < 4) {
                 SwitchToThread();
             } else {
-                due.QuadPart = -1000;           /* 100 us */
+                /* 100 us naps; with the hold, 1 ms ones once the wait is long (lat-q) */
+                due.QuadPart = s_lat_hold && qpc_ms() - t0 >= 20.0 ? -10000 : -1000;
                 if (s_lat_timer && SetWaitableTimer(s_lat_timer, &due, 0, NULL, NULL, FALSE))
                     WaitForSingleObject(s_lat_timer, 2);
                 else
                     Sleep(0);
             }
             lat_poll(0);
-            if (qpc_ms() - t0 > 100.0)
-                break;                          /* never hang on a lost query */
+            now = qpc_ms();
+            if (!s_lat_hold) {
+                if (now - t0 > 100.0)
+                    break;                      /* never hang on a lost query (the old wait) */
+                continue;
+            }
+            /* lat-q: the limit holds while frames keep finishing */
+            if (s_lat_tail != tail0) {
+                tail0 = s_lat_tail;
+                t_prog = now;
+            }
+            if (now - t_dev >= 50.0) {
+                /* BW_GPU_FAILTEST=gpuwait:<n> (test aid) reports it removed */
+                HRESULT why = BW_GPU_FT("gpuwait", DXGI_ERROR_DEVICE_REMOVED,
+                                        ID3D11Device_GetDeviceRemovedReason(s_dev));
+                t_dev = now;
+                if (FAILED(why)) {              /* item 28's fatal path: ends the boot */
+                    gpu_lost(DXGI_ERROR_DEVICE_REMOVED, "the frame-latency wait");
+                    break;
+                }
+                lat_poll(1);                    /* and let the driver submit again */
+            }
+            if (now - t_prog > LAT_STALL_MS) {
+                /* no frame finished for 3 s on a live device: a stalled GPU
+                 * or a lost query; never hang (logged, the first five) */
+                if (++s_lat_st_stall <= 5)
+                    fprintf(stderr, "[GPU-LAT] no frame finished in %.0f ms (frame %u, %u unfinished): the wait"
+                                    " gives up%s\n", LAT_STALL_MS, (unsigned)s_gen, s_lat_head - s_lat_tail,
+                            s_lat_st_stall == 5 ? "; later ones aren't logged" : "");
+                break;
+            }
         }
+        g_bw_present_waiting = 0;
         w = qpc_ms() - t0;
+        if (w > 100.0 && s_lat_hold) {
+            static int noted;
+            s_lat_st_long++;
+            if (!noted++)
+                fprintf(stderr, "[GPU-LAT] the GPU took over 100 ms for a frame (frame %u, waited %.0f ms): the"
+                                " limit holds (BW_GPU_LATENCY_HOLD; =0 gives 0.2.5's 100 ms give-up)\n",
+                        (unsigned)s_gen, w);
+        }
         s_lat_st_waits++;
         s_lat_st_wait_ms += w;
         if (w > s_lat_st_wait_max)
@@ -7511,9 +7665,11 @@ static void lat_stats_line(void)
     pace_stats_line();
     if (!s_lat_max || !s_lat_st_n)
         return;
-    fprintf(stderr, "[GPU-LAT] frames in flight %.2f mean, %lu most | waits %lu, %.1f ms (most %.1f)\n",
+    fprintf(stderr, "[GPU-LAT] frames in flight %.2f mean, %lu most | waits %lu, %.1f ms (most %.1f)"
+                    " | over 100 ms %lu, gave up %lu this boot\n",
             (double)s_lat_st_sum / s_lat_st_n, s_lat_st_most, s_lat_st_waits, s_lat_st_wait_ms,
-            s_lat_st_wait_max);
+            s_lat_st_wait_max, s_lat_st_long, s_lat_st_stall);
+    s_lat_st_long = 0;
     s_lat_st_n = s_lat_st_sum = s_lat_st_most = s_lat_st_waits = 0;
     s_lat_st_wait_ms = s_lat_st_wait_max = 0.0;
 }
@@ -7533,6 +7689,93 @@ static void lat_stats_line(void)
 static double s_pace_period_ms, s_pace_last_ms, s_pace_st_ms;
 static unsigned s_pace_st_n;
 static HANDLE s_pace_timer;
+/* 0.2.5 (item 64's check): the presents keep to a schedule. Each one used to
+ * be timed from the previous present as it actually happened, so every
+ * timer's late wake-up (about 0.1 ms) added up and the fixed caps landed
+ * 1-2% under (V on RC6: 240 -> 235.5, 144 -> 141.7, 120 -> 118.9, every
+ * present paced). Now the next present is due one period after the last
+ * one was due; a present a timer woke late for may come a little sooner
+ * after it, but never sooner than PACE_FLOOR of a period (at the 360 Hz
+ * display's 350 cap that is 2.79 ms, still longer than a refresh), and a
+ * frame more than a period late starts the schedule again from now (no
+ * catch-up burst). The timer also wakes PACE_SPIN_MS before, not 0.25 ms,
+ * so it is rarely late at all. BW_HIFPS_PACE_ABS=0 restores the old timing. */
+#define PACE_FLOOR   0.975
+#define PACE_SPIN_MS 0.4
+static double s_pace_next_ms;
+static int s_pace_abs = 1;
+/* lat-q: BW_HIFPS_PACE_ADAPT=1 (Remastered high frame rate, test switch):
+ * when frames come slower than the cap (the GPU or the game the slower
+ * side), the schedule's period follows what the frames sustain: the median
+ * of the last 32 present intervals times PACE_ADAPT_K, never below the cap's
+ * period. Seen on the maintainer's screen with just-in-time frames: presents
+ * followed each pass's own work (a pass with a game step takes ~2x one
+ * without), so their intervals spread 1.7 -> 3.2 ms; with a steady beat to
+ * aim at, JIT starts each pass its own work before the beat instead. */
+#define PACE_ADAPT_K 0.96
+static int s_pace_adapt;
+static float s_pace_iv[32];
+static unsigned s_pace_ivn;
+
+/* lat-q: BW_HIFPS_JIT=4 (the head start, a test switch): the schedule's
+ * period follows what the frames sustain. Replayed offline on the quiet
+ * slot's JIT logs (tools/bw_headstart.py, inferred): a steady beat at the
+ * frames' own rate, each pass started its own work before its beat even
+ * while the frame before is still on the NV2A thread, spreads the presents
+ * ~1.4 ms instead of JIT's 5.6 (as shipped 2.1). The beat: 2% longer when
+ * 4 of the last 32 presents came over a tenth of a period late, 1% shorter
+ * after 32 with none late; never under the cap's period or over 100 ms. */
+static int s_beat_auto;
+static double s_beat_T;
+static unsigned char s_bl[32];
+static unsigned s_bl_head, s_bl_n, s_bl_sum;
+static unsigned long s_beat_up, s_beat_down;
+
+void bw_d3d11_beat_auto(int on)
+{
+    s_beat_auto = on;
+}
+
+static void beat_tune(int late)
+{
+    if (s_beat_T < s_pace_period_ms)
+        s_beat_T = s_pace_period_ms;
+    if (s_bl_n == 32)
+        s_bl_sum -= s_bl[s_bl_head];
+    else
+        s_bl_n++;
+    s_bl[s_bl_head] = (unsigned char)(late != 0);
+    s_bl_sum += late != 0;
+    s_bl_head = (s_bl_head + 1) % 32u;
+    if (s_bl_sum >= 4) {
+        s_beat_T = s_beat_T * 1.02 < 100.0 ? s_beat_T * 1.02 : 100.0;
+        s_bl_n = s_bl_sum = 0;
+        s_beat_up++;
+    } else if (s_bl_n >= 32 && !s_bl_sum) {
+        s_beat_T = s_beat_T * 0.99 > s_pace_period_ms ? s_beat_T * 0.99 : s_pace_period_ms;
+        s_bl_n = 0;
+        s_beat_down++;
+    }
+}
+
+static double pace_period(void)
+{
+    float v[32];
+    unsigned n = s_pace_ivn < 32u ? s_pace_ivn : 32u, i, j;
+    double m;
+    if (s_beat_auto && s_beat_T > s_pace_period_ms)
+        return s_beat_T;
+    if (!s_pace_adapt || n < 16)
+        return s_pace_period_ms;
+    memcpy(v, s_pace_iv, n * sizeof v[0]);
+    for (i = 1; i < n; i++)
+        for (j = i; j > 0 && v[j - 1] > v[j]; j--) {
+            float x = v[j]; v[j] = v[j - 1]; v[j - 1] = x;
+        }
+    m = (double)v[n / 2] * PACE_ADAPT_K;
+    return m > s_pace_period_ms ? m : s_pace_period_ms;
+}
+static double s_pace_st_gap = -1.0;     /* BW_GPU_STATS: the shortest gap between presents */
 
 void bw_d3d11_pace_config(unsigned hz)
 {
@@ -7540,37 +7783,171 @@ void bw_d3d11_pace_config(unsigned hz)
     s_pace_period_ms = (hz && !(e && e[0] == '0')) ? 1000.0 / (double)hz : 0.0;
     e = getenv("BW_HIFPS_SCREENWAIT");
     s_screen_wait_ms = hz && !(e && e[0] == '0') ? 8u : 0u;
+    e = getenv("BW_HIFPS_PACE_ABS");
+    s_pace_abs = !(e && e[0] == '0');
+    s_pace_next_ms = 0.0;
+    e = getenv("BW_HIFPS_PACE_ADAPT");                  /* lat-q */
+    s_pace_adapt = s_pace_abs && e && e[0] == '1';
+    s_pace_ivn = 0;
+    if (s_pace_adapt && s_pace_period_ms > 0.0)
+        fprintf(stderr, "[GPU-PRESENT] the schedule follows the frames' own rate when they come slower"
+                        " than the cap (BW_HIFPS_PACE_ADAPT)\n");
     if (s_pace_period_ms > 0.0)
-        fprintf(stderr, "[GPU-PRESENT] presents at least %.3f ms apart (%u per second; BW_HIFPS_PACE=0 turns it off)\n",
-                s_pace_period_ms, hz);
+        fprintf(stderr, "[GPU-PRESENT] presents at least %.3f ms apart (%u per second%s; BW_HIFPS_PACE=0 turns it off)\n",
+                s_pace_period_ms, hz, s_pace_abs ? ", on a steady schedule" : ", timed from the last present (BW_HIFPS_PACE_ABS=0)");
+}
+
+/* When the next present is due (host ms, qpc_ms), the one answer for the
+ * limiter below and for anything that aims a frame at it (the latency
+ * batch's JIT pacing): the schedule, but never sooner than PACE_FLOOR of a
+ * period after the last present. */
+static double pace_due_ms(void)
+{
+    if (s_pace_abs && s_pace_next_ms > 0.0) {
+        double floor_ms = s_pace_last_ms + pace_period() * PACE_FLOOR;
+        return s_pace_next_ms > floor_ms ? s_pace_next_ms : floor_ms;
+    }
+    return s_pace_last_ms + s_pace_period_ms;
+}
+
+/* lat-q: is the frame cap being reached? (BW_HIFPS_JIT=3: just-in-time
+ * frames only while it is; bw_d3d11_cap_watch turns the watch on). Seen at
+ * a 120 cap: just-in-time frames keep the presents even there (spread 0.63
+ * ms) with the picture 16.7 -> 7.1 ms old; uncapped they spread the
+ * presents 2.2 -> 6.0 ms. Over the last 32 presents: reached when the
+ * median gap is within 2% of the cap's period and at most 4 came late (more
+ * than a tenth of a period after their slot); no longer reached when the
+ * median is 4% over or 12 came late. Each state holds at least 1 s; a
+ * release within 10 s of an engage (the cap didn't hold with the frames
+ * just in time; seen on a busy PC at a 90 cap: releases ~4 s after each
+ * engage, every ~5.5 s) makes the next engage wait 2 s, then 4, 8 ... 30 s
+ * (none again once an engage holds 10 s). The first twenty transitions are logged, all
+ * are counted (BW_GPU_STATS). */
+static float s_cap_iv[32];
+static unsigned char s_cap_late[32];
+static unsigned s_cap_ivn;
+static double s_cap_since_ms, s_cap_backoff_ms, s_cap_engaged_ms;
+static unsigned long s_cap_on_n, s_cap_off_n, s_cap_st_on, s_cap_st_n, s_cap_st_late;
+
+void bw_d3d11_cap_watch(int on)
+{
+    s_cap_watch = on;
+}
+
+static void cap_watch(double gap, double now, int late)
+{
+    float v[32];
+    unsigned n, i, j, nl = 0;
+    double med, p = s_pace_period_ms;
+    if (!s_cap_watch || p <= 0.0)
+        return;
+    s_cap_st_n++;
+    s_cap_st_on += g_bw_cap_reached != 0;
+    s_cap_st_late += late != 0;
+    s_cap_late[s_cap_ivn % 32u] = (unsigned char)(late != 0);
+    s_cap_iv[s_cap_ivn++ % 32u] = (float)(gap < 1000.0 ? gap : 1000.0);
+    n = s_cap_ivn < 32u ? s_cap_ivn : 32u;
+    if (n < 32 || now - s_cap_since_ms < 1000.0)
+        return;
+    memcpy(v, s_cap_iv, n * sizeof v[0]);
+    for (i = 1; i < n; i++)
+        for (j = i; j > 0 && v[j - 1] > v[j]; j--) {
+            float x = v[j]; v[j] = v[j - 1]; v[j - 1] = x;
+        }
+    for (i = 0; i < n; i++)
+        nl += s_cap_late[i];
+    med = (double)v[n / 2];
+    if (!g_bw_cap_reached) {
+        if (med <= p * 1.02 && nl <= 4 && now - s_cap_since_ms >= s_cap_backoff_ms) {
+            g_bw_cap_reached = 1;
+            s_cap_since_ms = s_cap_engaged_ms = now;
+            if (++s_cap_on_n <= 20)
+                fprintf(stderr, "[GPU-PRESENT] the frame cap is reached (median gap %.2f ms, cap %.2f, %u of 32"
+                                " late): just-in-time frames on (frame %u)\n", med, p, nl, (unsigned)s_gen);
+        }
+    } else {
+        if (now - s_cap_engaged_ms > 10000.0)
+            s_cap_backoff_ms = 0.0;             /* held long enough: no backoff */
+        if (med >= p * 1.04 || nl >= 12) {
+            g_bw_cap_reached = 0;
+            if (now - s_cap_engaged_ms < 10000.0)
+                s_cap_backoff_ms = s_cap_backoff_ms < 2000.0 ? 2000.0
+                                 : s_cap_backoff_ms * 2.0 > 30000.0 ? 30000.0 : s_cap_backoff_ms * 2.0;
+            s_cap_since_ms = now;
+            if (++s_cap_off_n <= 20)
+                fprintf(stderr, "[GPU-PRESENT] the frame cap is no longer reached (median gap %.2f ms, cap %.2f,"
+                                " %u of 32 late, %.1f s on): just-in-time frames off (frame %u; the next engage"
+                                " no sooner than %.0f s)\n", med, p, nl, (now - s_cap_engaged_ms) / 1000.0,
+                        (unsigned)s_gen, (s_cap_backoff_ms > 1000.0 ? s_cap_backoff_ms : 1000.0) / 1000.0);
+        }
+    }
 }
 
 static void pace_present(void)
 {
     double now, due;
+    int late;
     if (s_pace_period_ms <= 0.0)
         return;
     now = qpc_ms();
-    due = s_pace_last_ms + s_pace_period_ms;
+    due = pace_due_ms();
+    late = s_pace_last_ms > 0.0 && now > due + s_pace_period_ms * 0.1;   /* lat-q: cap_watch */
+    if (s_beat_auto && s_pace_last_ms > 0.0 && now < due + pace_period() * 4.0)
+        /* lat-q, BW_HIFPS_JIT=4: a frame over 4 periods late is a stall (a
+         * load, a busy GPU), not a beat a little too fast: not counted, so
+         * the beat doesn't climb through a stall and stay slow after it */
+        beat_tune(now > due + pace_period() * 0.1);
     if (s_pace_last_ms > 0.0 && now < due) {
-        double t0 = now;
-        /* sleep on a high-resolution timer to about 0.25 ms before, then
-         * spin the rest: a timer can only end late, so the gap is never short */
-        if (due - now > 0.35) {
+        double t0 = now, spin = s_pace_abs ? PACE_SPIN_MS : 0.25;
+        g_bw_present_waiting = 1;       /* lat-q */
+        g_bw_pace_waiting = 1;
+        s_flip_waited = 1;
+        /* sleep on a high-resolution timer to a little before, then spin
+         * the rest: a timer can only end late, so the gap is never short */
+        if (due - now > spin + 0.1) {
             LARGE_INTEGER d;
             if (!s_pace_timer)
                 s_pace_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
                                                       TIMER_ALL_ACCESS);
-            d.QuadPart = -(LONGLONG)((due - now - 0.25) * 10000.0);
+            d.QuadPart = -(LONGLONG)((due - now - spin) * 10000.0);
             if (s_pace_timer && SetWaitableTimer(s_pace_timer, &d, 0, NULL, NULL, FALSE))
                 WaitForSingleObject(s_pace_timer, 20);
         }
         while ((now = qpc_ms()) < due)
             YieldProcessor();
+        g_bw_present_waiting = 0;
+        g_bw_pace_waiting = 0;
         s_pace_st_ms += now - t0;
         s_pace_st_n++;
     }
+    if (s_pace_adapt && s_pace_last_ms > 0.0 && now - s_pace_last_ms < 100.0)
+        s_pace_iv[s_pace_ivn++ % 32u] = (float)(now - s_pace_last_ms);   /* lat-q */
+    if (s_pace_last_ms > 0.0)
+        cap_watch(now - s_pace_last_ms, now, late);                      /* lat-q */
+    if (s_pace_abs) {
+        double p = pace_period();
+        s_pace_next_ms = (s_pace_last_ms > 0.0 && now - due < p) ? due + p : now + p;
+    }
+    if (s_pace_last_ms > 0.0 && (s_pace_st_gap < 0.0 || now - s_pace_last_ms < s_pace_st_gap))
+        s_pace_st_gap = now - s_pace_last_ms;       /* BW_GPU_STATS: the shortest gap */
     s_pace_last_ms = now;
+    InterlockedIncrement(&g_bw_paced_n);                                 /* lat-q */
+}
+
+/* lat-q: the present pacing's next slot (qpc ms): 1 and *due_ms while the
+ * pacing is on and has paced a present; BW_HIFPS_JIT aims each pass at it. */
+int bw_d3d11_present_due(double *due_ms)
+{
+    if (s_pace_period_ms <= 0.0 || s_pace_last_ms <= 0.0)
+        return 0;
+    *due_ms = pace_due_ms();            /* B1's schedule: the one answer */
+    return 1;
+}
+
+/* lat-q: the schedule's period now (BW_HIFPS_PACE_ADAPT's, or the cap's) */
+double bw_d3d11_pace_period(void)
+{
+    return pace_period();
 }
 
 static void pace_stats_line(void)
@@ -7580,20 +7957,156 @@ static void pace_stats_line(void)
         s_screen_st_n = 0;
         s_screen_st_ms = 0.0;
     }
+    if (s_cap_watch && s_cap_st_n) {
+        fprintf(stderr, "[GPU-PRESENT] the frame cap reached for %lu of %lu presents, %lu late | just-in-time"
+                        " frames on %lu times, off %lu this boot\n",
+                s_cap_st_on, s_cap_st_n, s_cap_st_late, s_cap_on_n, s_cap_off_n);
+        s_cap_st_on = s_cap_st_n = s_cap_st_late = 0;
+    }
+    if (s_beat_auto && s_beat_T > 0.0)
+        fprintf(stderr, "[GPU-PRESENT] head start: the beat %.3f ms (%.1f per second), %lu longer and %lu shorter"
+                        " this boot\n", pace_period(), 1000.0 / pace_period(), s_beat_up, s_beat_down);
     if (!s_pace_st_n)
         return;
-    fprintf(stderr, "[GPU-PRESENT] paced %u presents, %.1f ms waited\n", s_pace_st_n, s_pace_st_ms);
+    fprintf(stderr, "[GPU-PRESENT] paced %u presents, %.1f ms waited, shortest gap %.3f ms\n",
+            s_pace_st_n, s_pace_st_ms, s_pace_st_gap);
     s_pace_st_n = 0;
     s_pace_st_ms = 0.0;
+    s_pace_st_gap = -1.0;
 }
 
+/* ---- BW_LATLOG (lat-m, test aid, every edition) --------------------------
+ * Per flip: the present call, the readback, and when the GPU finished the
+ * frame: a D3D11 fence is signalled after the present and a watcher thread
+ * waits on an event per flip (the D3D calls stay on this thread; the watcher
+ * only waits on Win32 events). On screen also DXGI's present count for the
+ * flip and its frame statistics, which say at which vblank which present
+ * reached the screen. Inert unless BW_LATLOG is set (bw_latlog.c). */
+#define LATF_RING 256
+static ID3D11Fence *s_latf;
+static ID3D11DeviceContext4 *s_latf_ctx;
+static ID3D11Device *s_latf_dev;
+static int s_latf_failed;
+static HANDLE s_latf_kick;
+static struct { long k; HANDLE ev; } s_latf_q[LATF_RING];
+static volatile LONG s_latf_head, s_latf_tail;     /* head: pushed (NV2A), tail: taken (watcher) */
+static unsigned long s_latf_skipped;
+static long s_lat_dumps;
+
+static DWORD WINAPI latf_watch(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        LONG tail = s_latf_tail;
+        if (tail == s_latf_head) {
+            WaitForSingleObject(s_latf_kick, 100);
+            continue;
+        }
+        {
+            HANDLE ev = s_latf_q[tail % LATF_RING].ev;
+            long k = s_latf_q[tail % LATF_RING].k;
+            if (WaitForSingleObject(ev, 2000) == WAIT_OBJECT_0)
+                bw_lat_ev(BW_LAT_GPU, bw_lat_now(), k, 0, 0, 0, 0, 0, 0.0, 0.0);
+            CloseHandle(ev);
+            InterlockedExchange(&s_latf_tail, tail + 1);
+        }
+    }
+}
+
+static void latf_signal(long k)
+{
+    HANDLE ev;
+    if (s_latf_failed || !s_dev || !s_ctx)
+        return;
+    if (s_latf_dev != s_dev) {                  /* first use, or a new device */
+        ID3D11Device5 *d5 = NULL;
+        if (s_latf) { ID3D11Fence_Release(s_latf); s_latf = NULL; }
+        if (s_latf_ctx) { ID3D11DeviceContext4_Release(s_latf_ctx); s_latf_ctx = NULL; }
+        s_latf_dev = s_dev;
+        if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_ID3D11Device5, (void **)&d5))
+            || FAILED(ID3D11Device5_CreateFence(d5, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Fence,
+                                                (void **)&s_latf))
+            || FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext4,
+                                                         (void **)&s_latf_ctx))) {
+            fprintf(stderr, "[BW] latency log: no D3D11 fence here; no GPU-done times\n");
+            s_latf_failed = 1;
+            if (d5) ID3D11Device5_Release(d5);
+            return;
+        }
+        ID3D11Device5_Release(d5);
+        if (!s_latf_kick) {
+            HANDLE th;
+            s_latf_kick = CreateEventW(NULL, FALSE, FALSE, NULL);
+            th = CreateThread(NULL, 0, latf_watch, NULL, 0, NULL);
+            if (th) {
+                SetThreadPriority(th, THREAD_PRIORITY_HIGHEST);
+                CloseHandle(th);
+            }
+        }
+    }
+    if (s_latf_head - s_latf_tail >= LATF_RING - 1) {
+        s_latf_skipped++;                       /* the watcher is behind: no time for this flip */
+        return;
+    }
+    ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!ev)
+        return;
+    if (FAILED(ID3D11DeviceContext4_Signal(s_latf_ctx, s_latf, (UINT64)k))
+        || FAILED(ID3D11Fence_SetEventOnCompletion(s_latf, (UINT64)k, ev))) {
+        CloseHandle(ev);
+        return;
+    }
+    s_latf_q[s_latf_head % LATF_RING].k = k;
+    s_latf_q[s_latf_head % LATF_RING].ev = ev;
+    InterlockedIncrement(&s_latf_head);
+    SetEvent(s_latf_kick);
+}
+
+static void lat_present_stats(long k)
+{
+    static UINT last_pc = 0xFFFFFFFFu;
+    UINT pc = 0;
+    DXGI_FRAME_STATISTICS st;
+    if (!s_swap)
+        return;
+    if (SUCCEEDED(IDXGISwapChain1_GetLastPresentCount(s_swap, &pc)))
+        bw_lat_ev(BW_LAT_PCOUNT, bw_lat_now(), k, pc, 0, 0, 0, 0, 0.0, 0.0);
+    memset(&st, 0, sizeof st);
+    if (SUCCEEDED(IDXGISwapChain1_GetFrameStatistics(s_swap, &st)) && st.PresentCount != last_pc) {
+        last_pc = st.PresentCount;
+        bw_lat_ev(BW_LAT_STATS, bw_lat_now(), st.PresentCount, st.PresentRefreshCount,
+                  st.SyncRefreshCount, st.SyncQPCTime.QuadPart, 0, 0, 0.0, 0.0);
+    }
+}
+
+static void bw_flip_body(void);
+
+/* lat-q: counts the flips the back end has finished (g_bw_flips_done) */
 static void bw_flip(void)
 {
+    bw_flip_body();
+    InterlockedIncrement(&g_bw_flips_done);
+}
+
+static void bw_flip_body(void)
+{
+    int64_t lat_t0 = 0, lat_tp = 0, lat_tp1 = 0, lat_trb = 0;
+    long lat_k = 0;
+    int lat_res = -1;
+    if (g_bw_lat_on) {
+        lat_t0 = bw_lat_now();
+        lat_k = InterlockedIncrement(&g_bw_lat_flips);
+        if (nv2a_pb_exec_flip_dumping())
+            bw_lat_ev(BW_LAT_DUMPED, lat_t0, lat_k, ++s_lat_dumps, 0, 0, 0, 0, 0.0, 0.0);
+    }
     stats_tick();
     check_holes();
     s_st_flips++;
-    if (!s_dev)
+    if (!s_dev) {
+        if (lat_t0)
+            bw_lat_ev(BW_LAT_FLIP, lat_t0, lat_k, -2, 0, 0, 0, bw_lat_now(), 0.0, 0.0);
         return;
+    }
     gs_unbind();                        /* item 43: the present and the effects draw without one */
     vsh_finish_compiled();              /* item 43: into the shader cache, drawn again or not */
     bw_gpu_debug_drain();               /* item 25: BW_GPU_DEBUG's messages, once a flip */
@@ -7618,9 +8131,20 @@ static void bw_flip(void)
         double t0 = (s_stats > 0 || trc_on()) ? qpc_ms() : 0.0, t1 = 0.0;
         unsigned long long fl_t0;
         int fl_pres;
+        s_flip_waited = 0;               /* lat-q: set by the waits below */
+        g_bw_flip_ready_ms = qpc_ms();
         pace_present();                  /* P2b: no sooner than 1/target after the last */
         fl_t0 = g_bw_fl_on ? bw_fl_ticks() : 0;
+        if (lat_t0)
+            lat_tp = bw_lat_now();
         fl_pres = gpu_present(shown);    /* before the readback's wait */
+        if (lat_t0) {
+            lat_tp1 = bw_lat_now();
+            lat_res = s_present_mode ? fl_pres : 2;
+            latf_signal(lat_k);
+            if (lat_res == 1)
+                lat_present_stats(lat_k);
+        }
         if (fl_t0)
             bw_fl_event(BW_FL_N_FLIP, bw_fl_us_since(fl_t0), s_present_mode ? (unsigned)fl_pres : 2u, s_gen);
         if (trc_on()) {
@@ -7645,8 +8169,11 @@ static void bw_flip(void)
             s_st_rb_ms += t2 - t1;
             if (t2 - t1 > s_st_rb_max) s_st_rb_max = t2 - t1;
         }
+        if (lat_t0)
+            lat_trb = bw_lat_now();
         lat_flip();                      /* P2b: GPU frames in flight (BW_GPU_LATENCY) */
-        ws_dump(shown);                  /* widescreen: the wide picture, when dumping */
+        g_bw_last_flip_waited = s_flip_waited;   /* lat-q: BW_HIFPS_JIT=2 */
+        ws_dump(shown);                 /* widescreen: the wide picture, when dumping */
         black_watch(s_cur);
         peek_write(s_cur);
         flash_watch(s_cur);
@@ -7688,6 +8215,8 @@ static void bw_flip(void)
     }
     s_gen++;
     bw_ab_frame(s_gen);              /* BW_GPU_AB: the next frame's parity */
+    if (lat_t0)
+        bw_lat_ev(BW_LAT_FLIP, lat_t0, lat_k, lat_res, lat_tp, lat_tp1, lat_trb, bw_lat_now(), 0.0, 0.0);
 }
 
 /* item 43: draw cpu (BW_GPU_STATS) around the clear and the screen-space draw */

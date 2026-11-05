@@ -106,7 +106,10 @@ void bw_edition_apply_image_fixes(const void *xbe, size_t xbe_size);
 
 /* Saves, before xbox_path_init (main.c). Returns the save root to hand to
  * xbox_path_init: NULL in Original (the toolkit's default,
- * %LOCALAPPDATA%\xboxrecomp, exactly as before the switch). For the other
+ * %LOCALAPPDATA%\xboxrecomp, exactly as before the switch), or
+ * BW_EDITION_SAVE_ROOT itself when that is set (test runs: Original's
+ * partition images and Z: unpack cache then stay out of the player's
+ * folder; docs/audio/iso.md). For the other
  * editions: <base>\editions\<name>, base = BW_EDITION_SAVE_ROOT or
  * %LOCALAPPDATA%\xboxrecomp. If RECOMP_SAVE_DIR is set (test runs), it is
  * moved to <RECOMP_SAVE_DIR>\editions\<name> the same way. On the first boot

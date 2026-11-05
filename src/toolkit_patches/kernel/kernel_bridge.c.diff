@@ -168,7 +168,18 @@
          end = (uint32_t)(((uint64_t)base + size + 0xFFFu) & ~(uint64_t)0xFFFu);
          if (end > mapped || end < page_base)
              end = mapped;
-@@ -2068,6 +2146,13 @@
+@@ -1846,6 +1924,10 @@
+                     waited);
+     }
+ 
++    {
++        extern void bw_log_drain(int wait_ms);   /* Blood Wake (au-vp): the log's ring before ExitProcess */
++        bw_log_drain(500);
++    }
+     xbox_HalReturnToFirmware(routine);
+ }
+ 
+@@ -2068,6 +2150,13 @@
      g_eax = (uint32_t)xbox_KeWaitForSingleObject(
          h, wait_reason, wait_mode,
          (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
@@ -182,7 +193,7 @@
  }
  
  /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
-@@ -2087,6 +2172,13 @@
+@@ -2087,6 +2176,13 @@
          return;
      g_eax = (uint32_t)xbox_NtWaitForSingleObject(
          handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
@@ -196,7 +207,7 @@
  }
  
  /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
-@@ -2152,6 +2244,14 @@
+@@ -2152,6 +2248,14 @@
      g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
          handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
@@ -211,7 +222,7 @@
  }
  
  /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
-@@ -2225,6 +2325,16 @@
+@@ -2225,6 +2329,16 @@
      g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
          count, handles, wait_type, (BOOLEAN)alertable,
          XBOX_TO_NATIVE(timeout_ptr));
@@ -228,7 +239,7 @@
  }
  
  /*
-@@ -2344,11 +2454,23 @@
+@@ -2344,11 +2458,23 @@
   * failure surfaced later somewhere unrelated. Report the code and stop
   * pretending the call succeeded.
   */
@@ -252,7 +263,110 @@
      g_eax = 0;
  }
  
-@@ -3224,9 +3346,39 @@
+@@ -2860,6 +2986,71 @@
+  * thread write the same words. */
+ enum { VBL_ACK_FAST_MS = 2, VBL_ACK_LATE_MS = 1000, VBL_ACK_SLOW_STEP_MS = 16 };
+ 
++/* Blood Wake carried patch (lane au-vp, docs/audio/vp.md): the watch that
++ * releases the XDK vblank DPC, prompt whatever the host's scheduling.
++ * The DPC runs on the timer thread holding the one-CPU gate and spins on
++ * PMC_INTR_0 until this thread sees its ack; a posted interrupt (the APU's:
++ * a trapped front end makes no sound meanwhile) waits for the gate. Seen
++ * with BW_APU_HOTSTAT's watch: the gate held 10-27 ms, dozens of times in a
++ * 130 s boot, on a quiet PC with the window covered or minimized, the timer
++ * thread spinning in the DPC's ack loop, preempted and running in turn. The
++ * watch's 2 ms of SwitchToThread can hand the rest of a slice to the very
++ * DPC spinning on the same core (parked cores, a background window), so the
++ * ack waited for the spinner's quantum, and its 1 ms waits last as long as
++ * the timer resolution, which Windows 11 may ignore for such a window. Now
++ * the watch runs at time-critical priority (it waits nearly all the time)
++ * and steps on a high-resolution waitable timer: 0.25 ms for the first 2 ms,
++ * then 1 ms, so it preempts a spinning DPC the moment a step ends.
++ * Scheduling only; every edition, always on. BW_VBL_ACK_HRT=0: the yields,
++ * the plain waits and the normal priority, as before. */
++static HANDLE vbl_ack_hrt(void)
++{
++#ifdef _WIN32
++    static XBOX_THREAD_LOCAL HANDLE t;
++    static XBOX_THREAD_LOCAL int tried;
++    static volatile LONG said;
++    if (!tried) {
++        const char *e = getenv("BW_VBL_ACK_HRT");
++        tried = 1;
++        if (!(e && e[0] == '0'))
++            t = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++                                       TIMER_ALL_ACCESS);
++        if (!InterlockedExchange(&said, 1)) {
++            fprintf(stderr, "  [KERNEL] BW the vblank ack's watch: %s (BW_VBL_ACK_HRT)\n",
++                    t ? "time-critical, 0.25 then 1 ms steps on a high-resolution timer (au-vp)"
++                      : "yields, then plain 1 ms waits, at normal priority (as before)");
++            fflush(stderr);
++        }
++    }
++    return t;
++#else
++    return NULL;
++#endif
++}
++
++/* One step of the watch: the rearm event or the step's end (step_us on the
++ * high-resolution timer; a plain step_ms wait without it). 1 on the event. */
++static int vbl_ack_step_us(HANDLE rearm, DWORD step_ms, DWORD step_us)
++{
++#ifdef _WIN32
++    HANDLE t = step_us ? vbl_ack_hrt() : NULL;
++    if (t) {
++        HANDLE hs[2];
++        LARGE_INTEGER due;
++        DWORD r;
++        hs[0] = rearm;
++        hs[1] = t;
++        due.QuadPart = -(LONGLONG)step_us * 10;
++        SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE);
++        r = WaitForMultipleObjects(2, hs, FALSE, 50);
++        if (r != WAIT_OBJECT_0 + 1)
++            CancelWaitableTimer(t);
++        return r == WAIT_OBJECT_0;
++    }
++#endif
++    return WaitForSingleObject(rearm, step_ms) == WAIT_OBJECT_0;
++}
++
+ int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                        volatile LONG *tick_busy, HANDLE rearm, long *late_ms)
+ {
+@@ -2882,12 +3073,17 @@
+         if (!*tick_busy && !(*pmc_intr & NV2A_PMC_INTR_PCRTC))
+             return XBOX_VBL_ACK_NONE;   /* nobody is waiting on it */
+         if (now - start <= VBL_ACK_FAST_MS) {
+-            SwitchToThread();
++            if (vbl_ack_hrt()) {         /* Blood Wake (au-vp): 0.25 ms steps, not a yield */
++                if (vbl_ack_step_us(rearm, 0, 250))
++                    return XBOX_VBL_ACK_REARMED;
++            } else {
++                SwitchToThread();
++            }
+             now = kernel_clock_ms();
+             continue;
+         }
+         step = now - start <= VBL_ACK_LATE_MS ? 1 : VBL_ACK_SLOW_STEP_MS;
+-        if (WaitForSingleObject(rearm, step) == WAIT_OBJECT_0) {
++        if (vbl_ack_step_us(rearm, step, step == 1 ? 1000 : 0)) {   /* Blood Wake (au-vp): 1 ms on the high-resolution timer */
+             /* The next vblank: it is that one's ack now. */
+             return XBOX_VBL_ACK_REARMED;
+         }
+@@ -2916,6 +3112,10 @@
+     int r = XBOX_VBL_ACK_ON_TIME;
+ 
+     (void)unused;
++#ifdef _WIN32
++    if (vbl_ack_hrt())                   /* Blood Wake (au-vp): it preempts a spinning DPC at once */
++        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++#endif
+     for (;;) {
+         long late_ms;
+ 
+@@ -3224,9 +3424,39 @@
   * edge, 0 when vblanks are off. */
  #define VBLANK_RESTART_NS 100000000ull
  
@@ -293,7 +407,7 @@
  }
  
  static int kernel_vblank_tick_ns(uint64_t now_ns, uint64_t *next_due_ns)
-@@ -3256,6 +3408,22 @@
+@@ -3256,6 +3486,22 @@
      *next_due_ns = vblank_due(t0_ns, count);
      kernel_vblank_count(kernel_clock_ms());
      kernel_vblank_raise();
@@ -316,7 +430,7 @@
      return 1;
  }
  
-@@ -3890,6 +4058,21 @@
+@@ -3890,6 +4136,21 @@
  {
      uint32_t status = STACK_ARG(0);
  
@@ -338,7 +452,7 @@
      /* Simple mapping of common status codes */
      switch (status) {
      case 0x00000000: g_eax = 0; break;          /* STATUS_SUCCESS → ERROR_SUCCESS */
-@@ -4191,6 +4374,39 @@
+@@ -4191,6 +4452,39 @@
      st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
                             file_attrs, share, disposition, options);
  
@@ -378,7 +492,7 @@
      if (NT_SUCCESS(st)) {
          bridge_write_handle(handle_va, h);
          bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
-@@ -5446,7 +5662,17 @@
+@@ -5446,7 +5740,17 @@
   * through the block table and takes the raw 32-bit guest VA. */
  static void bridge_ExFreePool(void)
  {
@@ -397,7 +511,7 @@
      g_eax = 0;
  }
  
-@@ -5643,6 +5869,9 @@
+@@ -5643,6 +5947,9 @@
      g_eax = (uint32_t)xbox_NtResumeThread(
          bridge_resolve_handle(STACK_ARG(0)),
          (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
@@ -407,7 +521,18 @@
  }
  
  /* ── ObfDereferenceObject (ordinal 250, fastcall: object in ecx)
-@@ -9241,7 +9470,8 @@
+@@ -6087,6 +6394,10 @@
+  * The implementation calls ExitProcess, so this never actually returns. */
+ static void bridge_HalInitiateShutdown(void)
+ {
++    {
++        extern void bw_log_drain(int wait_ms);   /* Blood Wake (au-vp): the log's ring before ExitProcess */
++        bw_log_drain(500);
++    }
+     xbox_HalInitiateShutdown();
+     g_eax = 0;
+ }
+@@ -9241,7 +9552,8 @@
                      bridge_run_thread_inline(fn, start_context1, start_context2);
                  } else {
                      bridge_spawn_guest_thread(fn, start_context1, start_context2,

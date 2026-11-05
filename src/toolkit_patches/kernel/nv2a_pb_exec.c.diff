@@ -1837,7 +1837,41 @@
      if (c != s_vbl_count) {
          s_vbl_count = c;
          s_vbl_moved_ns = now_ns;
-@@ -3744,10 +5089,129 @@
+@@ -3728,6 +5073,33 @@
+     return xbox_FlipHoldPoll(&s_flip_hold, c, now, ok);
+ }
+ 
++/* Blood Wake carried patch (lat-q): when the pending hold will release, on
++ * the host clock (xbox_HostNowNs), for Remastered's just-in-time frames
++ * (bw_hifps_hooks.c). 1 with *due_ns while a host-paced hold is pending
++ * (*due_ns = now if it is already due and the walk hasn't polled yet); 0
++ * when nothing is held or the hold isn't host-paced. Read from the game
++ * thread without a lock: a stale answer only makes the caller look again. */
++int bw_flip_hold_due(uint64_t *due_ns)
++{
++    unsigned hz = s_bw_pace_hz;
++    uint64_t now, k;
++    int32_t d;
++
++    if (!hz || !s_flip_hold.held)
++        return 0;
++    now = xbox_HostNowNs();
++    k = now * (uint64_t)hz / 1000000000ull;           /* bw_pace_count, unwrapped */
++    d = (int32_t)(s_flip_hold.target - (uint32_t)k);
++    if (!s_flip_hold.held)
++        return 0;
++    if (d <= 0) {
++        *due_ns = now;
++        return 1;
++    }
++    *due_ns = ((k + (uint64_t)d) * 1000000000ull + hz - 1) / hz;
++    return 1;
++}
++
+ /* The hold's line in the periodic [GPU] report, then reset. */
+ static void flip_hold_report(void)
+ {
+@@ -3744,10 +5116,129 @@
      h->held_ns = 0;
  }
  
@@ -1967,7 +2001,7 @@
      /* BACK_END_WRITE_SEMAPHORE_RELEASE. The title's pointer already names the
       * semaphore word; SET_SEMAPHORE_OFFSET is not added (in X-Men Legends it
       * held 0xFF000000 at times, which put the write outside guest memory). */
-@@ -3758,6 +5222,7 @@
+@@ -3758,6 +5249,7 @@
      }
      if (!inited) {
          inited = 1;
@@ -1975,7 +2009,7 @@
          s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
          /* Stencil state as the hardware resets it: GL_ALWAYS, masks 0xFF,
           * GL_KEEP, until the title says otherwise. */
-@@ -3913,6 +5378,8 @@
+@@ -3913,6 +5405,8 @@
          break;
      case 0x1E70: s_gpu.rc.stage_program = param; break;
      case 0x17F8: s_gpu.clip_plane_mode = param; break;
@@ -1984,7 +2018,7 @@
  
      /* Alpha test and fog. */
      case 0x0300: s_gpu.alpha_test = param; break;
-@@ -3959,6 +5426,11 @@
+@@ -3959,6 +5453,11 @@
              fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
@@ -1996,7 +2030,7 @@
          clear_surface(param);
          if (param & 0x01)                         /* Z */
              zbuf_clear();
-@@ -4015,6 +5487,7 @@
+@@ -4015,6 +5514,7 @@
  
      case NV097_ARRAY_ELEMENT16:
          /* Two 16-bit indices per parameter word. */
@@ -2004,7 +2038,7 @@
          if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
-@@ -4026,16 +5499,23 @@
+@@ -4026,16 +5526,23 @@
              s_gpu.idx[s_gpu.idx_count++] = param;
          break;
      case NV097_NO_OPERATION:
@@ -2030,7 +2064,7 @@
          return;
  
      case NV097_SET_FLIP_READ:
-@@ -4075,6 +5555,8 @@
+@@ -4075,6 +5582,8 @@
          if (s_ftrace == 2)
              fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                      s_gpu.drawn_offset, s_gpu.color_offset, 10);
@@ -2039,7 +2073,7 @@
          /* The stall ends when the buffer being read is the one just finished.
           * There is no scanout here to wait for, so that is now; when the
           * title may go on is the flip hold's (below). */
-@@ -4082,6 +5564,7 @@
+@@ -4082,6 +5591,7 @@
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -2047,7 +2081,7 @@
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -4108,6 +5591,20 @@
+@@ -4108,6 +5618,20 @@
                  xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
              }
          }
@@ -2068,7 +2102,7 @@
          {
              /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
               * report -- a consecutive sequence, which is what a headless
-@@ -4125,13 +5622,16 @@
+@@ -4125,13 +5649,16 @@
                      if (f) { fclose(f); on = 1; }
                  }
                  s_flip_dumping = on;
@@ -2086,7 +2120,7 @@
  
          if (verbose) {
              static unsigned n;
-@@ -4151,6 +5651,14 @@
+@@ -4151,6 +5678,14 @@
           * early. */
          if (nv2a_pb_exec_flip_pacing()) {
              extern int nv2a_pb_scan_in_call(void);
@@ -2101,7 +2135,7 @@
              xbox_FlipHoldStall(&s_flip_hold, stall_vbl, stall_ns,
                                 clock_ok && !nv2a_pb_scan_in_call());
          }
-@@ -4162,13 +5670,16 @@
+@@ -4162,13 +5697,16 @@
          s_gpu.xf_mode = param;
          break;
      case 0x1E98:                                  /* _PROGRAM_CXT_WRITE_EN */
@@ -2118,7 +2152,7 @@
          break;
      case 0x1EA4:                                  /* _CONSTANT_LOAD */
          nv2a_vsh_set_constant_load(param);
-@@ -4244,6 +5755,7 @@
+@@ -4244,6 +5782,7 @@
          }
          if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
              nv2a_vsh_program_word(param);
@@ -2126,7 +2160,7 @@
              break;
          }
          if (method >= 0x0B80 && method < 0x0C00) {    /* TRANSFORM_CONSTANT(i) */
-@@ -4509,6 +6021,11 @@
+@@ -4509,6 +6048,11 @@
              fprintf(stderr, " v%u:%u/%u", s_gpu.xf_fmt[j] >> 8,
                      s_gpu.xf_fmt[j] & 15, (s_gpu.xf_fmt[j] >> 4) & 15);
          fprintf(stderr, "\n");

@@ -81,6 +81,8 @@ set(GAME_SOURCES
     src/recomp_manual.c
     src/bw_profile.c
     src/bw_framelog.c         # BW_FRAMELOG: per-frame events and long-frame stacks (P2b, test aid)
+    src/bw_latlog.c           # BW_LATLOG: controller-latency timestamps (lat-m, test aid)
+    src/bw_padwatch.c         # BW_PADWATCH: when the game sees each pad (au-iso, test aid)
     src/bw_host.c
     src/bw_wait.c
     src/bw_state.c
@@ -340,7 +342,13 @@ bw_carried_patch(xbox_kernel "src/kernel/nv2a_pb_scan.c"
 # BW_APU_DSP=xemu; without it the stub's fold-down runs as before.
 add_subdirectory(src/xemu_dsp)
 target_sources(xbox_apu PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_xdsp.c)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_xdsp.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_wasapi.c    # lat-a: the WASAPI output (Remastered)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_out.c       # au-out: MMCSS, the rebuild worker, the device line
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_hot.c       # au-hot: BW_APU_HOTSTAT (a test aid, inert when off)
+    # BW_DSP_TRACE=<dir>: the DSP trace recorder (au-trace; a test aid, inert
+    # when unset; docs/audio/trace_format.md).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_dsp_trace.c)
 target_link_libraries(xbox_apu PUBLIC bw_xemu_dsp)
 # TK-36: PsCreateSystemThreadEx ignored CreateSuspended, so Bink's workers ran
 # before their mutex and exit event existed (BW_THREAD_SUSPEND=0 restores).

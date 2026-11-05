@@ -18,6 +18,8 @@
  *   present     the next Present reports DXGI_ERROR_DEVICE_REMOVED
  *   swapchain   a swap chain create attempt (E_ACCESSDENIED) or a ResizeBuffers
  *               (E_OUTOFMEMORY) fails (item 29; added to contract 5, call B1-5)
+ *   gpuwait     the GPU limit's long wait (BW_GPU_LATENCY, over 50 ms) finds the
+ *               device removed (DXGI_ERROR_DEVICE_REMOVED; lat-q, additive)
  * Each failure made on request is logged ("[GPU-FAILTEST] ..."), once per
  * rule (a rule with + logs its first three and then counts).
  *

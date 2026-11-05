@@ -1,34 +1,69 @@
 --- xboxrecomp/src/usb/usb_gamepad.c
 +++ src/toolkit_patches/usb/usb_gamepad.c
-@@ -1,4 +1,11 @@
+@@ -1,4 +1,14 @@
  /*
 + * Blood Wake carried patch of xboxrecomp v0.16.0 src/usb/usb_gamepad.c (MIT
 + * License, Copyright (c) 2026 sp00nz -- see ../xboxrecomp/LICENSE); the .diff
-+ * beside this file is the exact change. Two additions: '!' live pad lines
-+ * (tools/bw_autopilot2.py), and bw_pad_pulse (release 0.2.5, item 79: the
-+ * menus' mouse presses a player's own pad for a moment; bw_input_ext.h).
++ * beside this file is the exact change. Three additions: '!' live pad lines
++ * (tools/bw_autopilot2.py), bw_pad_pulse (release 0.2.5, item 79: the
++ * menus' mouse presses a player's own pad for a moment; bw_input_ext.h), and
++ * with BW_LATLOG set (lat-m, test aid) the pad script runs on the performance
++ * counter and logs the first report that carries each step and its release
++ * (src/bw_latlog.c).
 + */
 +/*
   * usb_gamepad.c -- an Xbox controller, as the console's USB stack expects it.
   *
   * Descriptors and the input report, from the USB 2.0 specification for the
-@@ -220,6 +227,7 @@
+@@ -220,6 +230,9 @@
  /* The host's own pad, through the layer that already maps one to XInput.
   * A real controller plugged into the PC drives this emulated one. */
  #include "../input/xinput_xbox.h"
 +#include "../input/bw_input_ext.h"   /* Blood Wake: bw_pad_pulse */
++#include "../../bw_latlog.h"          /* Blood Wake (lat-m): BW_LATLOG test aid */
++extern long bw_pad_game_clock_ms(void);   /* Blood Wake (au-orig): RECOMP_PAD_CLOCK=game, src/bw_padwatch.c */
  
  /*
   * The Xbox report is 20 bytes and fixed:
-@@ -316,6 +324,7 @@
+@@ -295,6 +308,9 @@
+  * Buttons: up down left right start back lthumb rthumb (the digital byte),
+  * a b x y black white lt rt (the analog bytes, reported fully pressed), and
+  * lleft lright lup ldown / rleft rright rup rdown (a stick at full throw).
++ * Blood Wake carried patch (lat-p, test aid): <button>@<percent> sets how far
++ * that entry's sticks and analog buttons go (rleft@40 is the right stick 40%
++ * to the left, lt@50 the trigger half way); without it, full throw as before.
+  * Every entry is printed as it fires, so a run log says what was pressed when.
+  *
+  * RECOMP_PAD_LIVE=<file> is the same thing driven while the title runs: each
+@@ -315,7 +331,9 @@
+     uint8_t pad;             /* which controller: "p2-a" is pad 1 */
      uint8_t stick;           /* full deflection: 1 L-left 2 L-right 4 L-up
                                  8 L-down, then the same four for the right */
-     int announced;
+-    int announced;
++    int announced;           /* Blood Wake (lat-m): 2 once its release is logged */
 +    int immediate;           /* Blood Wake carried patch: a '!' live step */
++    uint8_t amount;          /* Blood Wake carried patch (lat-p): '@' throw in %, 0 = full */
  } PadStep;
  
  static PadStep s_script[PAD_SCRIPT_MAX];
-@@ -485,17 +494,43 @@
+@@ -391,10 +409,15 @@
+             b += 3;
+         }
+         for (;;) {
+-            size_t n = strcspn(b, "+:,\r\n ");
++            size_t n = strcspn(b, "+:,@\r\n ");
+             if (!pad_button_bits(b, n, &st.digital, &st.analog, &st.stick))
+                 fprintf(stderr, "  PAD: unknown button \"%.*s\"\n", (int)n, b);
+             b += n;
++            if (*b == '@') {
++                /* lat-p: a partial throw for this entry's sticks and analog buttons */
++                unsigned long v = strtoul(b + 1, (char **)&b, 10);
++                st.amount = v >= 1 && v < 100 ? (uint8_t)v : 0;
++            }
+             if (*b != '+')
+                 break;
+             b++;
+@@ -485,17 +508,43 @@
                   * report, which is a different input from "down, then a". */
                  /* Serialised per pad: pad 2's throttle must not wait out
                   * pad 1's -- split-screen players press at the same time. */
@@ -78,7 +113,99 @@
                  fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
                  fflush(stderr);
                  npending = 0;
-@@ -556,6 +591,46 @@
+@@ -510,7 +559,9 @@
+ static void pad_script_apply(int pad, uint8_t *out)
+ {
+     static unsigned long t0;
++    static int64_t q0, qf;   /* Blood Wake (lat-m): BW_LATLOG's clock */
+     unsigned long now, t;
++    int64_t qnow = 0;
+     int i, j;
+ 
+     if (s_script_len < 0)
+@@ -519,17 +570,65 @@
+     if (!t0)
+         t0 = now;
+     t = now - t0;
++    if (g_bw_lat_on) {
++        /* Blood Wake carried patch (lat-m, test aid): with BW_LATLOG the
++         * script's clock is the performance counter, from the same first
++         * report, so a step is due at a known instant (to the microsecond,
++         * not GetTickCount's 15.6 ms tick), and the first report that
++         * carries it, and the first after its hold, are logged. */
++        qnow = bw_lat_now();
++        if (!q0) {
++            LARGE_INTEGER f;
++            QueryPerformanceFrequency(&f);
++            qf = f.QuadPart;
++            q0 = qnow;
++        }
++        t = (unsigned long)((qnow - q0) * 1000 / qf);
++    }
+     pad_live_poll(t);
+     if (s_script_len == 0)
+         return;
++    {
++        /* Blood Wake carried patch (lane au-orig, test aid; off unless set):
++         * RECOMP_PAD_CLOCK=game keys the script to the game's own clock
++         * (bw_pad_game_clock_ms, src/bw_padwatch.c: Blood Wake's weapons
++         * clock, 33 ms a game step, as BW_STEPLOG keys its lines), not the
++         * host's. A press then reaches the same game step in every run,
++         * whatever the PC's load, so two runs' step logs can be compared
++         * with input. Before the game's clock runs nothing scripted is due.
++         * Live steps (RECOMP_PAD_LIVE) keep the host clock. */
++        static int gclk = -1;
++        if (gclk < 0) {
++            const char *e = getenv("RECOMP_PAD_CLOCK");
++            gclk = e && (e[0] == 'g' || e[0] == 'G');
++            if (gclk)
++                fprintf(stderr, "  PAD: the script's times are the game's own clock (RECOMP_PAD_CLOCK=game)\n");
++        }
++        if (gclk) {
++            long g = bw_pad_game_clock_ms();
++            t = g > 0 ? (unsigned long)g : 0;
++        }
++    }
+     for (i = 0; i < s_script_len; i++) {
+         PadStep *st = &s_script[i];
+         if (st->pad != pad)
+             continue;
+-        if (t < st->at_ms || t >= st->at_ms + st->hold_ms)
++        if (t < st->at_ms || t >= st->at_ms + st->hold_ms) {
++            if (g_bw_lat_on && st->announced == 1 && t >= st->at_ms + st->hold_ms) {
++                unsigned long end = st->at_ms + st->hold_ms;
++                st->announced = 2;
++                bw_lat_ev(BW_LAT_RELEASE, qnow, i, q0 + (int64_t)end * qf / 1000, (int64_t)end,
++                          st->digital | (st->analog << 8) | (st->stick << 16) | ((int64_t)st->pad << 24),
++                          (int64_t)st->hold_ms, 0, 0.0, 0.0);
++            }
+             continue;
++        }
+         if (!st->announced) {
+             st->announced = 1;
++            if (g_bw_lat_on)
++                bw_lat_ev(BW_LAT_PRESS, qnow, i, q0 + (int64_t)st->at_ms * qf / 1000, (int64_t)st->at_ms,
++                          st->digital | (st->analog << 8) | (st->stick << 16) | ((int64_t)st->pad << 24),
++                          (int64_t)st->hold_ms, 0, 0.0, 0.0);
+             fprintf(stderr, "  PAD: t=%lu ms step %d (digital 0x%02X analog 0x%02X)\n",
+                     t, i, st->digital, st->analog);
+             fflush(stderr);
+@@ -537,10 +636,11 @@
+         out[2] |= st->digital;
+         for (j = 0; j < 8; j++)
+             if (st->analog & (1u << j))
+-                out[4 + j] = 0xFF;
++                out[4 + j] = st->amount ? (uint8_t)(255u * st->amount / 100u) : 0xFF;
+         if (st->stick) {
+-            /* Axes at 12..19: LX LY RX RY, signed 16-bit, up positive. */
+-            static const int16_t full = 32767;
++            /* Axes at 12..19: LX LY RX RY, signed 16-bit, up positive.
++             * lat-p: '@' scales the throw (test aid). */
++            const int16_t full = st->amount ? (int16_t)(32767L * st->amount / 100L) : 32767;
+             int16_t ax[4];
+             memcpy(ax, &out[12], sizeof ax);
+             if (st->stick & 0x01) ax[0] = (int16_t)-full;
+@@ -556,6 +656,46 @@
      }
  }
  
@@ -125,7 +252,16 @@
  int usb_gamepad_report(int pad, uint8_t *out, int max)
  {
      XBOX_INPUT_STATE state;
-@@ -611,6 +686,7 @@
+@@ -565,6 +705,8 @@
+ 
+     if (max < 20)
+         return 0;
++    if (g_bw_lat_on && pad == 0)            /* Blood Wake (lat-m): the report interval */
++        bw_lat_ev(BW_LAT_REPORT, bw_lat_now(), pad, 0, 0, 0, 0, 0, 0.0, 0.0);
+     memset(out, 0, 20);
+     out[0] = 0;
+     out[1] = 20;
+@@ -611,6 +753,7 @@
      if (xbox_InputGetState((DWORD)pad, &state) != 0) {
          out[2] = synth;
          pad_script_apply(pad, out);
@@ -133,7 +269,7 @@
          return 20;
      }
  
-@@ -628,5 +704,6 @@
+@@ -628,5 +771,6 @@
      out[18] = (uint8_t)(g->sThumbRY & 0xFF);
      out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
      pad_script_apply(pad, out);

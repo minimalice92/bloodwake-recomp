@@ -1,6 +1,6 @@
 --- xboxrecomp/src/apu/apu_xaudio2.c
 +++ src/toolkit_patches/apu/apu_xaudio2.c
-@@ -4,6 +4,14 @@
+@@ -4,6 +4,21 @@
   * Provides low-latency audio output via XAudio2 (Win7+).
   * Called from the APU monitor frame to submit mixed samples.
   * Falls back gracefully if XAudio2 is unavailable.
@@ -10,20 +10,92 @@
 + * bw_surround_output_wanted() says so for the device found; otherwise it is
 + * as before (2 channels into a 2-channel mastering voice). And (0.2.5 item
 + * 68) a lost or changed audio device is rebuilt on the default one: see
-+ * xa2_check_device. The original file is xboxrecomp/src/apu/apu_xaudio2.c
-+ * (sha256 guarded in CMakeLists.txt).
++ * xa2_check_device. And (lat-a; every edition's default since 0.3.0, lane
++ * au-orig) the same contract can run on a WASAPI shared-mode stream instead
++ * of XAudio2 (bw_apu_wasapi.c): see "Two outputs" below. And (au-out, the
++ * audio rework's output lane, docs/audio/out.md) a lost or changed device is
++ * opened on a worker and swapped in at a period boundary (every edition,
++ * call AO-3; BW_AUDIO_REBUILD_WORKER), each open names its device in one line ("[XA2]
++ * output device:"), and the WASAPI output is event-driven with its pacing
++ * marks in samples (xa2_wait_event, xa2_marks_samples). The original file is
++ * xboxrecomp/src/apu/apu_xaudio2.c (sha256 guarded in CMakeLists.txt).
   */
  
  #include <stdint.h>
-@@ -19,12 +27,15 @@
+@@ -19,12 +34,80 @@
  #define COBJMACROS
  #include <windows.h>
  #include <xaudio2.h>
 +#include <mmdeviceapi.h>     /* Blood Wake (item 68): the default-device notice */
++#include <audioclient.h>     /* Blood Wake (lat-a): the device's periods, read only */
++#include "../../bw_latlog.h" /* Blood Wake (lat-a): BW_LATLOG test aid (press to sound) */
++#include "bw_apu_hot.h"      /* Blood Wake (au-hot): BW_APU_HOTSTAT, a test aid */
++#include "bw_apu_wasapi.h"   /* Blood Wake (lat-a): the WASAPI output (Remastered) */
++#include "bw_apu_out.h"      /* Blood Wake (au-out): the rebuild worker, the device line */
++#include "../../bw_edition.h"
  
  #pragma comment(lib, "xaudio2.lib")
  #pragma comment(lib, "ole32.lib")
  
++/* ---- Blood Wake (lat-a, test aids; inert unless switched on) -------------
++ *
++ * BW_LATLOG (src/bw_latlog.c) also gets, from here: each device buffer
++ * submitted (B: the WAV index of its first sample, the buffers queued before,
++ * the samples played then), each XAudio2 processing pass of the source voice
++ * (J: the bytes it still needed, the samples played), and about once a second
++ * XAudio2's own performance data (K: CurrentLatencyInSamples, its glitch
++ * count). At init it reads (never changes) the default device's periods.
++ *
++ * BW_XA2_STATS=1 (also on with BW_LATLOG): the source voice's passes that
++ * found it short of samples (OnVoiceProcessingPassStart's BytesRequired > 0
++ * after the first submit: that pass played silence for the missing part), a
++ * glitch count that does not depend on the device buffer size or on how often
++ * the queue is polled; printed every 5 s and at shutdown as [XA2-STAT]. */
++static int g_xa2_stat_on;              /* BW_XA2_STATS or BW_LATLOG */
++static volatile LONG g_xa2_passes, g_xa2_starved_passes, g_xa2_drain_passes;
++static volatile LONG64 g_xa2_starved_bytes;
++static volatile LONG g_xa2_draining;   /* xa2_expect_drain until the next submit */
++static uint64_t g_xa2_accepted;        /* samples handed to xa2_submit_samples (= the WAV index) */
++static uint64_t g_xa2_buf_first;       /* that index of the staged buffer's first sample */
++static uint64_t g_xa2_submitted;       /* samples submitted to the voice, all rebuilds */
++static ULONGLONG g_xa2_stat_next, g_xa2_perf_next;
++
++/* ---- Blood Wake (lat-a): two outputs -------------------------------------
++ *
++ * g_wa = 1: this boot writes to a WASAPI shared-mode stream (bw_apu_wasapi.c,
++ * bw_wa_wanted: every edition by default since 0.3.0; BW_AUDIO_OUT=xaudio2
++ * keeps XAudio2) instead of an XAudio2 source voice. Everything above the device stays the
++ * same: the pacing reads the queue (here the stream's padding: frames written
++ * and not yet read by Windows' engine, exact), each period is written as it
++ * is made (no 512-sample staging), the rebuild on a lost or changed device,
++ * the wait while there is none, BW_TEST_AUDIO_LOST and BW_AUDIO_REBUILD, the
++ * underrun count and the played count. If the stream can't be opened at boot
++ * for any reason but "no device", the boot falls back to XAudio2.
++ *
++ * Short passes (BW_XA2_STATS / BW_LATLOG, both outputs): either engine reads
++ * 480 frames a pass at 48 kHz (XAudio2's quantum, and the shared engine's
++ * period on this PC), so the played count moves in whole passes; a move that
++ * is not a whole number of passes is a pass that found fewer frames than it
++ * needed and played silence for the rest. The same count for both outputs,
++ * from the same polls; on XAudio2 the voice callback's count checks it. */
++static int g_wa;
++static uint64_t g_st_played_last;
++static long g_st_short;
++static int64_t g_st_short_frames;
++static int64_t g_st_last_poll_qpc;
++/* au-out: the engine's pass is the WASAPI stream's period (480 frames at a
++ * 10 ms period; IAudioClient3's where smaller); XAudio2's quantum is 480 */
++static int xa2_pass(void)
++{
++    int p = g_wa ? bw_wa_period() : 0;
++    return p > 0 ? p : 480;
++}
++#define XA2_PASS xa2_pass()
++static void xa2_slack_note(int pad, int n);   /* au-out, below */
++static int g_lead_auto;                        /* au-lat: BW_WASAPI_LEAD=auto, below */
++static int g_spread;                           /* au-orig: BW_WASAPI_SPREAD, below */
++static void xa2_slack_line(void);
++
  #define XA2_SAMPLE_RATE   48000
 -#define XA2_CHANNELS      2
 +static int g_xa2_channels = 2;          /* Blood Wake: 2, or 6 for 5.1 */
@@ -32,7 +104,7 @@
  /* Device buffer size and count. Defaults 512 x 4 (10.7 ms each, 43 ms
   * worst case queued); RECOMP_AUDIO_BUF_SAMPLES and RECOMP_AUDIO_BUF_COUNT
   * override them at xa2_init, clamped to the static storage below. */
-@@ -59,7 +70,7 @@
+@@ -59,7 +142,7 @@
   * XA2_NUM_BUFS slots the staging buffer was the oldest queued one, and
   * filling it overwrote audio the device had not played yet. */
  #define XA2_RING (XA2_NUM_BUFS + 1)
@@ -41,7 +113,7 @@
  static int                     g_xa2_next_buf = 0;
  static int                     g_xa2_fill = 0;  /* samples staged in bufs[next_buf] */
  static unsigned  g_xa2_underruns;
-@@ -68,11 +79,410 @@
+@@ -68,11 +151,1016 @@
  static int                     g_xa2_initialized = 0;
  static int                     g_xa2_frames_written = 0;
  
@@ -70,19 +142,26 @@
 + * and the boot stayed silent to its end. Now apu_core.c calls
 + * xa2_poll_stalled each period while the queue is stalled: a flagged loss is
 + * acted on there, and a device that has taken no sound for a second counts as
-+ * lost (at most every 5 s).
++ * lost (at most every 5 s). Every edition, on either output.
 + *
 + * Test switches (any edition; never in a preset):
 + *   BW_TEST_AUDIO_LOST=<ms>[,<ms>...]  at those times after init, behave as if
 + *       the device were lost: the voice stops consuming and the flag is set,
 + *       as OnCriticalError would
 + *   BW_TEST_AUDIO_STALL=<ms>[,<ms>...]  (item 105) at those times after init,
-+ *       the voice stops taking sound with no error and no notice
++ *       the voice (or the WASAPI stream) stops taking sound with no error and
++ *       no notice
 + *   BW_TEST_AUDIO_NODEVICE=<from>-<to>  (item 105) opens in that window (ms
 + *       after the first open) fail as if Windows had no output device
++ *   BW_TEST_AUDIO_NEWDEFAULT=<ms>[,<ms>...]  (au-out) at those times after
++ *       init, Windows' default-device notice, the device staying
++ *   BW_TEST_AUDIO_DEVICE=<part of a name>  (au-out) every open takes that
++ *       active output instead of Windows' default (bw_apu_out.c), so a
++ *       second device is measured without changing the default
 + *   BW_AUDIO_REBUILD=0  no rebuild (the old behaviour, for comparing) */
 +static volatile LONG g_xa2_lost;       /* 0, or why: 1 critical error, 2 new default device, 3 test,
-+                                        * 4 no sound taken for a second while stalled (item 105) */
++                                        * 4 no sound taken for a second while stalled (item 105),
++                                        * 5 a failing WASAPI call (lat-a) */
 +static volatile LONG g_xa2_lost_hr;
 +static uint64_t  g_xa2_played_base;   /* samples the voices before the last rebuild played */
 +static unsigned  g_xa2_rebuilds;
@@ -100,6 +179,35 @@
 +}
 +static IXAudio2EngineCallbackVtbl s_ecb_vtbl = { ecb_pass_start, ecb_pass_end, ecb_critical };
 +static IXAudio2EngineCallback s_ecb = { &s_ecb_vtbl };
++
++/* Blood Wake (lat-a): the source voice's callback (BW_XA2_STATS / BW_LATLOG
++ * only), on XAudio2's own thread once per processing pass. */
++static void STDMETHODCALLTYPE vcb_pass_start(IXAudio2VoiceCallback *t, UINT32 bytes)
++{
++    (void)t;
++    g_xa2_passes++;
++    if (bytes && g_xa2_submitted) {
++        if (g_xa2_draining)
++            g_xa2_drain_passes++;
++        else {
++            g_xa2_starved_passes++;
++            g_xa2_starved_bytes += bytes;
++        }
++    }
++    if (g_bw_lat_on && g_xa2_source) {
++        XAUDIO2_VOICE_STATE st;
++        IXAudio2SourceVoice_GetState(g_xa2_source, &st, 0);
++        bw_lat_ev(BW_LAT_XPASS, bw_lat_now(), bytes, (int64_t)(g_xa2_played_base + st.SamplesPlayed),
++                  st.BuffersQueued, (int64_t)g_xa2_submitted, g_xa2_draining, 0, 0.0, 0.0);
++    }
++}
++static void STDMETHODCALLTYPE vcb_void(IXAudio2VoiceCallback *t) { (void)t; }
++static void STDMETHODCALLTYPE vcb_ctx(IXAudio2VoiceCallback *t, void *c) { (void)t; (void)c; }
++static void STDMETHODCALLTYPE vcb_err(IXAudio2VoiceCallback *t, void *c, HRESULT e)
++{ (void)t; (void)c; (void)e; }
++static IXAudio2VoiceCallbackVtbl s_vcb_vtbl = { vcb_pass_start, vcb_void, vcb_void, vcb_ctx, vcb_ctx,
++                                                vcb_ctx, vcb_err };
++static IXAudio2VoiceCallback s_vcb = { &s_vcb_vtbl };
 +
 +static const GUID k_iid_unknown = { 0x00000000, 0x0000, 0x0000,
 +                                    { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
@@ -145,6 +253,10 @@
 +/* Destroy the voices and the engine (the COM state stays). */
 +static void xa2_release(void)
 +{
++    if (g_wa) {                          /* Blood Wake (lat-a) */
++        bw_wa_release();
++        return;
++    }
 +    if (g_xa2_source) {
 +        IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
 +        IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
@@ -162,7 +274,8 @@
 +}
 +
 +/* BW_TEST_AUDIO_NODEVICE (item 105): an open in the window fails as if Windows
-+ * had no output device. */
++ * had no output device (0x80070490), for the no-device wait and its retries
++ * (0-8000: no device at start). On either output (lat-a). */
 +static int xa2_test_nodevice(int quiet)
 +{
 +    static int parsed;
@@ -188,21 +301,51 @@
 +    return 0;
 +}
 +
-+/* The engine, a mastering voice on the default device, and the source voice,
-+ * started. At boot it also decides the layout (5.1 or stereo); a rebuild
-+ * keeps it. quiet: no failure lines (retries while no device is there). */
-+static HRESULT xa2_open(int boot, int quiet)
++/* Blood Wake (au-out): the XAudio2 objects of one output, so a rebuild can
++ * open a new set on the output worker while the frame thread keeps the live
++ * one (the globals) until the swap. */
++typedef struct {
++    IXAudio2               *x;
++    IXAudio2MasteringVoice *m;
++    IXAudio2SourceVoice    *s;
++} Xa2Set;
++static Xa2Set s_xa_next;
++
++static void xa2_set_release(Xa2Set *o)
++{
++    if (o->s) {
++        IXAudio2SourceVoice_Stop(o->s, 0, XAUDIO2_COMMIT_NOW);
++        IXAudio2SourceVoice_FlushSourceBuffers(o->s);
++        o->s->lpVtbl->DestroyVoice(o->s);
++    }
++    if (o->m)
++        o->m->lpVtbl->DestroyVoice(o->m);
++    if (o->x)
++        IXAudio2_Release(o->x);
++    memset(o, 0, sizeof *o);
++}
++
++/* The engine, a mastering voice on the default device, and the source voice
++ * (started unless start is 0: a set opened on the worker starts at the swap).
++ * At boot it also decides the layout (5.1 or stereo); a rebuild keeps it.
++ * quiet: no failure lines (retries while no device is there). */
++static HRESULT xa2_open_set(Xa2Set *o, int boot, int quiet, int start)
 +{
 +    HRESULT hr;
 +    WAVEFORMATEX wfx = { 0 };
 +
-+    hr = XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
-+    if (FAILED(hr) || !g_xa2) {
++    /* lat-a test switches (any edition; never in a preset): XAudio2's own
++     * flags, hex (BW_XA2_CREATE_FLAGS for XAudio2Create, BW_XA2_MASTER_FLAGS
++     * for the mastering voice, e.g. 10000 = XAUDIO2_NO_VIRTUAL_AUDIO_CLIENT) */
++    UINT32 cflags = (UINT32)strtoul(getenv("BW_XA2_CREATE_FLAGS") ? getenv("BW_XA2_CREATE_FLAGS") : "0", NULL, 16);
++    UINT32 mflags = (UINT32)strtoul(getenv("BW_XA2_MASTER_FLAGS") ? getenv("BW_XA2_MASTER_FLAGS") : "0", NULL, 16);
++    hr = XAudio2Create(&o->x, cflags, XAUDIO2_DEFAULT_PROCESSOR);
++    if (FAILED(hr) || !o->x) {
 +        if (!quiet)
 +            fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
 +        return FAILED(hr) ? hr : E_FAIL;
 +    }
-+    IXAudio2_RegisterForCallbacks(g_xa2, &s_ecb);
++    IXAudio2_RegisterForCallbacks(o->x, &s_ecb);
 +    if (xa2_test_nodevice(quiet))        /* item 105's test switch */
 +        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 +
@@ -212,21 +355,23 @@
 +    {
 +        int dev_ch = 2;
 +        XAUDIO2_VOICE_DETAILS det;
-+        hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
-+            XAUDIO2_DEFAULT_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
-+        if (SUCCEEDED(hr) && g_xa2_master) {
-+            g_xa2_master->lpVtbl->GetVoiceDetails(g_xa2_master, &det);
++        wchar_t tdev[400];               /* au-out: BW_TEST_AUDIO_DEVICE (a test), or the default */
++        LPCWSTR dev_id = bw_out_test_device_xa2(tdev, sizeof tdev / sizeof tdev[0]) ? tdev : NULL;
++        hr = IXAudio2_CreateMasteringVoice(o->x, &o->m,
++            XAUDIO2_DEFAULT_CHANNELS, XA2_SAMPLE_RATE, mflags, dev_id, NULL, 0);
++        if (SUCCEEDED(hr) && o->m) {
++            o->m->lpVtbl->GetVoiceDetails(o->m, &det);
 +            dev_ch = (int)det.InputChannels;
 +        }
 +        if (boot)
 +            g_xa2_channels = bw_surround_output_wanted(dev_ch) ? 6 : 2;
-+        if (g_xa2_master && (FAILED(hr) || (g_xa2_channels == 2 && dev_ch != 2))) {
-+            g_xa2_master->lpVtbl->DestroyVoice(g_xa2_master);
-+            g_xa2_master = NULL;
++        if (o->m && (FAILED(hr) || (g_xa2_channels == 2 && dev_ch != 2))) {
++            o->m->lpVtbl->DestroyVoice(o->m);
++            o->m = NULL;
 +        }
-+        if (!g_xa2_master)
-+            hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
-+                2, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
++        if (!o->m)
++            hr = IXAudio2_CreateMasteringVoice(o->x, &o->m,
++                2, XA2_SAMPLE_RATE, mflags, dev_id, NULL, 0);
 +        if (boot || SUCCEEDED(hr))
 +            fprintf(stderr, "[XA2] the audio device has %d channels; output: %s\n", dev_ch,
 +                    g_xa2_channels == 6 ? "5.1 (6 channels)" : "stereo");
@@ -257,11 +402,12 @@
 +        wfe.Samples.wValidBitsPerSample = 16;
 +        wfe.dwChannelMask = 0x3F;                    /* FL FR FC LFE BL BR */
 +        wfe.SubFormat = pcm;
-+        hr = IXAudio2_CreateSourceVoice(g_xa2, &g_xa2_source,
-+            (const WAVEFORMATEX *)&wfe, 0, XAUDIO2_DEFAULT_FREQ_RATIO, NULL, NULL, NULL);
++        hr = IXAudio2_CreateSourceVoice(o->x, &o->s,
++            (const WAVEFORMATEX *)&wfe, 0, XAUDIO2_DEFAULT_FREQ_RATIO,
++            g_xa2_stat_on ? &s_vcb : NULL, NULL, NULL);
 +    } else {
-+        hr = IXAudio2_CreateSourceVoice(g_xa2, &g_xa2_source,
-+            &wfx, 0, XAUDIO2_DEFAULT_FREQ_RATIO, NULL, NULL, NULL);
++        hr = IXAudio2_CreateSourceVoice(o->x, &o->s,
++            &wfx, 0, XAUDIO2_DEFAULT_FREQ_RATIO, g_xa2_stat_on ? &s_vcb : NULL, NULL, NULL);
 +    }
 +    if (FAILED(hr)) {
 +        if (!quiet)
@@ -269,25 +415,116 @@
 +        return hr;
 +    }
 +
-+    hr = IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
-+    if (FAILED(hr)) {
-+        if (!quiet)
-+            fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
-+        return hr;
++    if (start) {
++        hr = IXAudio2SourceVoice_Start(o->s, 0, XAUDIO2_COMMIT_NOW);
++        if (FAILED(hr)) {
++            if (!quiet)
++                fprintf(stderr, "[XA2] Start failed: 0x%08lX\n", hr);
++            return hr;
++        }
++    }
++    {
++        /* au-out: the device in full, in one line (the bug report reads it).
++         * XAudio2's mastering voice is on Windows' default output. */
++        char desc[440];
++        if (bw_out_describe(NULL, desc, sizeof desc))
++            fprintf(stderr, "[XA2] output device: %s; XAudio2 on %s, its own processing quantum (10 ms);"
++                    " our voice %d Hz %d ch 16-bit\n", desc,
++                    getenv("BW_TEST_AUDIO_DEVICE") ? "the test switch's device" : "Windows' default output",
++                    XA2_SAMPLE_RATE, g_xa2_channels);
 +    }
 +    return S_OK;
 +}
 +
-+/* BW_TEST_AUDIO_LOST: the next test time (ms after init) due, or 0. */
++/* The live output: the WASAPI stream (bw_apu_wasapi.c), or a set made into
++ * the globals. */
++static HRESULT xa2_open(int boot, int quiet)
++{
++    Xa2Set o;
++    HRESULT hr;
++
++    if (g_wa) {                          /* Blood Wake (lat-a): the WASAPI stream */
++        if (xa2_test_nodevice(quiet))
++            return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
++        return (HRESULT)bw_wa_open(boot, quiet, &g_xa2_channels);
++    }
++    memset(&o, 0, sizeof o);
++    hr = xa2_open_set(&o, boot, quiet, 1);
++    g_xa2 = o.x;                         /* a part made before a failure: xa2_release */
++    g_xa2_master = o.m;
++    g_xa2_source = o.s;
++    return hr;
++}
++
++/* Blood Wake (lat-a): a WASAPI call failed: the stream is dead. Keep what it
++ * played, let it go (its every later call would fail too) and flag the loss
++ * for xa2_check_device, as XAudio2's critical error does. */
++static void xa2_wa_failed(long hr)
++{
++    g_xa2_lost_hr = hr;
++    if (bw_wa_active()) {
++        g_xa2_played_base += bw_wa_consumed();
++        bw_wa_release();
++    }
++    InterlockedCompareExchange(&g_xa2_lost, 5, 0);
++}
++
++/* Blood Wake (lat-a): the current voice or stream, whichever output. */
++static int xa2_have_voice(void)
++{
++    return g_wa ? bw_wa_active() : g_xa2_source != NULL;
++}
++
++/* Samples the current voice or stream has had read since it was made. */
++static uint64_t xa2_voice_played(void)
++{
++    XAUDIO2_VOICE_STATE st;
++    if (g_wa)
++        return bw_wa_active() ? bw_wa_consumed() : 0;
++    if (!g_xa2_source)
++        return 0;
++    IXAudio2SourceVoice_GetState(g_xa2_source, &st, 0);
++    return st.SamplesPlayed;
++}
++
++/* BW_TEST_AUDIO_LOST: the next test time (ms after init) due, or 0. Up to
++ * 32 times (au-fx: 8 before; the many-losses case takes 28 in one boot). */
 +static ULONGLONG test_lost_due(ULONGLONG since)
 +{
 +    static int parsed;
-+    static ULONGLONG at[8];
++    static ULONGLONG at[32];
 +    static int n, next;
 +    if (!parsed) {
 +        const char *e = getenv("BW_TEST_AUDIO_LOST");
 +        parsed = 1;
-+        while (e && *e && n < 8) {
++        while (e && *e && n < 32) {
++            char *end;
++            unsigned long v = strtoul(e, &end, 10);
++            if (end == e)
++                break;
++            at[n++] = v;
++            e = end;
++            while (*e == ',' || *e == ' ')
++                e++;
++        }
++    }
++    if (next < n && since >= at[next])
++        return at[next++];
++    return 0;
++}
++
++/* BW_TEST_AUDIO_NEWDEFAULT (au-out): the next time (ms after init) due for a
++ * default-device notice as Windows sends one, or 0. The device stays and keeps
++ * playing: the rebuild follows "the new default", which is the same device. */
++static ULONGLONG test_newdefault_due(ULONGLONG since)
++{
++    static int parsed;
++    static ULONGLONG at[32];
++    static int n, next;
++    if (!parsed) {
++        const char *e = getenv("BW_TEST_AUDIO_NEWDEFAULT");
++        parsed = 1;
++        while (e && *e && n < 32) {
 +            char *end;
 +            unsigned long v = strtoul(e, &end, 10);
 +            if (end == e)
@@ -328,6 +565,241 @@
 +    return 0;
 +}
 +
++/* ---- Blood Wake (au-out): the rebuild on the output worker ---------------
++ *
++ * Item 68's rebuild opened the new device on the APU frame thread: 5-38 ms
++ * of no periods there (lat-a), 190-550 ms in item 68's own runs, while the
++ * chip's clock (voices, notifications) stood still. Now the frame thread
++ * only takes the change; the new device is opened on the output worker
++ * (bw_apu_out.c) into a second set, and swapped in at the start of a period
++ * (xa2_check_device runs before each submit). Meanwhile:
++ *   - a lost device: there is no voice, so periods are dropped and the chip
++ *     runs on the host clock, as while waiting for a device (item 68);
++ *   - Windows has a new default device (its notice): the old device still
++ *     plays and keeps being fed until the swap, and on WASAPI what it held
++ *     and hadn't played yet is written to the new stream first, so the
++ *     sound carries on where it was (no gap, nothing twice);
++ *   - another change before the open is done: that open is let go and the
++ *     default device is opened again (flapping devices settle on the last).
++ * The layout stays the boot's (the game was told it once); Windows maps it
++ * onto whatever the new device has (XAudio2's mastering voice, or WASAPI's
++ * AUTOCONVERTPCM). Every edition by default (the audio rework's gate, call
++ * AO-3: a port fix, better than item 68's frame-thread rebuild in Original
++ * too); BW_AUDIO_REBUILD_WORKER=0 rebuilds on the frame thread as item 68 did. */
++static int      g_rb_worker = -1;
++static int      g_rb_open;             /* a set or stream is being opened on the worker */
++static int      g_rb_again;            /* a newer change came in meanwhile */
++static int      g_rb_keep;             /* the old output plays until the swap */
++static int      g_rb_wa;               /* the job opens a WASAPI stream (else XAudio2) */
++static int      g_rb_quiet;
++static LONGLONG g_rb_q0;               /* the change taken (performance counter) */
++static double   g_rb_ft_ms;            /* the frame thread's own part */
++static int      g_rb_releasing;        /* the worker is letting an old output go */
++static Xa2Set   s_xa_old;              /* a stopped XAudio2 set, let go on the worker */
++static uint64_t g_ev_last;             /* event-driven WASAPI: the played count at the last poll */
++
++static int xa2_rb_worker(void)
++{
++    if (g_rb_worker < 0) {
++        const char *e = getenv("BW_AUDIO_REBUILD_WORKER");
++        g_rb_worker = (e && *e) ? *e != '0' : 1;   /* every edition (call AO-3) */
++        if (g_rb_worker && bw_wa_exclusive_wanted()) {
++            /* au-lat: an exclusive stream holds its device, so the new one
++             * can't open while it lives: release first, then open (the frame
++             * thread's rebuild, item 68's) */
++            g_rb_worker = 0;
++            fprintf(stderr, "[XA2] WASAPI exclusive: a rebuild releases the old stream first (on the frame thread)\n");
++        }
++    }
++    return g_rb_worker;
++}
++
++/* Let the retired outputs go (on the worker). */
++static long xa2_rb_free_job(void *arg)
++{
++    (void)arg;
++    bw_wa_free_retired();
++    xa2_set_release(&s_xa_old);
++    return 0;
++}
++
++static long xa2_rb_job(void *arg)
++{
++    HRESULT hr;
++    xa2_rb_free_job(arg);
++    if (g_rb_wa) {
++        if (xa2_test_nodevice(g_rb_quiet))
++            return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
++        return bw_wa_open_next(g_rb_quiet, g_xa2_channels);
++    }
++    memset(&s_xa_next, 0, sizeof s_xa_next);
++    hr = xa2_open_set(&s_xa_next, 0, g_rb_quiet, 0);
++    if (FAILED(hr))
++        xa2_set_release(&s_xa_next);
++    return hr;
++}
++
++static double xa2_qpc_ms(LONGLONG a, LONGLONG b)
++{
++    LARGE_INTEGER f;
++    QueryPerformanceFrequency(&f);
++    return (double)(b - a) * 1000.0 / (double)f.QuadPart;
++}
++
++/* The live voice or stream goes: what it played stays in the count, what it
++ * held is lost. defer: it is stopped here and let go on the worker (only
++ * while the worker runs no job). */
++static void xa2_rb_drop_live(int defer)
++{
++    g_xa2_played_base += xa2_voice_played();
++    g_xa2_submitted = g_xa2_played_base;
++    if (!defer)
++        xa2_release();
++    else if (g_wa)
++        bw_wa_retire();
++    else {
++        if (g_xa2_source)
++            IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
++        xa2_set_release(&s_xa_old);      /* none left over, normally */
++        s_xa_old.x = g_xa2;
++        s_xa_old.m = g_xa2_master;
++        s_xa_old.s = g_xa2_source;
++        g_xa2 = NULL;
++        g_xa2_master = NULL;
++        g_xa2_source = NULL;
++    }
++    g_st_played_last = g_xa2_played_base;
++    g_ev_last = g_xa2_played_base;
++    g_xa2_next_buf = 0;
++    g_xa2_fill = 0;
++    g_xa2_dry = 1;
++}
++
++/* Take a change (why, as g_xa2_lost) and post the open. 0: the worker can't
++ * be used (the caller rebuilds here, as before). */
++static int xa2_rb_start(LONG why, int first)
++{
++    LARGE_INTEGER a, b;
++    QueryPerformanceCounter(&a);
++    if (first) {
++        g_rb_q0 = a.QuadPart;
++        g_rb_ft_ms = 0;
++    }
++    g_rb_keep = why == 2 && xa2_have_voice() && !g_xa2_waiting;
++    if (!g_rb_keep && xa2_have_voice())
++        xa2_rb_drop_live(1);             /* the worker lets it go first */
++    g_rb_wa = g_wa;
++    g_rb_quiet = g_xa2_waiting;
++    if (!bw_out_post(xa2_rb_job, NULL))
++        return 0;
++    g_rb_open = 1;
++    QueryPerformanceCounter(&b);
++    g_rb_ft_ms += xa2_qpc_ms(a.QuadPart, b.QuadPart);
++    return 1;
++}
++
++/* The worker's open finished (hr, in job_ms): swap it in, or wait, or fall
++ * back to XAudio2, as the frame-thread rebuild does. */
++static void xa2_rb_finish(long hr, double job_ms)
++{
++    LARGE_INTEGER a, b;
++    ULONGLONG now = GetTickCount64();
++    int tail = 0;
++    QueryPerformanceCounter(&a);
++    g_rb_open = 0;
++    if (g_rb_again) {
++        g_rb_again = 0;
++        if (SUCCEEDED(hr)) {
++            if (g_rb_wa)
++                bw_wa_drop_next();
++            else
++                xa2_set_release(&s_xa_next);
++        }
++        if (!xa2_rb_start(2, 0))
++            InterlockedCompareExchange(&g_xa2_lost, 2, 0);   /* the worker is busy: next period */
++        return;
++    }
++    if (SUCCEEDED(hr)) {
++        if (g_rb_wa) {
++            uint64_t old = 0;
++            int had = bw_wa_active();
++            tail = bw_wa_adopt_next(g_rb_keep && had, &old);
++            if (had)
++                g_xa2_played_base += old;
++            if (tail < 0) {
++                /* it wouldn't start: counted as a lost device, tried again */
++                g_xa2_submitted = g_xa2_played_base;
++                g_st_played_last = g_xa2_played_base;
++                g_ev_last = g_xa2_played_base;
++                g_xa2_lost_hr = bw_wa_last_error();
++                InterlockedCompareExchange(&g_xa2_lost, 5, 0);
++                return;
++            }
++            g_xa2_submitted = g_xa2_played_base + (uint64_t)tail;
++        } else {
++            if (xa2_have_voice())
++                xa2_rb_drop_live(1);    /* the kept old voice, let go on the worker */
++            g_xa2 = s_xa_next.x;
++            g_xa2_master = s_xa_next.m;
++            g_xa2_source = s_xa_next.s;
++            memset(&s_xa_next, 0, sizeof s_xa_next);
++            IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
++            g_xa2_submitted = g_xa2_played_base;
++        }
++        g_st_played_last = g_xa2_played_base;
++        g_ev_last = g_xa2_played_base;
++        g_xa2_next_buf = 0;
++        g_xa2_fill = 0;
++        g_xa2_dry = 1;
++        QueryPerformanceCounter(&b);
++        g_rb_ft_ms += xa2_qpc_ms(a.QuadPart, b.QuadPart);
++        if (g_xa2_quiet_events)
++            fprintf(stderr, "[XA2] (Windows changed its default device %u more times while there was "
++                    "none)\n", g_xa2_quiet_events);
++        g_xa2_quiet_events = 0;
++        g_xa2_waiting = 0;
++        g_xa2_rebuilds++;
++        g_xa2_rebuilt_at = now;
++        fprintf(stderr, "[XA2] rebuilt on the default audio device in %.1f ms (rebuild %u; opened on the"
++                " output worker in %.1f ms, the frame thread's part %.2f ms; %s, as the game was told at"
++                " boot%s%s); sound goes on\n", xa2_qpc_ms(g_rb_q0, b.QuadPart), g_xa2_rebuilds, job_ms,
++                g_rb_ft_ms, g_xa2_channels == 6 ? "5.1" : "stereo", g_wa ? "; WASAPI" : "",
++                g_rb_keep ? (tail > 0 ? "; the old device played until the swap, and what it still held"
++                                        " went on to the new one" : "; the old device played until the swap")
++                          : "");
++        if (g_rb_keep && tail > 0)
++            fprintf(stderr, "[XA2] (%d frames, %.1f ms, carried from the old device)\n", tail, tail / 48.0);
++        if (bw_out_post(xa2_rb_free_job, NULL))
++            g_rb_releasing = 1;          /* the old one goes on the worker */
++        else
++            xa2_rb_free_job(NULL);
++        return;
++    }
++    if (g_rb_wa && hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND) && hr != AUDCLNT_E_DEVICE_INVALIDATED) {
++        /* lat-a: a device is there but the stream won't open on it: the rest
++         * of this boot goes on with XAudio2 rather than waiting forever */
++        fprintf(stderr, "[XA2] the WASAPI output didn't reopen (0x%08lX): this boot goes on with"
++                " XAudio2\n", (unsigned long)hr);
++        if (xa2_have_voice())
++            xa2_rb_drop_live(1);
++        g_wa = 0;
++        if (!xa2_rb_start(0, 0))
++            InterlockedCompareExchange(&g_xa2_lost, 4, 0);
++        return;
++    }
++    if (g_rb_keep && xa2_have_voice()) {
++        fprintf(stderr, "[XA2] Windows' new default device didn't open (0x%08lX): the sound stays on the"
++                " device it was on\n", (unsigned long)hr);
++        return;
++    }
++    if (!g_xa2_waiting)
++        fprintf(stderr, "[XA2] no audio device (0x%08lX, %.1f ms to find out on the output worker): the game"
++                " runs silent and tries again when Windows has a device (or every 5 s)\n",
++                (unsigned long)hr, job_ms);
++    g_xa2_waiting = 1;
++    g_xa2_retry_at = now + 5000;         /* Windows' notice usually comes first */
++}
++
 +/* The APU frame thread, before each submit (and while the queue is stalled,
 + * item 105): a lost or changed device is rebuilt here (see above). */
 +static void xa2_check_device(void)
@@ -339,28 +811,63 @@
 +    static const char *const k_why[] = { "", "XAudio2 reported a critical error",
 +                                         "Windows has a new default audio device",
 +                                         "test switch BW_TEST_AUDIO_LOST",
-+                                         "the device has taken no sound for a second" };
++                                         "the device has taken no sound for a second",
++                                         "the WASAPI stream failed (its device went away)" };
 +
 +    if ((t = test_lost_due(now - g_xa2_t0)) != 0) {
-+        if (g_xa2_source)
++        if (g_wa)
++            bw_wa_stop();                /* Blood Wake (lat-a): the stream stops consuming */
++        else if (g_xa2_source)
 +            IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
 +        fprintf(stderr, "[XA2] test: the audio device is lost at %llu ms (the voice stops "
 +                "consuming)\n", (unsigned long long)t);
 +        InterlockedExchange(&g_xa2_lost, 3);
 +    }
 +    if ((t = test_stall_due(now - g_xa2_t0)) != 0) {
-+        if (g_xa2_source)
++        if (g_wa)
++            bw_wa_stop();                /* Blood Wake (lat-a): the stream stops consuming */
++        else if (g_xa2_source)
 +            IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
 +        fprintf(stderr, "[XA2] test: the device stops taking sound at %llu ms, with no error and no"
 +                " notice (BW_TEST_AUDIO_STALL)\n", (unsigned long long)t);
 +    }
-+    if (g_xa2_rebuilt_at && now - g_xa2_rebuilt_at >= 1000 && g_xa2_source) {
-+        XAUDIO2_VOICE_STATE st;
-+        IXAudio2SourceVoice_GetState(g_xa2_source, &st, 0);
++    while ((t = test_newdefault_due(now - g_xa2_t0)) != 0) {
++        fprintf(stderr, "[XA2] test: Windows' default-device notice at %llu ms; the device stays"
++                " (BW_TEST_AUDIO_NEWDEFAULT)\n", (unsigned long long)t);
++        InterlockedCompareExchange(&g_xa2_lost, 2, 0);
++    }
++    if (g_xa2_rebuilt_at && now - g_xa2_rebuilt_at >= 1000 && xa2_have_voice()) {
++        uint64_t sp = xa2_voice_played();
 +        fprintf(stderr, "[XA2] one second after the rebuild the new device has played %llu "
-+                "samples (%.0f ms of sound)\n", (unsigned long long)st.SamplesPlayed,
-+                st.SamplesPlayed / 48.0);
++                "samples (%.0f ms of sound)\n", (unsigned long long)sp, sp / 48.0);
 +        g_xa2_rebuilt_at = 0;
++    }
++    if (g_rb_releasing) {
++        if (bw_out_poll(NULL, NULL))
++            g_rb_releasing = 0;
++        else if (g_xa2_lost || (g_xa2_waiting && now >= g_xa2_retry_at))
++            return;                      /* au-out: the worker is letting the old output go: next period */
++    }
++    if (g_rb_open) {
++        /* au-out: an open on the worker is under way: a newer change makes
++         * it open again; its result is swapped in here, at a period's start */
++        long rhr;
++        double rms;
++        why = InterlockedExchange(&g_xa2_lost, 0);
++        if (why) {
++            if (!(g_xa2_waiting && why == 2))
++                fprintf(stderr, "[XA2] the audio device is gone or changed: %s (while a device was being"
++                        " opened: the default one is opened again)\n", k_why[why < 6 ? why : 0]);
++            g_rb_again = 1;
++            if (why != 2 && g_rb_keep) {
++                if (xa2_have_voice())
++                    xa2_rb_drop_live(0); /* the old device died meanwhile (the worker is busy) */
++                g_rb_keep = 0;
++            }
++        }
++        if (bw_out_poll(&rhr, &rms))
++            xa2_rb_finish(rhr, rms);
++        return;
 +    }
 +    if (!g_xa2_lost && !(g_xa2_waiting && now >= g_xa2_retry_at))
 +        return;
@@ -370,22 +877,14 @@
 +        if (g_xa2_waiting && why == 2)
 +            g_xa2_quiet_events++;        /* while no device: counted, said once when it's back */
 +        else
-+            fprintf(stderr, "[XA2] the audio device is gone or changed: %s\n", k_why[why < 5 ? why : 0]);
-+        if (why == 1)
++            fprintf(stderr, "[XA2] the audio device is gone or changed: %s\n", k_why[why < 6 ? why : 0]);
++        if (why == 1 || why == 5)
 +            fprintf(stderr, "[XA2] (the error: 0x%08lX)\n", (unsigned long)g_xa2_lost_hr);
 +        if (e && *e == '0') {
 +            fprintf(stderr, "[XA2] no rebuild (BW_AUDIO_REBUILD=0): silent until the next boot\n");
 +            return;
 +        }
 +    }
-+    QueryPerformanceFrequency(&f);
-+    QueryPerformanceCounter(&q0);
-+    if (g_xa2_source) {
-+        XAUDIO2_VOICE_STATE st;
-+        IXAudio2SourceVoice_GetState(g_xa2_source, &st, 0);
-+        g_xa2_played_base += st.SamplesPlayed;
-+    }
-+    xa2_release();
 +    {
 +        static int com;
 +        if (!com++) {
@@ -393,7 +892,28 @@
 +            (void)c;
 +        }
 +    }
++    if (xa2_rb_worker() && xa2_rb_start(why, 1))
++        return;                          /* au-out: opened on the worker, swapped in later */
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&q0);
++    g_xa2_played_base += xa2_voice_played();
++    /* lat-a: what the old voice still held is lost, never played; the new
++     * voice's stream starts where the played count stands */
++    g_xa2_submitted = g_xa2_played_base;
++    xa2_release();
 +    hr = xa2_open(0, g_xa2_waiting);
++    if (FAILED(hr) && g_wa && hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
++            && hr != AUDCLNT_E_DEVICE_INVALIDATED) {
++        /* lat-a: a device is there but the stream won't open on it: the rest
++         * of this boot goes on with XAudio2 rather than waiting forever */
++        fprintf(stderr, "[XA2] the WASAPI output didn't reopen (0x%08lX): this boot goes on with"
++                " XAudio2\n", (unsigned long)hr);
++        xa2_release();
++        g_wa = 0;
++        hr = xa2_open(0, g_xa2_waiting);
++    }
++    g_st_played_last = g_xa2_played_base;   /* lat-a: no pass spans the rebuild */
++    g_ev_last = g_xa2_played_base;
 +    g_xa2_next_buf = 0;
 +    g_xa2_fill = 0;
 +    g_xa2_dry = 1;                       /* the empty new voice is not an underrun */
@@ -417,16 +937,16 @@
 +    g_xa2_rebuilds++;
 +    g_xa2_rebuilt_at = now;
 +    fprintf(stderr, "[XA2] rebuilt on the default audio device in %.1f ms (rebuild %u; %s, as "
-+            "the game was told at boot); sound goes on\n",
++            "the game was told at boot%s); sound goes on\n",
 +            (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)f.QuadPart, g_xa2_rebuilds,
-+            g_xa2_channels == 6 ? "5.1" : "stereo");
++            g_xa2_channels == 6 ? "5.1" : "stereo", g_wa ? "; WASAPI" : "");
 +}
 +
 +/* 0.2.5 item 105 (carried apu_core.c calls it): each period while the device
 + * queue is stalled, when no submit runs xa2_check_device. A loss flagged
 + * meanwhile is acted on, and a device that has taken no sound for a second
 + * counts as lost (why 4), at most every 5 s. BW_AUDIO_REBUILD=0 keeps the old
-+ * behaviour (silent until the next boot). */
++ * behaviour (silent until the next boot). Every edition, on either output. */
 +void xa2_poll_stalled(int stalled_ms)
 +{
 +    static int no_rebuild = -1;
@@ -445,6 +965,164 @@
 +    xa2_check_device();
 +}
 +
++/* Blood Wake (lat-a, BW_LATLOG only): what Windows says about the default
++ * output device, read only (no stream is opened, nothing is changed): its
++ * name, mix format, WASAPI's device periods and the shared engine's periods.
++ * Logged as one line and a K event with a = -1. */
++static void xa2_lat_device_info(void)
++{
++    static const GUID iid_ac  = { 0x1CB9AD4C, 0xDBFA, 0x4C32,
++                                  { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
++    static const GUID iid_ac3 = { 0x7ED4EE07, 0x8E67, 0x4CD4,
++                                  { 0x8C, 0x1A, 0x2B, 0x7A, 0x59, 0x87, 0xAD, 0x42 } };
++    static const PROPERTYKEY k_name = { { 0xA45C254E, 0xDF1C, 0x4EFD,
++                                          { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0 } }, 14 };
++    IMMDevice *dev = NULL;
++    IAudioClient *ac = NULL;
++    IAudioClient3 *ac3 = NULL;
++    IPropertyStore *ps = NULL;
++    WAVEFORMATEX *mix = NULL;
++    REFERENCE_TIME def = 0, mn = 0;
++    UINT32 p_def = 0, p_fund = 0, p_min = 0, p_max = 0, p_cur = 0;
++    char name[200] = "?";
++    if (!s_mmde || FAILED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(s_mmde, eRender, eConsole, &dev))) {
++        fprintf(stderr, "[XA2] lat: no default output device to describe\n");
++        return;
++    }
++    if (SUCCEEDED(IMMDevice_OpenPropertyStore(dev, STGM_READ, &ps))) {
++        PROPVARIANT pv;
++        PropVariantInit(&pv);
++        if (SUCCEEDED(IPropertyStore_GetValue(ps, &k_name, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal)
++            WideCharToMultiByte(CP_UTF8, 0, pv.pwszVal, -1, name, (int)sizeof name, NULL, NULL);
++        PropVariantClear(&pv);
++        IPropertyStore_Release(ps);
++    }
++    if (SUCCEEDED(IMMDevice_Activate(dev, &iid_ac, CLSCTX_ALL, NULL, (void **)&ac))) {
++        IAudioClient_GetDevicePeriod(ac, &def, &mn);
++        IAudioClient_GetMixFormat(ac, &mix);
++        if (mix && SUCCEEDED(IAudioClient_QueryInterface(ac, &iid_ac3, (void **)&ac3))) {
++            WAVEFORMATEX *cur = NULL;
++            IAudioClient3_GetSharedModeEnginePeriod(ac3, mix, &p_def, &p_fund, &p_min, &p_max);
++            if (SUCCEEDED(IAudioClient3_GetCurrentSharedModeEnginePeriod(ac3, &cur, &p_cur)) && cur)
++                CoTaskMemFree(cur);
++            IAudioClient3_Release(ac3);
++        }
++        IAudioClient_Release(ac);
++    }
++    {
++        /* What a plain WASAPI shared stream of the smallest buffer would have
++         * (for the report's options): initialized, never started, released. */
++        IAudioClient *ac2 = NULL;
++        if (mix && SUCCEEDED(IMMDevice_Activate(dev, &iid_ac, CLSCTX_ALL, NULL, (void **)&ac2))) {
++            REFERENCE_TIME sl = 0;
++            UINT32 bs = 0;
++            HRESULT h2 = IAudioClient_Initialize(ac2, AUDCLNT_SHAREMODE_SHARED,
++                                                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, mix, NULL);
++            if (SUCCEEDED(h2)) {
++                IAudioClient_GetStreamLatency(ac2, &sl);
++                IAudioClient_GetBufferSize(ac2, &bs);
++            }
++            fprintf(stderr, "[XA2] lat: a plain WASAPI shared stream there: %s, stream latency %.2f ms,"
++                    " buffer %u frames (%.2f ms); never started\n", SUCCEEDED(h2) ? "ok" : "refused",
++                    sl / 1e4, bs, mix->nSamplesPerSec ? bs * 1000.0 / mix->nSamplesPerSec : 0.0);
++            IAudioClient_Release(ac2);
++        }
++    }
++    IMMDevice_Release(dev);
++    fprintf(stderr, "[XA2] lat: default output \"%s\": mix %lu Hz %u ch; WASAPI device period %.2f ms"
++            " (minimum %.2f); shared engine period now %u frames (default %u, fundamental %u, %u..%u)\n",
++            name, mix ? (unsigned long)mix->nSamplesPerSec : 0ul, mix ? mix->nChannels : 0,
++            def / 1e4, mn / 1e4, p_cur, p_def, p_fund, p_min, p_max);
++    bw_lat_ev(BW_LAT_XPERF, bw_lat_now(), -1, (int64_t)def, (int64_t)mn, p_def, p_fund, p_min,
++              mix ? (double)mix->nSamplesPerSec : 0.0, (double)p_cur);
++    if (mix)
++        CoTaskMemFree(mix);
++}
++
++/* Blood Wake (lat-a): BW_XA2_STATS / BW_LATLOG, every 5 s and at shutdown. */
++static void xa2_stat_line(const char *when)
++{
++    XAUDIO2_PERFORMANCE_DATA pd;
++    memset(&pd, 0, sizeof pd);
++    if (g_xa2)
++        IXAudio2_GetPerformanceData(g_xa2, &pd);
++    if (!g_wa)
++    fprintf(stderr, "[XA2-STAT] %s: passes %ld, starved %ld (%.1f ms of silence), during a pause %ld;"
++            " XAudio2 glitches %u, its latency %u samples (%.1f ms); underruns %u; submitted %llu\n",
++            when, (long)g_xa2_passes, (long)g_xa2_starved_passes,
++            (double)g_xa2_starved_bytes / (2.0 * XA2_CHANNELS) / 48.0, (long)g_xa2_drain_passes,
++            pd.GlitchesSinceEngineStarted, pd.CurrentLatencyInSamples,
++            pd.CurrentLatencyInSamples / 48.0, g_xa2_underruns, (unsigned long long)g_xa2_submitted);
++    fprintf(stderr, "[XA2-STAT] %s: %s; short passes %ld (%.1f ms of silence; from the played count);"
++            " underruns %u; submitted %llu", when,
++            g_wa ? (bw_wa_exclusive() ? "WASAPI exclusive mode" : "WASAPI shared mode") : "XAudio2", g_st_short,
++            g_st_short_frames / 48.0, g_xa2_underruns, (unsigned long long)g_xa2_submitted);
++    if (g_wa) {
++        uint64_t fr;
++        int64_t q;
++        LARGE_INTEGER now, f;
++        if (bw_wa_clock(&fr, &q)) {
++            /* the stream's clock: read but not yet played, as Windows reports it */
++            QueryPerformanceCounter(&now);
++            QueryPerformanceFrequency(&f);
++            fprintf(stderr, "; read but not yet playing %.1f ms (the stream's clock)",
++                    ((double)bw_wa_consumed() - (double)fr
++                     - (double)(now.QuadPart - q) * 48000.0 / (double)f.QuadPart) / 48.0);
++        }
++        {
++            /* au-out: the queue just before each write since the last line */
++            int mn = 0, p1 = 0, med = 0;
++            if (bw_wa_queue_stats(&mn, &p1, &med))
++                fprintf(stderr, "; queue before each write min %.1f p1 %.1f median %.1f ms (%s, period %d)",
++                        mn / 48.0, p1 / 48.0, med / 48.0, bw_wa_event() ? "event-driven" : "polled",
++                        bw_wa_period());
++            xa2_slack_line();
++        }
++        if (bw_wa_exclusive()) {
++            /* au-lat: the device's periods the output thread handed short */
++            double xm = 0;
++            long xs = bw_wa_excl_shorts(&xm);
++            fprintf(stderr, "; exclusive periods handed short %ld (%.1f ms of silence)", xs, xm);
++        }
++    }
++    fprintf(stderr, "\n");
++}
++
++/* Blood Wake (lat-a): at each queue poll (stats on), the played count against
++ * the last poll's: a move that is not a whole number of passes is a short
++ * pass. With BW_LATLOG on the WASAPI output, each move is also a J event (the
++ * pass happened between the polls; its time is the polls' midpoint) and the
++ * stream's clock an H event. */
++static void xa2_stat_poll(void)
++{
++    uint64_t pl = xa2_samples_played();
++    int64_t now = g_bw_lat_on ? bw_lat_now() : 0;
++    if (pl > g_st_played_last && g_st_played_last && g_xa2_submitted && !g_xa2_draining) {
++        uint64_t j = pl - g_st_played_last;
++        if (j % XA2_PASS) {
++            g_st_short++;
++            g_st_short_frames += XA2_PASS - (int64_t)(j % XA2_PASS);
++        }
++        if (g_bw_lat_on && g_wa) {
++            uint64_t k, n = (j + XA2_PASS - 1) / XA2_PASS;
++            for (k = 0; k < n; k++)
++                bw_lat_ev(BW_LAT_XPASS, g_st_last_poll_qpc + (now - g_st_last_poll_qpc) * (int64_t)(2 * k + 1)
++                                            / (int64_t)(2 * n),
++                          0, (int64_t)(g_st_played_last + k * XA2_PASS), -1, (int64_t)g_xa2_submitted,
++                          g_xa2_draining, 1, 0.0, 0.0);
++        }
++    }
++    if (pl >= g_st_played_last)
++        g_st_played_last = pl;
++    if (g_bw_lat_on && g_wa) {
++        uint64_t fr;
++        int64_t q;
++        if (bw_wa_clock(&fr, &q))
++            bw_lat_ev(BW_LAT_WCLOCK, q, (int64_t)(g_xa2_played_base + fr), (int64_t)pl, 0, 0, 0, 0, 0.0, 0.0);
++    }
++    g_st_last_poll_qpc = now;
++}
++
  int xa2_init(void)
  {
      HRESULT hr;
@@ -453,7 +1131,18 @@
  
      if (g_xa2_initialized) return 1;
  
-@@ -89,37 +499,30 @@
+@@ -81,6 +1169,10 @@
+                                     XA2_BUF_SAMPLES_MIN, XA2_BUF_SAMPLES_MAX);
+     g_xa2_num_bufs = xa2_env_int("RECOMP_AUDIO_BUF_COUNT", XA2_NUM_BUFS_DEFAULT,
+                                  XA2_NUM_BUFS_MIN, XA2_NUM_BUFS_MAX);
++    {
++        const char *e = getenv("BW_XA2_STATS");          /* Blood Wake (lat-a) */
++        g_xa2_stat_on = (e && *e && *e != '0') || g_bw_lat_on;
++    }
+ 
+     hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+@@ -89,45 +1181,68 @@
      }
      com_initialized = SUCCEEDED(hr);
  
@@ -461,15 +1150,34 @@
 -    if (FAILED(hr) || !g_xa2) {
 -        fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
 -        goto fail;
--    }
++    g_wa = bw_wa_wanted();               /* Blood Wake (lat-a) */
++    hr = xa2_open(1, 0);
++    if (FAILED(hr) && g_wa && hr != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
++            && hr != AUDCLNT_E_DEVICE_INVALIDATED) {
++        fprintf(stderr, "[XA2] the WASAPI output didn't open (0x%08lX): this boot uses XAudio2\n",
++                (unsigned long)hr);
++        g_wa = 0;
++        hr = xa2_open(1, 0);
+     }
 -
 -    hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
 -        XA2_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
-+    hr = xa2_open(1, 0);
-     if (FAILED(hr)) {
+-    if (FAILED(hr)) {
 -        fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
 -        goto fail;
--    }
++    if (g_wa && !getenv("RECOMP_AUDIO_BUF_SAMPLES")) {
++        /* lat-a: the WASAPI stream's padding is exact, where XAudio2's queue
++         * reading over-counts the buffer being played by 0-511 samples, so
++         * its pacing marks are counted in 384-sample units: the same real
++         * queue as XAudio2's 512 with more margin (measured, docs/latency/a.md
++         * 3.1). The marks only; nothing is staged on this output.
++         * au-out: the marks are in samples now (xa2_marks_samples); the
++         * "buffer" is then the engine's period, what the device takes at
++         * once (the host-starve check's jitter). BW_WASAPI_MARKS=buffers
++         * keeps lat-a's 384-sample units. */
++        const char *e = getenv("BW_WASAPI_MARKS");
++        g_xa2_buf_samples = (e && e[0] == 'b') ? 384 : (bw_wa_period() > 0 ? bw_wa_period() : 480);
+     }
 -
 -    wfx.wFormatTag      = WAVE_FORMAT_PCM;
 -    wfx.nChannels       = XA2_CHANNELS;
@@ -480,15 +1188,15 @@
 -
 -    hr = IXAudio2_CreateSourceVoice(g_xa2, &g_xa2_source,
 -        &wfx, 0, XAUDIO2_DEFAULT_FREQ_RATIO, NULL, NULL, NULL);
--    if (FAILED(hr)) {
+     if (FAILED(hr)) {
 -        fprintf(stderr, "[XA2] CreateSourceVoice failed: 0x%08lX\n", hr);
 -        goto fail;
 +        /* Blood Wake (item 68): XAudio2 works but Windows has no audio
 +         * device (none plugged in, or the default one just went away): start
 +         * silent and wait for one, as after a loss, instead of the waveOut
 +         * fallback (which has no device either) and a silent boot. */
-+        if (g_xa2 && (hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
-+                      || hr == XAUDIO2_E_DEVICE_INVALIDATED)) {
++        if ((g_xa2 || g_wa) && (hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
++                      || hr == XAUDIO2_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_DEVICE_INVALIDATED)) {
 +            xa2_release();
 +            g_xa2_waiting = 1;
 +            g_xa2_retry_at = GetTickCount64() + 5000;
@@ -511,16 +1219,25 @@
 +        s_mmde = NULL;
      }
  
++    if (g_bw_lat_on)
++        xa2_lat_device_info();           /* Blood Wake (lat-a), read only */
++
      g_xa2_next_buf = 0;
-@@ -127,6 +530,7 @@
+     g_xa2_fill = 0;
      g_xa2_dry = 0;
      g_xa2_initialized = 1;
      g_xa2_frames_written = 0;
 +    g_xa2_t0 = GetTickCount64();
  
++    if (g_wa)
++        fprintf(stderr, "[XA2] WASAPI output initialized (%d Hz 16-bit; the pacing's marks as for %d x"
++                " %d-sample buffers, %.1f ms queued max)\n", XA2_SAMPLE_RATE, XA2_NUM_BUFS,
++                XA2_BUF_SAMPLES, 1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE);
++    else
      fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)\n",
              XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES,
-@@ -142,20 +546,12 @@
+             1000.0 * XA2_NUM_BUFS * XA2_BUF_SAMPLES / XA2_SAMPLE_RATE);
+@@ -142,20 +1257,14 @@
  
  void xa2_shutdown(void)
  {
@@ -542,17 +1259,105 @@
 +        IMMDeviceEnumerator_Release(s_mmde);
 +        s_mmde = NULL;
      }
++    if (g_xa2_initialized && g_xa2_stat_on)
++        xa2_stat_line("at shutdown");    /* Blood Wake (lat-a) */
 +    xa2_release();
  
      if (g_xa2_initialized)
          fprintf(stderr, "[XA2] Shut down (%d frames written)\n", g_xa2_frames_written);
-@@ -180,13 +576,15 @@
+@@ -173,6 +1282,26 @@
+  * kept, not padded or dropped. Returns 1 if every sample was accepted; 0 if
+  * the voice already had every buffer queued when one filled, in which case
+  * that buffer is discarded (pacing by queue depth is what prevents it). */
++/* Blood Wake: BW_TEST_AUDIO_MUTE=1 (a test aid, tools/bw_run.py sets it)
++ * hands the device silence of the same length, so a test run is quiet
++ * while its timing, glitch counts and WAV dump (taken before this) stay
++ * exactly as they'd be. Read once per boot. On the WASAPI output (lat-a)
++ * the period is written as the engine's own silence
++ * (AUDCLNT_BUFFERFLAGS_SILENT): the same length, at the same moment. A line
++ * in the log says so once (au-int), naming the output. */
++static int xa2_test_mute(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_TEST_AUDIO_MUTE");
++        on = (e && e[0] == '1') ? 1 : 0;
++        if (on)
++            fprintf(stderr, "[XA2] test run: the device gets silence of the same length (BW_TEST_AUDIO_MUTE;"
++                    " %s output; the WAV dump is unchanged)\n", g_wa ? "WASAPI" : "XAudio2");
++    }
++    return on;
++}
++
+ int xa2_submit_samples(const int16_t *samples, int num_samples)
+ {
+     XAUDIO2_VOICE_STATE state;
+@@ -180,37 +1309,124 @@
      int idx, n, ok = 1;
      HRESULT hr;
  
 -    if (!g_xa2_initialized || !g_xa2_source) return 0;
++    uint64_t pos;                        /* Blood Wake (lat-a): the WAV index of samples[0] */
++
 +    if (!g_xa2_initialized) return 0;
 +    xa2_check_device();                  /* Blood Wake (item 68) */
++    pos = g_xa2_accepted;
++    g_xa2_accepted += (uint64_t)num_samples;
++    if (g_xa2_stat_on) {
++        ULONGLONG now = GetTickCount64();
++        if (g_bw_lat_on && g_xa2 && now >= g_xa2_perf_next) {
++            XAUDIO2_PERFORMANCE_DATA pd;
++            memset(&pd, 0, sizeof pd);
++            IXAudio2_GetPerformanceData(g_xa2, &pd);
++            bw_lat_ev(BW_LAT_XPERF, bw_lat_now(), pd.CurrentLatencyInSamples,
++                      pd.GlitchesSinceEngineStarted, pd.ActiveSourceVoiceCount, g_xa2_starved_passes,
++                      (int64_t)g_xa2_starved_bytes, g_xa2_passes,
++                      pd.TotalCyclesSinceLastQuery
++                          ? (double)pd.AudioCyclesSinceLastQuery / (double)pd.TotalCyclesSinceLastQuery : 0.0,
++                      0.0);
++            g_xa2_perf_next = now + 1000;
++        }
++        if (now >= g_xa2_stat_next) {
++            if (g_xa2_stat_next)
++                xa2_stat_line("5 s");
++            g_xa2_stat_next = now + 5000;
++        }
++    }
++    if (g_wa) {
++        /* Blood Wake (lat-a): straight into the stream, at once. A failing
++         * call (the device went away, the audio service restarted) is a lost
++         * device, as XAudio2's critical error is. */
++        int pad;
++        long w;
++        if (!bw_wa_active())
++            return 0;                    /* no device: waiting (xa2_check_device) */
++        pad = bw_wa_padding();
++        if (pad < 0) {
++            xa2_wa_failed(bw_wa_last_error());
++            return 0;
++        }
++        if (pad + num_samples > bw_wa_capacity()) {
++            if (g_bw_lat_on)
++                bw_lat_ev(BW_LAT_XBUF, bw_lat_now(), (int64_t)pos, num_samples, pad,
++                          (int64_t)xa2_samples_played(), 0, (int64_t)g_xa2_submitted, 0.0, 0.0);
++            return 0;
++        }
++        w = bw_wa_write(xa2_test_mute() ? NULL : samples, num_samples);   /* NULL: silence */
++        if (g_bw_lat_on)
++            bw_lat_ev(BW_LAT_XBUF, bw_lat_now(), (int64_t)pos, num_samples, pad,
++                      (int64_t)xa2_samples_played(), w ? -1 : 1,
++                      (int64_t)g_xa2_submitted + (w ? 0 : num_samples), 0.0, 0.0);
++        if (w) {
++            xa2_wa_failed(w);
++            return 0;
++        }
++        if ((g_xa2_stat_on || g_lead_auto || g_bw_hot || g_spread > 0) && bw_wa_event())
++            xa2_slack_note(pad, num_samples);   /* au-out; au-lat: the auto lead's costs; au-hot; au-orig: the spread */
++        g_xa2_submitted += (uint64_t)num_samples;
++        g_xa2_draining = 0;
++        g_xa2_frames_written++;
++        return 1;
++    }
 +    if (!g_xa2_source) return 0;
  
      while (num_samples > 0) {
@@ -560,11 +1365,50 @@
          n = XA2_BUF_SAMPLES - g_xa2_fill;
          if (n > num_samples) n = num_samples;
 -        memcpy(g_xa2_bufs[idx][g_xa2_fill], samples,
-+        memcpy(&g_xa2_bufs[idx][g_xa2_fill * XA2_CHANNELS], samples,
-                n * XA2_CHANNELS * sizeof(int16_t));
+-               n * XA2_CHANNELS * sizeof(int16_t));
++        if (g_xa2_fill == 0)
++            g_xa2_buf_first = pos;
++        if (xa2_test_mute())
++            memset(&g_xa2_bufs[idx][g_xa2_fill * XA2_CHANNELS], 0,
++                   n * XA2_CHANNELS * sizeof(int16_t));
++        else
++            memcpy(&g_xa2_bufs[idx][g_xa2_fill * XA2_CHANNELS], samples,
++                   n * XA2_CHANNELS * sizeof(int16_t));
          g_xa2_fill += n;
          samples += n * XA2_CHANNELS;
-@@ -211,6 +609,12 @@
+         num_samples -= n;
++        pos += (uint64_t)n;
+         if (g_xa2_fill < XA2_BUF_SAMPLES)
+             break;
+ 
+         g_xa2_fill = 0;
+         IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                      XAUDIO2_VOICE_NOSAMPLESPLAYED);
+-        if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { ok = 0; continue; }
++        if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
++            ok = 0;
++            if (g_bw_lat_on)
++                bw_lat_ev(BW_LAT_XBUF, bw_lat_now(), (int64_t)g_xa2_buf_first, XA2_BUF_SAMPLES,
++                          state.BuffersQueued, (int64_t)xa2_samples_played(), 0,
++                          (int64_t)g_xa2_submitted, 0.0, 0.0);
++            continue;
++        }
+ 
+         memset(&xbuf, 0, sizeof(xbuf));
+         xbuf.AudioBytes = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
+         xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
+         hr = IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
++        if (g_bw_lat_on)
++            bw_lat_ev(BW_LAT_XBUF, bw_lat_now(), (int64_t)g_xa2_buf_first, XA2_BUF_SAMPLES,
++                      state.BuffersQueued, (int64_t)xa2_samples_played(), FAILED(hr) ? -1 : 1,
++                      (int64_t)g_xa2_submitted + (FAILED(hr) ? 0 : XA2_BUF_SAMPLES), 0.0, 0.0);
+         if (FAILED(hr)) { ok = 0; continue; }
+ 
++        g_xa2_submitted += (uint64_t)XA2_BUF_SAMPLES;
++        g_xa2_draining = 0;
+         g_xa2_next_buf = (idx + 1) % XA2_RING;
+         g_xa2_frames_written++;
+     }
      return ok;
  }
  
@@ -577,7 +1421,72 @@
  int xa2_get_buffer_size(void)
  {
      return XA2_BUF_SAMPLES;
-@@ -261,13 +665,16 @@
+@@ -230,9 +1446,46 @@
+ {
+     XAUDIO2_VOICE_STATE state;
+ 
+-    if (!g_xa2_initialized || !g_xa2_source) return 0;
++    int q;
++
++    if (!g_xa2_initialized || !xa2_have_voice()) return 0;
++    if (g_xa2_stat_on)
++        xa2_stat_poll();                 /* Blood Wake (lat-a) */
++    if (g_wa) {
++        q = bw_wa_padding();             /* Blood Wake (lat-a): exact, no staging */
++        if (q < 0) {
++            xa2_wa_failed(bw_wa_last_error());
++            return 0;
++        }
++        state.BuffersQueued = (UINT32)q;  /* the dry test below: q == 0 */
++        if (bw_wa_event() && bw_wa_mix_rate() == XA2_SAMPLE_RATE && bw_wa_period() > 0) {
++            /* au-out: event-driven at a 48 kHz mix the engine reads whole
++             * periods, so a move of the played count that isn't a whole
++             * number of them is a pass that found too little and played
++             * silence for the rest: that is the underrun here. An empty
++             * buffer right after a full pass is not one (the floor may be one
++             * period exactly). */
++            uint64_t w = bw_wa_written();
++            uint64_t pl = g_xa2_played_base + (w >= (uint64_t)q ? w - (uint64_t)q : 0);
++            if (pl > g_ev_last && g_ev_last && g_xa2_frames_written > 0 && !g_xa2_draining
++                    && (pl - g_ev_last) % (uint64_t)bw_wa_period()) {
++                ULONGLONG now = GetTickCount64();
++                g_xa2_underruns++;
++                if (now - g_xa2_underrun_logged >= 1000) {
++                    g_xa2_underrun_logged = now;
++                    fprintf(stderr, "[XA2] underrun x%u (a short pass)\n", g_xa2_underruns);
++                }
++            }
++            if (pl >= g_ev_last)
++                g_ev_last = pl;
++            g_xa2_dry = 0;
++            return q;
++        }
++    } else {
+     IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                  XAUDIO2_VOICE_NOSAMPLESPLAYED);
++        q = (int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill;
++    }
+     if (state.BuffersQueued == 0 && g_xa2_frames_written > 0) {
+         if (!g_xa2_dry) {
+             ULONGLONG now = GetTickCount64();
+@@ -246,7 +1499,7 @@
+     } else {
+         g_xa2_dry = 0;
+     }
+-    return (int)state.BuffersQueued * XA2_BUF_SAMPLES + g_xa2_fill;
++    return q;
+ }
+ 
+ /* Mark the coming dry spell as already seen; the first call that finds
+@@ -254,6 +1507,7 @@
+ void xa2_expect_drain(void)
+ {
+     g_xa2_dry = 1;
++    g_xa2_draining = 1;                  /* Blood Wake (lat-a): BW_XA2_STATS */
+ }
+ 
+ unsigned xa2_underruns(void)
+@@ -261,13 +1515,603 @@
      return g_xa2_underruns;
  }
  
@@ -589,10 +1498,597 @@
  
 -    if (!g_xa2_initialized || !g_xa2_source) return 0;
 +    if (!g_xa2_initialized) return 0;
++    if (g_wa)                            /* Blood Wake (lat-a) */
++        return g_xa2_played_base + (bw_wa_active() ? bw_wa_consumed() : 0);
 +    if (!g_xa2_source) return g_xa2_played_base;
      IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
 -    return state.SamplesPlayed;
 +    return g_xa2_played_base + state.SamplesPlayed;
++}
++
++/* Blood Wake (au-lat, docs/audio/lat.md, deliverable 3; lat-a section 5's
++ * idea): BW_APU_VPWAKE=1 (Remastered with the event-driven WASAPI output; off
++ * by default) starts the frame thread's next period as soon as a voice starts
++ * (VOICE_ON, on the game's thread), instead of at the next pass, when the
++ * queue is full and the frame thread is waiting. The period is the one it
++ * would have made at the next pass, so the sound's place in the stream, and
++ * every sample in it, are unchanged; only the time it is made moves. */
++static int g_vpwake = -1;
++static volatile LONG g_vpwake_flag;
++void *xa2_wait_event(void);
++
++static int xa2_vpwake_on(void)
++{
++    if (g_vpwake < 0) {
++        const char *e = getenv("BW_APU_VPWAKE");
++        g_vpwake = bw_edition_at_least(BW_ED_REMASTERED) && e && *e == '1';
++        if (g_vpwake)
++            fprintf(stderr, "[APU] a voice's start wakes the frame thread for its period (BW_APU_VPWAKE)\n");
++    }
++    return g_vpwake;
++}
++
++void xa2_voice_wake(void)
++{
++    void *ev;
++    if (!xa2_vpwake_on() || (ev = xa2_wait_event()) == NULL)
++        return;                             /* event-driven only */
++    InterlockedExchange(&g_vpwake_flag, 1);
++    SetEvent((HANDLE)ev);
++}
++
++/* The carried apu_core.c's pacing at a period boundary: 1 once after a voice
++ * started, to make a period now; clear_only: the period being made picks it
++ * up anyway. */
++int xa2_take_voice_wake(int clear_only)
++{
++    if (g_vpwake <= 0)
++        return 0;
++    if (clear_only) {
++        InterlockedExchange(&g_vpwake_flag, 0);
++        return 0;
++    }
++    return InterlockedExchange(&g_vpwake_flag, 0) != 0;
++}
++
++/* Blood Wake (au-out, carried apu_core.c's throttle): the event the WASAPI
++ * engine sets once a pass, when the live stream is event-driven; NULL
++ * otherwise (XAudio2, a polled stream, no device). The frame thread waits on
++ * it instead of a timer while the queue is full, and tops the stream up
++ * right after each pass. */
++void *xa2_wait_event(void)
++{
++    return g_xa2_initialized && g_wa ? bw_wa_event() : NULL;
++}
++
++/* ---- Blood Wake (au-out): the top-up just in time (BW_WASAPI_LEAD) -------
++ *
++ * Event-driven, the stream is topped up right after each pass: the next pass
++ * is 10 ms away, so the samples written then wait about a period before the
++ * engine reads them. BW_WASAPI_LEAD=<ms> (wherever the WASAPI output runs;
++ * off unless set, never in a preset) tops it up that long before the next pass instead, from the
++ * passes' own times (each wake on the engine's event after a wait). The
++ * samples are then that much younger when read; the lead must cover making a
++ * pass's worth of periods (the DSP stage's share above all) plus the
++ * scheduler's delay. A late top-up is a short pass, counted. The slack of
++ * each critical write (the one that brings the queue up to a whole pass) to
++ * the next pass is counted for BW_XA2_STATS in either mode. */
++static int64_t g_pass_us;              /* the last pass seen (a wake on the event after a wait) */
++static int64_t g_lead_us = -1;
++#define XA2_SLACK_BINS 64
++static unsigned g_slack_h[XA2_SLACK_BINS]; /* 0.25 ms bins, the last one open; bin 0 also counts late */
++
++static int64_t xa2_now_us(void)
++{
++    LARGE_INTEGER f, c;
++    QueryPerformanceFrequency(&f);
++    QueryPerformanceCounter(&c);
++    return (int64_t)(c.QuadPart / f.QuadPart) * 1000000LL + (int64_t)(c.QuadPart % f.QuadPart) * 1000000LL / f.QuadPart;
++}
++
++/* au-lat (docs/audio/lat.md, deliverable 5): BW_WASAPI_LEAD=auto[,<margin ms>],
++ * the lead that follows what a top-up really costs. At the queue's floor a
++ * fixed lead paid (3 ms: VOICE_ON to speakers 37.6 -> 24.8 ms) but left too
++ * little room on a busy PC (one short pass at 3 ms; the worst slack 0.25-1.25
++ * ms at 3-4 ms beside two other games), and the cost of a top-up (from when it
++ * may start to the write that completes the pass: the frame thread's wake plus
++ * making the periods) varies with the PC's load: about 2.5 ms here at most,
++ * 7.75 ms on au-out's pinned small PC. So:
++ *  - each pass's cost is measured (the critical write), and the lead is the
++ *    worst cost of the last 6 s plus the margin (3 ms), at least 3 ms;
++ *  - it rises at once when a pass costs more, and comes down only as the 6 s
++ *    window forgets the worst one;
++ *  - when the lead would leave under 1 ms of the pass, or after any short pass
++ *    (for 20 s, starting over), the stream is topped up right after the pass
++ *    as without a lead (au-out's event mode: a whole pass of room);
++ *  - for the first 6 s of a stream it waits to have the costs. */
++static int     g_lead_auto;
++static int64_t g_lead_margin_us = 3000;
++#define XA2_LEAD_MIN_US 3000
++#define XA2_COST_SLOTS 6
++static int64_t g_cost_max[XA2_COST_SLOTS], g_cost_t0;
++static int     g_cost_slot, g_cost_filled;
++static int64_t g_lead_cur;                 /* auto: the lead in use; 0: right after the pass */
++static int64_t g_lead_off_until;
++static unsigned g_lead_u_seen;
++static unsigned g_lead_changes, g_lead_logged;
++static int64_t g_lead_cost_worst_line;     /* for the 5 s line */
++
++static int64_t xa2_lead_us(void)
++{
++    if (g_lead_us < 0) {
++        const char *e = getenv("BW_WASAPI_LEAD");
++        g_lead_us = 0;
++        if (e && (e[0] == 'a' || e[0] == 'A')) {
++            const char *c = strchr(e, ',');
++            g_lead_auto = 1;
++            if (c && atof(c + 1) > 0)
++                g_lead_margin_us = (int64_t)(atof(c + 1) * 1000.0);
++            fprintf(stderr, "[XA2] WASAPI: topped up just in time, the lead following the top-ups' cost"
++                            " (the worst of 6 s plus %.2f ms, at least %.2f; right after the pass when that"
++                            " leaves no room, and for 20 s after a short pass) (BW_WASAPI_LEAD=auto)\n",
++                    g_lead_margin_us / 1000.0, XA2_LEAD_MIN_US / 1000.0);
++        } else if (e && *e) {
++            g_lead_us = (int64_t)(atof(e) * 1000.0);
++            if (g_lead_us)
++                fprintf(stderr, "[XA2] WASAPI: topped up %.2f ms before each pass (BW_WASAPI_LEAD)\n",
++                        g_lead_us / 1000.0);
++        }
++    }
++    return g_lead_auto ? g_lead_cur : g_lead_us;
++}
++
++/* auto: a new cost (the critical write's, us) and the lead from it. */
++static void xa2_lead_cost(int64_t now, int64_t cost, int64_t pass_us)
++{
++    int64_t worst = 0, want;
++    int i;
++    if (!g_cost_t0 || now - g_cost_t0 >= 1000000) {
++        if (g_cost_t0 && g_cost_filled < XA2_COST_SLOTS)
++            g_cost_filled++;
++        g_cost_slot = (g_cost_slot + 1) % XA2_COST_SLOTS;
++        g_cost_max[g_cost_slot] = 0;
++        g_cost_t0 = now;
++    }
++    if (cost > g_cost_max[g_cost_slot])
++        g_cost_max[g_cost_slot] = cost;
++    if (cost > g_lead_cost_worst_line)
++        g_lead_cost_worst_line = cost;
++    for (i = 0; i < XA2_COST_SLOTS; i++)
++        if (g_cost_max[i] > worst)
++            worst = g_cost_max[i];
++    want = worst + g_lead_margin_us;
++    if (want < XA2_LEAD_MIN_US)
++        want = XA2_LEAD_MIN_US;
++    if (g_cost_filled < XA2_COST_SLOTS - 1 || now < g_lead_off_until || want > pass_us - 1000)
++        want = 0;                          /* right after the pass */
++    if (want != g_lead_cur) {
++        if ((want == 0) != (g_lead_cur == 0) && g_lead_logged++ < 100)
++            fprintf(stderr, "[XA2] WASAPI: the lead %s (the worst top-up of the last %d s %.2f ms)\n",
++                    want ? "on" : "off: topped up right after each pass", XA2_COST_SLOTS, worst / 1000.0);
++        g_lead_cur = want;
++        g_lead_changes++;
++    }
++}
++
++/* auto: a short pass (an underrun) turns the lead off for 20 s and forgets the
++ * costs. */
++static void xa2_lead_check_short(int64_t now)
++{
++    if (!g_lead_auto || g_xa2_underruns == g_lead_u_seen)
++        return;
++    g_lead_u_seen = g_xa2_underruns;
++    g_lead_off_until = now + 20000000;
++    memset(g_cost_max, 0, sizeof g_cost_max);
++    g_cost_filled = 0;
++    g_cost_t0 = 0;
++    if (g_lead_cur && g_lead_logged++ < 100)
++        fprintf(stderr, "[XA2] WASAPI: a short pass: the lead off for 20 s (topped up right after each pass)\n");
++    g_lead_cur = 0;
++}
++
++/* The next pass after now, from the last one seen and the engine's period. */
++static int64_t xa2_next_pass(int64_t now_us)
++{
++    int64_t p = (int64_t)(bw_wa_period() > 0 ? bw_wa_period() : 480) * 1000000LL / XA2_SAMPLE_RATE;
++    int64_t n;
++    if (!g_pass_us || now_us - g_pass_us > 1000000)
++        return 0;
++    n = g_pass_us + p;
++    if (n <= now_us)
++        n += ((now_us - n) / p + 1) * p;
++    return n;
++}
++
++/* ---- Blood Wake (lane au-orig, call ORIG-4, docs/audio/spread.md): the spread
++ *
++ * Event-driven, the frame thread makes a pass's periods back to back right
++ * after the engine's pass: about 480 frames a pass at this PC's 10 ms, so two
++ * of the APU's 256-frame periods, then one now and then. So the second period
++ * of a pair is made (its voices' ends set, where DirectSound's GetStatus reads
++ * them) up to 5.3 ms before a steady pace would make it, and the title saw
++ * sounds end 1.5-2.0 ms sooner on average than on XAudio2, whose pacing makes
++ * one period per period (docs/audio/orig.md 3.5).
++ *
++ * BW_WASAPI_SPREAD (wherever this output runs, event-driven and shared, with
++ * no BW_WASAPI_LEAD): the period that completes a pass's need is made at the
++ * spread point, BW_WASAPI_SPREAD ms after the pass (default 5.33: one APU
++ * period, the steady pace), the first ones as before right after the pass.
++ * Never later than the next pass less a room: the worst time making such a
++ * period took over the last 6 s plus a margin (2.5 ms), and at least a floor
++ * (3 ms), each counted from when its period was due (a late wake counts);
++ * a busy PC so moves it back toward the pass by itself. The pass
++ * times are a grid fitted to the earliest wakes on the engine's event (a late
++ * wake can't push the schedule later; the grid follows the device's clock
++ * drift by at most 20 us a pass). The samples are as young when read as the
++ * steady pace makes them (inferred: about 2 ms younger on average).
++ * BW_WASAPI_SPREAD=0: back to back, as before; =<ms>[,<margin ms>[,<floor ms>]]
++ * sets the point and the room. BW_XA2_STATS adds the periods deferred, made at
++ * once, and the room, to the 5 s line. */
++#define XA2_SPREAD_DEFAULT 0               /* off: a short pass in a loaded soak (docs/audio/spread.md); =1 turns it on */
++static int     g_spread = -1;                /* 0 off, 1 the mid-pass point, 2 the steady pace */
++static int64_t g_spread_us = 5333, g_spread_margin_us = 2500, g_spread_floor_us = 3000;
++static int64_t g_grid_us;                  /* a pass time: the earliest wakes on the event */
++static int64_t g_spread_go;                /* when the deferred period's making began (0: none) */
++static int64_t g_sp_cost[XA2_COST_SLOTS], g_sp_t0;
++static int     g_sp_slot;
++static unsigned g_sp_deferred, g_sp_now;
++static int     g_sp_waited;                /* a wait for the point was asked since the last making */
++static int64_t g_sp_worst_line, g_sp_room_line;
++
++static int xa2_spread_on(void)
++{
++    if (g_spread < 0) {
++        const char *e = getenv("BW_WASAPI_SPREAD");
++        g_spread = XA2_SPREAD_DEFAULT;
++        if (e && *e) {
++            double a = 0, b = 0, c = 0;
++            int n;
++            if (e[0] == 'u' || e[0] == 'U') {
++                g_spread = 2;              /* the steady pace */
++                n = sscanf(e + 1, ",%lf,%lf", &b, &c);
++                if (n >= 1 && b >= 0 && b < 20.0)
++                    g_spread_margin_us = (int64_t)(b * 1000.0);
++                if (n >= 2 && c >= 0 && c < 20.0)
++                    g_spread_floor_us = (int64_t)(c * 1000.0);
++            } else {
++                n = sscanf(e, "%lf,%lf,%lf", &a, &b, &c);
++                g_spread = !(n >= 1 && a == 0);
++                if (n >= 1 && a > 1.0 && a < 20.0)
++                    g_spread_us = (int64_t)(a * 1000.0);
++                if (n >= 2 && b >= 0 && b < 20.0)
++                    g_spread_margin_us = (int64_t)(b * 1000.0);
++                if (n >= 3 && c >= 0 && c < 20.0)
++                    g_spread_floor_us = (int64_t)(c * 1000.0);
++            }
++        }
++        if (g_spread == 1)
++            fprintf(stderr, "[XA2] WASAPI: each pass's last period made %.2f ms into the pass"
++                            " (no later than the next pass less the worst making of 6 s plus %.2f ms, at least"
++                            " %.2f) (BW_WASAPI_SPREAD; =0 back to back)\n", g_spread_us / 1000.0,
++                    g_spread_margin_us / 1000.0, g_spread_floor_us / 1000.0);
++        else if (g_spread == 2)
++            fprintf(stderr, "[XA2] WASAPI: each period made when its samples are due at the steady pace, the"
++                            " queue's level unchanged (no later than the next pass less the worst making of 6 s"
++                            " plus %.2f ms, at least %.2f) (BW_WASAPI_SPREAD=u; =0 back to back)\n",
++                    g_spread_margin_us / 1000.0, g_spread_floor_us / 1000.0);
++    }
++    return g_spread;
++}
++
++static int64_t xa2_period_us(void)
++{
++    return (int64_t)(bw_wa_period() > 0 ? bw_wa_period() : 480) * 1000000LL / XA2_SAMPLE_RATE;
++}
++
++/* A wake on the engine's event after a wait, at t: the grid keeps the
++ * earliest; later wakes move it on by at most 20 us (the device's clock
++ * against the host's). */
++static void xa2_grid_note(int64_t t)
++{
++    int64_t p = xa2_period_us(), k, pred, d;
++    if (!g_grid_us || t - g_grid_us > 1000000 || t < g_grid_us) {
++        g_grid_us = t;
++        return;
++    }
++    k = (t - g_grid_us + p / 2) / p;
++    pred = g_grid_us + k * p;
++    d = t - pred;
++    g_grid_us = d < 0 ? t : pred + (d < 20 ? d : 20);
++}
++
++/* The worst making of a deferred period over the last 6 s. */
++static int64_t xa2_spread_worst(void)
++{
++    int64_t w = 0;
++    int i;
++    for (i = 0; i < XA2_COST_SLOTS; i++)
++        if (g_sp_cost[i] > w)
++            w = g_sp_cost[i];
++    return w;
++}
++
++static void xa2_spread_cost(int64_t now, int64_t cost)
++{
++    if (!g_sp_t0 || now - g_sp_t0 >= 1000000) {
++        g_sp_slot = (g_sp_slot + 1) % XA2_COST_SLOTS;
++        g_sp_cost[g_sp_slot] = 0;
++        g_sp_t0 = now;
++    }
++    if (cost > g_sp_cost[g_sp_slot])
++        g_sp_cost[g_sp_slot] = cost;
++    if (cost > g_sp_worst_line)
++        g_sp_worst_line = cost;
++}
++
++/* Carried apu_core.c's pacing, event-driven, below the high mark, when no
++ * lead applies: need is what the queue lacks of its mark (samples), period
++ * the APU's period (samples). When to make the next period (0: now). */
++int64_t xa2_spread_due(int64_t now_us, int q, int high, int period)
++{
++    int64_t p, k, t, nx, room, due;
++    int need = high - q, ep;
++    if (!xa2_spread_on() || !bw_wa_event() || bw_wa_exclusive() || xa2_lead_us() ||
++        (g_spread == 1 && need > period) ||
++        !g_grid_us || now_us - g_grid_us > 1000000 || now_us < g_grid_us)
++        return 0;
++    p = xa2_period_us();
++    ep = bw_wa_period() > 0 ? bw_wa_period() : 480;
++    k = (now_us - g_grid_us) / p;
++    t = g_grid_us + k * p;                 /* this pass */
++    nx = t + p;                            /* the next */
++    room = xa2_spread_worst() + g_spread_margin_us;
++    if (room < g_spread_floor_us)
++        room = g_spread_floor_us;
++    if (g_spread == 2) {
++        /* the steady pace: the samples the queue holds beyond what the next
++         * pass leaves at the mark are played, at the engine's rate, by
++         * t + (q - (high - ep)) / rate; the next period is made then, so the
++         * queue's level stays as before. A period that the next pass needs
++         * more than one of is kept a room further back. */
++        due = t + (int64_t)(q - (high - ep)) * 1000000LL / XA2_SAMPLE_RATE;
++        if (need > period)
++            room *= 2;
++    } else {
++        due = t + g_spread_us;
++    }
++    if (due > nx - room)
++        due = nx - room;
++    if (room > g_sp_room_line)
++        g_sp_room_line = room;
++    if (due > now_us) {
++        g_sp_waited = 1;
++        return due;
++    }
++    if (!g_spread_go) {
++        /* the cost is counted from when the period was due, so a late wake
++         * (the scheduler's, not the making's) raises the room as well */
++        g_spread_go = due > t ? due : now_us;
++        if (g_sp_waited)
++            g_sp_deferred++;               /* made at its point */
++        else
++            g_sp_now++;                    /* already past it: at once */
++        g_sp_waited = 0;
++    }
++    return 0;
++}
++
++/* Carried apu_core.c's pacing, event-driven, below the high mark: when to
++ * start the top-up (0: now). */
++int64_t xa2_topup_due(int64_t now_us)
++{
++    int64_t lead, n;
++    xa2_lead_us();
++    xa2_lead_check_short(now_us);          /* au-lat: BW_WASAPI_LEAD=auto */
++    lead = xa2_lead_us();
++    if (!lead || !bw_wa_event())
++        return 0;
++    n = xa2_next_pass(now_us);
++    return n && n - lead > now_us ? n - lead : 0;
++}
++
++/* Carried apu_core.c's throttle: wait for the engine's event or wait_us,
++ * whichever is first, on a high-resolution timer where Windows has one (else
++ * whole milliseconds). Returns 1 on the event; a wake on it after a real wait
++ * is a pass's time. */
++int xa2_wait(void *ev, int64_t wait_us)
++{
++    static HANDLE tm;
++    static int tried;
++    DWORD r;
++    int64_t t0 = xa2_now_us();
++    if (!tried) {
++        tried = 1;
++        tm = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
++                                    TIMER_ALL_ACCESS);
++    }
++    if (tm) {
++        HANDLE hs[2];
++        LARGE_INTEGER due;
++        hs[0] = (HANDLE)ev;
++        hs[1] = tm;
++        due.QuadPart = -(wait_us * 10);
++        SetWaitableTimer(tm, &due, 0, NULL, NULL, FALSE);
++        r = WaitForMultipleObjects(2, hs, FALSE, (DWORD)(wait_us / 1000 + 50));
++        if (r != WAIT_OBJECT_0 + 1)
++            CancelWaitableTimer(tm);
++    } else {
++        r = WaitForSingleObject((HANDLE)ev, (DWORD)((wait_us + 999) / 1000));
++    }
++    if (r == WAIT_OBJECT_0) {
++        int64_t t = xa2_now_us();
++        if (t - t0 >= 300) {
++            g_pass_us = t;                /* it waited, then the pass came */
++            xa2_grid_note(t);             /* au-orig: the spread's pass grid */
++        }
++        return 1;
++    }
++    return 0;
++}
++
++/* The critical write's slack (BW_XA2_STATS): pad was below a pass and this
++ * write makes it a whole one. */
++static void xa2_slack_note(int pad, int n)
++{
++    int p = bw_wa_period() > 0 ? bw_wa_period() : 480;
++    int64_t now, nx;
++    int b;
++    if (pad >= p || pad + n < p)
++        return;
++    now = xa2_now_us();
++    nx = xa2_next_pass(now);
++    if (g_bw_hot)
++        bw_hot_cw(pad, n, nx ? nx - now : -1);   /* au-hot: the pass's critical write */
++    if (g_spread_go) {
++        /* au-orig: the spread's making, from its point to the write */
++        if (now - g_spread_go < 50000)  /* a stall (no write for 50 ms) isn't a making */
++            xa2_spread_cost(now, now - g_spread_go);
++        g_spread_go = 0;
++    }
++    if (!nx)
++        return;
++    if (g_lead_auto) {
++        /* au-lat: the cost of this top-up, from when it could start (right
++         * after the pass, or the lead before the next one) */
++        int64_t pus = (int64_t)p * 1000000LL / XA2_SAMPLE_RATE;
++        int64_t cost = (g_lead_cur ? g_lead_cur : pus) - (nx - now);
++        xa2_lead_cost(now, cost < 0 ? 0 : cost, pus);
++    }
++    if (!g_xa2_stat_on)
++        return;
++    b = (int)((nx - now) / 250);
++    g_slack_h[b < 0 ? 0 : b >= XA2_SLACK_BINS ? XA2_SLACK_BINS - 1 : b]++;
++}
++
++static void xa2_slack_line(void)
++{
++    unsigned long tot = 0, c = 0;
++    int i, mn = -1, p1 = -1, med = -1;
++    for (i = 0; i < XA2_SLACK_BINS; i++)
++        tot += g_slack_h[i];
++    if (!tot)
++        return;
++    for (i = 0; i < XA2_SLACK_BINS; i++) {
++        if (!g_slack_h[i])
++            continue;
++        if (mn < 0)
++            mn = i;
++        c += g_slack_h[i];
++        if (p1 < 0 && c * 100 >= tot)
++            p1 = i;
++        if (c * 2 >= tot) {
++            med = i;
++            break;
++        }
++    }
++    fprintf(stderr, "; the write that completes a pass lands min %.2f p1 %.2f median %.2f ms before it (%lu)",
++            mn * 0.25, p1 * 0.25, med * 0.25, tot);
++    memset(g_slack_h, 0, sizeof g_slack_h);
++    if (g_lead_auto) {
++        /* au-lat: the auto lead */
++        fprintf(stderr, "; the lead %.2f ms (auto; %u changes; the worst top-up %.2f ms)", g_lead_cur / 1000.0,
++                g_lead_changes, g_lead_cost_worst_line / 1000.0);
++        g_lead_changes = 0;
++        g_lead_cost_worst_line = 0;
++    }
++    if (g_spread > 0) {
++        /* au-orig: the spread */
++        fprintf(stderr, "; the spread: %u periods at their point, %u at once; the room up to %.2f ms (the worst"
++                        " making %.2f ms)", g_sp_deferred, g_sp_now, g_sp_room_line / 1000.0,
++                g_sp_worst_line / 1000.0);
++        g_sp_deferred = g_sp_now = 0;
++        g_sp_worst_line = g_sp_room_line = 0;
++    }
++}
++
++/* Blood Wake (au-out, carried apu_core.c's adaptive queue): the WASAPI
++ * output's pacing marks in samples, from the engine's period P (480 frames
++ * at this PC's 10 ms; IAudioClient3's where smaller):
++ *   floor  P + a margin: event-driven, the stream is topped up to it right
++ *          after each pass, so the next pass finds a whole period and has
++ *          the pass's 10 ms to be made in: no margin (measured, 0 glitches
++ *          at P under load, docs/audio/out.md 5; BW_WASAPI_MARGIN, samples);
++ *          polled, 288 (lat-a's measured 768 at P = 480). BW_WASAPI_FLOOR
++ *          sets the floor itself.
++ *   start  1536 (32 ms, lat-a's start; BW_WASAPI_START), then two steps
++ *          down to the floor after 40 s with no short pass: a boot's
++ *          loading can stall the frame thread past one pass (seen: 55 ms
++ *          once, at Remastered's high frame rate), and real play reaches a
++ *          mission long after the 40 s.
++ *   cap    2688 (56 ms, lat-a's cap)
++ * each within the stream's buffer (less a period). Returns 0 on XAudio2, and
++ * with BW_WASAPI_MARKS=buffers or RECOMP_AUDIO_BUF_SAMPLES (lat-a's
++ * 384-sample units). */
++/* Blood Wake (au-fx, carried apu_core.c's adaptive queue): 1, once, after a
++ * WASAPI stream was put in place with no tail to carry (a lost device), so
++ * the queue starts again at its start mark (bw_apu_wasapi.c; 0 on XAudio2
++ * and with BW_WASAPI_REBUILD_START=0). */
++int xa2_queue_restart(void)
++{
++    return g_xa2_initialized && g_wa && bw_wa_take_queue_restart();
++}
++
++/* au-lat (docs/audio/lat.md 2.4): the event-driven floor stays one engine
++ * period (au-out's). A battle's moments of slow periods (RC2 has them too)
++ * leave the write that completes a pass at 0-0.25 ms before it in about 1
++ * battle in 3-10, and a 2-4 ms short pass in about 1 in 10. BW_WASAPI_MARGIN
++ * adds samples to the floor; 96 (2 ms) reduced but didn't remove them in its
++ * confirmation, and a margin is a price on every sound, so the cause (the
++ * frame thread's own work, not the lock) is for a lane of its own. */
++#define BW_WA_EVENT_MARGIN 0
++int xa2_marks_samples(int *floor, int *start, int *cap)
++{
++    static int mode = -1, last_p = 480, margin, margin_set, floor_set = -1, start_set = -1, ev = 1;
++    const char *e;
++    int p, fl, st, c, lim;
++    if (!g_xa2_initialized || !g_wa)
++        return 0;
++    if (mode < 0) {                      /* read once */
++        e = getenv("BW_WASAPI_MARKS");
++        mode = !(e && e[0] == 'b') && !getenv("RECOMP_AUDIO_BUF_SAMPLES");
++        e = getenv("BW_WASAPI_EVENT");
++        ev = !(e && *e == '0');
++        margin = ev ? BW_WA_EVENT_MARGIN : 288;
++        e = getenv("BW_WASAPI_MARGIN");
++        if (e && *e)
++            margin = atoi(e), margin_set = 1;
++        e = getenv("BW_WASAPI_FLOOR");
++        if (e && *e)
++            floor_set = atoi(e);
++        e = getenv("BW_WASAPI_START");
++        if (e && *e)
++            start_set = atoi(e);
++    }
++    if (!mode)
++        return 0;
++    p = bw_wa_period();
++    if (p > 0)
++        last_p = p;                      /* no stream: the last one's */
++    p = last_p;
++    /* au-lat: exclusive mode (a test switch): the device wants a whole period
++     * every 3 ms or so, so the ring keeps one APU period more than that */
++    fl = floor_set >= 0 ? floor_set : p + (!margin_set && bw_wa_exclusive() ? 256 : margin);
++    st = start_set >= 0 ? start_set : 1536;
++    if (st < fl)
++        st = fl;
++    c = 2688;
++    if (c < st)
++        c = st;
++    lim = bw_wa_capacity() - 256;
++    if (bw_wa_active() && lim > 0) {
++        if (c > lim)
++            c = lim;
++        if (st > c)
++            st = c;
++        if (fl > st)
++            fl = st;
++    }
++    if (fl < 1)
++        fl = 1;
++    *floor = fl;
++    *start = st;
++    *cap = c;
++    return 1;
  }
  
  #else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */

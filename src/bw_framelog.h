@@ -6,11 +6,17 @@
 
 enum {
     BW_FL_G_FRAME = 1,      /* game thread: Graphics_HandleMessage message 8 begins */
-    BW_FL_G_FRAME_END,      /*   ... ends (a = steps run since the last frame) */
+    BW_FL_G_FRAME_END,      /*   ... ends (a = steps run since the last frame, b = the last PUT
+                                 handed over, lat-q: matches the frame to its walk and flip) */
     BW_FL_G_UPD,            /*   Game_Update begins */
     BW_FL_G_UPD_END,        /*   Game_Update ends */
     BW_FL_G_KICK,           /*   a KickOff (a = waited us, b = segments out at entry, c = ring seq) */
     BW_FL_G_BOT,            /*   D3D's wait for a GPU time (a = waited us, b = fence, c = GPU time at entry) */
+    BW_FL_G_JIT,            /*   lat-q: the just-in-time wait before a pass (a = waited us, b = what it
+                                 waited for: 1 the walk, 2 the flip hold, 4 a present-side wait,
+                                 8 the present pacing's slot, 16 gave up on an idle walk,
+                                 32 started at the beat across a present-side wait;
+                                 c = 1 when the guard ended it) */
     BW_FL_N_WALK = 10,      /* NV2A thread: a segment walked (a = PUT, b = us walking, c = GET before) */
     BW_FL_N_FLIP,           /*   the back end's flip (a = us presenting, b = 1 presented / 0 dropped / 2 off-screen) */
     BW_FL_N_HOLD,           /*   a flip hold begins */

@@ -444,7 +444,8 @@ void sub_000DB8B9(void)
     }
     fflush(stderr);
     /* The launch ends in HalReturnToFirmware -> ExitProcess, which skips
-     * atexit: write the sampling profile (BW_PROFILE) now. */
+     * atexit: write the sampling profile (BW_PROFILE) now. (The log's ring is
+     * drained by the bridge, kernel_bridge.c, just before the exit.) */
     {
         extern void bw_profile_dump(const char *why);
         extern void bw_edition_summary(void);
@@ -686,6 +687,14 @@ extern void sub_0012C9F0_gen(void);
  * in every edition but Original (BW_HIFPS_ASYNC, default 3); otherwise at the first
  * KickOff from BW_KICKOFF_ASYNC (default 3, every edition). -1 = not set. */
 int g_bw_kickoff_async = -1;
+/* lat-q: the last segment handed over (PUT, as the walk sees it) and the
+ * guest word block whose +0x44 is GET, for Remastered's just-in-time frames
+ * (bw_hifps_hooks.c) and the frame log's frame-to-flip match. Host-side
+ * copies only; nothing in guest memory changes. */
+volatile uint32_t g_bw_ko_user, g_bw_ko_last_put;
+/* lat-q: the game thread's time waiting in the async KickOff, us (host-side;
+ * BW_HIFPS_JIT=4 takes it out of a pass's own work) */
+unsigned long long g_bw_ko_wait_us;
 
 void sub_0012C9F0(void)
 {
@@ -752,10 +761,12 @@ void sub_0012C9F0(void)
         static unsigned seq;
         uint32_t user = BW_MEM32(dev + 0x2304), p = put & 0x03FFFFFFu;
         unsigned out, out0 = 99;
-        unsigned long long fl_t0 = g_bw_fl_on ? bw_fl_ticks() : 0;
+        unsigned long long fl_t0 = g_bw_fl_on ? bw_fl_ticks() : 0, kw0 = 0;
         BW_MEM32(user + 0x40) = p;
         BW_MEM32(dev + 0x18) = put;
         ring[++seq & 15u] = p;
+        g_bw_ko_user = user;                     /* lat-q: host-side copies (above) */
+        g_bw_ko_last_put = p;
         bw_put_queue_push(p);                    /* P1: the walk per segment (BW_PB_SEGWALK) */
         _mm_sfence();
         BW_MEM32(regs + 0x100410) = BW_MEM32(regs + 0x100410) | 0x10000u;
@@ -768,12 +779,16 @@ void sub_0012C9F0(void)
                 out0 = out;
             if (out <= (unsigned)g_bw_kickoff_async)
                 break;
+            if (!kw0)
+                kw0 = bw_fl_ticks();             /* lat-q: g_bw_ko_wait_us */
             xbox_IrqSafePoint();
             if (++n < 64)
                 _mm_pause();
             else
                 bw_flush_wait();
         }
+        if (kw0)
+            g_bw_ko_wait_us += bw_fl_us_since(kw0);
         if (fl_t0)
             bw_fl_event(BW_FL_G_KICK, bw_fl_us_since(fl_t0), out0, seq);
         g_eax = user;
@@ -1037,4 +1052,70 @@ void sub_000308E0(void)
         if (*st0 > r2)
             *st0 = (*st0 - r2) / (double)k + r2;
     }
+}
+
+/* D-011 hook, Remastered only (D-016 amendment; the high frame rate, lane
+ * au-fx, the wake audit's T1; BW_HIFPS_PFXTRAIL=0 is the undo):
+ * PFX_ShiftTrailHistory 0x00023F80 (ecx = a particle, edx = its emitter; no
+ * stack arguments, a plain ret). Behaviours 1, 3, 4, 5, 7, 8 and 9 call it
+ * for every particle on every drawn frame (seen, e.g. 0x24069-0x24084), so
+ * at 120-360 fps a trail ribbon (shields, power-ups, the cannon's muzzle
+ * spark) spans a quarter to a twelfth of its 30 fps length. On a drawn
+ * frame with no new game step bw_hifps_trail_hold (src/bw_hifps_hooks.c)
+ * draws the next step's ribbon (its head the particle now), widens the
+ * bounds as the body would and puts the stored points back after the frame,
+ * and the call returns here; on a frame after m steps it makes m - 1 of the
+ * m shifts and the body the last (B+, call A10); otherwise, in Original
+ * always, the game's own body runs unchanged. Evidence:
+ * docs/remaster/wake.md (Audit, T1), docs/audio/fx.md (its parity runs,
+ * sections 3 and 7, and B+). */
+extern void sub_00023F80_gen(void);
+extern int bw_hifps_trail_hold(void);
+
+void sub_00023F80(void)
+{
+    if (bw_hifps_trail_hold()) {
+        g_esp += 4;                         /* the body's own ret */
+        return;
+    }
+    sub_00023F80_gen();
+}
+
+/* D-011 hook, Remastered only (D-016 amendment; the high frame rate, lane
+ * au-fx, the wake audit's T3; BW_HIFPS_BOLTPHASE=0 is the undo):
+ * Lightning_UpdateBolt 0x000253B0, behaviour 10 (thiscall, ecx = the
+ * emitter, [esp+4] the frame time; ret 4), the Stinger's hit bolt
+ * (BUILTIN_Lightning). It walks the bolt's phase (+0x2A8) once per particle
+ * per call, i.e. per drawn frame (seen, 0x25508-0x25562). On a drawn frame
+ * with no new game step the phase is put back after the game's own body
+ * (bw_hifps_bolt_hold / bw_hifps_bolt_release, src/bw_hifps_hooks.c), so it
+ * walks per step as at 30 fps; on a drawn frame that follows m >= 2 steps
+ * the body runs m times, as m frames of Original (bw_hifps_bolt_extra; B+,
+ * call A10); otherwise, in Original always, the body runs once unchanged and
+ * nothing is put back. Evidence: docs/remaster/wake.md (Audit, T3),
+ * docs/audio/fx.md. */
+extern void sub_000253B0_gen(void);
+extern int bw_hifps_bolt_hold(uint32_t emitter, uint32_t *phase);
+extern void bw_hifps_bolt_release(uint32_t emitter, uint32_t phase);
+extern int bw_hifps_bolt_extra(uint32_t emitter);
+extern __declspec(thread) uint32_t g_ebx, g_esi, g_edi, g_ebp;   /* RECOMP_TLS: TK-7 */
+
+void sub_000253B0(void)
+{
+    uint32_t emitter = g_ecx, phase = 0, dt = BW_MEM32(g_esp + 4), sp0 = g_esp;
+    int extra = bw_hifps_bolt_extra(emitter);
+    int hold = bw_hifps_bolt_hold(emitter, &phase);
+    while (extra-- > 0) {
+        uint32_t ebx = g_ebx, esi = g_esi, edi = g_edi, ebp = g_ebp;
+        g_esp -= 4; BW_MEM32(g_esp) = dt;               /* the frame time */
+        g_esp -= 4; BW_MEM32(g_esp) = 0;                /* return address; ret 4 */
+        g_ecx = emitter;
+        sub_000253B0_gen();
+        g_esp = sp0;
+        g_ebx = ebx; g_esi = esi; g_edi = edi; g_ebp = ebp;
+        g_ecx = emitter;
+    }
+    sub_000253B0_gen();
+    if (hold)
+        bw_hifps_bolt_release(emitter, phase);
 }

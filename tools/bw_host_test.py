@@ -155,6 +155,10 @@ def main():
     env.update(play.BASE_ENV)
     env.update(play.GPU_ENV)
     env.update(BW_HOST="1", BW_HOST_LINGER="0")
+    # A test boot never uses the maintainer's saves or game disk (lane au-iso):
+    # its own under --out, as tools/bw_run.py gives every run.
+    env.update(RECOMP_SAVE_DIR=os.path.abspath(os.path.join(a.out, "saves")),
+               BW_EDITION_SAVE_ROOT=os.path.abspath(os.path.join(a.out, "disk")))
     if a.pad:
         env["RECOMP_PAD_SCRIPT"] = a.pad
     host = subprocess.Popen([play.EXE], cwd=REPO, env=env)

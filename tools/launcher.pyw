@@ -836,9 +836,92 @@ def screens():
     return out
 
 
+def sound_device_mmdevice():
+    """Windows' default sound output (render, console) in full, from its own
+    device API (IMMDeviceEnumerator, through ctypes): "<name> (<n> channels,
+    <rate> Hz)", or None. The name is the one Windows' sound settings show,
+    not cut short (the old wave API gives 31 characters)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("d1", ctypes.c_uint32), ("d2", ctypes.c_uint16), ("d3", ctypes.c_uint16),
+                    ("d4", ctypes.c_ubyte * 8)]
+
+        def __init__(self, s):
+            super().__init__()
+            h = s.replace("-", "")
+            self.d1, self.d2, self.d3 = int(h[0:8], 16), int(h[8:12], 16), int(h[12:16], 16)
+            for i in range(8):
+                self.d4[i] = int(h[16 + 2 * i:18 + 2 * i], 16)
+
+    class PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+    class PROPVARIANT(ctypes.Structure):
+        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort),
+                    ("r3", ctypes.c_ushort), ("p1", ctypes.c_void_p), ("p2", ctypes.c_void_p)]
+
+    ole32 = ctypes.OleDLL("ole32")
+    hr_init = ctypes.windll.ole32.CoInitializeEx(None, 0x2)    # apartment; S_FALSE or a mode clash is fine
+    HRESULT = ctypes.HRESULT
+
+    def method(obj, index, *argtypes):
+        vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        return ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, *argtypes)(vtbl[index])
+
+    def release(obj):
+        if obj:
+            vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(vtbl[2])(obj)
+
+    en, dev, ps = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+    try:
+        ole32.CoCreateInstance(ctypes.byref(GUID("BCDE0395-E52F-467C-8E3D-C4579291692E")), None, 0x17,
+                               ctypes.byref(GUID("A95664D2-9614-4F35-A746-DE8DB63617E6")), ctypes.byref(en))
+        # IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole)
+        method(en, 4, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))(en, 0, 0, ctypes.byref(dev))
+        # IMMDevice::OpenPropertyStore(STGM_READ)
+        method(dev, 4, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p))(dev, 0, ctypes.byref(ps))
+        get = method(ps, 5, ctypes.POINTER(PROPERTYKEY), ctypes.POINTER(PROPVARIANT))
+        pv = PROPVARIANT()
+        # PKEY_Device_FriendlyName
+        get(ps, ctypes.byref(PROPERTYKEY(GUID("A45C254E-DF1C-4EFD-8020-67D146A850E0"), 14)), ctypes.byref(pv))
+        name = ctypes.wstring_at(pv.p1) if pv.vt == 31 and pv.p1 else None          # VT_LPWSTR
+        ctypes.windll.ole32.PropVariantClear(ctypes.byref(pv))
+        if not name:
+            return None
+        fmt = ""
+        pv = PROPVARIANT()
+        try:
+            # PKEY_AudioEngine_DeviceFormat: the shared engine's format (a WAVEFORMATEX blob)
+            get(ps, ctypes.byref(PROPERTYKEY(GUID("F19F064D-082C-4E27-BC73-6882A1BB8E4C"), 0)), ctypes.byref(pv))
+            if pv.vt == 65 and pv.p2:                                                # VT_BLOB
+                raw = ctypes.string_at(pv.p2, 8)
+                ch = int.from_bytes(raw[2:4], "little")
+                rate = int.from_bytes(raw[4:8], "little")
+                fmt = " (%d channels, %d Hz)" % (ch, rate)
+        except OSError:
+            pass
+        ctypes.windll.ole32.PropVariantClear(ctypes.byref(pv))
+        return name + fmt
+    finally:
+        release(ps)
+        release(dev)
+        release(en)
+        if hr_init in (0, 1):
+            ctypes.windll.ole32.CoUninitialize()
+
+
 def sound_device():
-    """Windows' default sound output (its name as the old wave API gives it,
-    at most 31 characters), or None."""
+    """Windows' default sound output: its full name from Windows' device API,
+    or, if that fails, the old wave API's (at most 31 characters); or None."""
+    try:
+        name = sound_device_mmdevice()
+        if name:
+            return name
+    except (OSError, AttributeError, ValueError):
+        pass
     try:
         import ctypes
         from ctypes import wintypes
@@ -877,6 +960,20 @@ def controllers():
     except (OSError, AttributeError):
         pass
     return None
+
+
+def sound_line(log_path):
+    """The game's own output-device line from its log (the last open or
+    rebuild: "[XA2] output device: ..."), or None."""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            hit = None
+            for line in f:
+                if line.startswith("[XA2] output device: "):
+                    hit = line[len("[XA2] output device: "):].strip()
+            return hit
+    except OSError:
+        return None
 
 
 def adapter_line(log_path):
@@ -946,6 +1043,8 @@ def system_summary(settings_path, edition):
         "Graphics cards (Windows): %s" % fact(graphics_cards),
         "Screens: %s" % fact(screens),
         "Sound (Windows' default output): %s" % fact(sound_device),
+        "Sound (the game's log): %s" % fact(lambda: sound_line(os.path.join(REPO, "play.log")),
+                                            "not in the log (play once first)"),
         "Controllers connected (XInput): %s" % fact(controllers),
         "Starts (oldest first; 1 = reached the title): %s" % fact(
             lambda: ",".join(start_history(os.path.dirname(settings_path))), "no record"),

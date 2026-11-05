@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "bw_edition.h"
+#include "bw_latlog.h"     /* lat-m: BW_LATLOG test aid (menu navigation times) */
 
 extern ptrdiff_t g_xbox_mem_offset;
 extern __declspec(thread) uint32_t g_eax, g_esp;
@@ -121,6 +122,10 @@ static void m_quit(void)
     else {
         xbox_InputRumbleAllOff("Quit Game");
         fflush(stdout);
+        {
+            extern void bw_log_drain(int wait_ms);   /* au-vp: the log's ring first (main.c) */
+            bw_log_drain(500);
+        }
         TerminateProcess(GetCurrentProcess(), 0);
     }
 }
@@ -841,6 +846,15 @@ extern void sub_0005C060_gen(void);
 void sub_0005C060(void)
 {
     sub_0005C060_gen();
+    if (g_bw_lat_on) {
+        /* BW_LATLOG (lat-m, test aid, read-only): FrontEnd_UpdateMenuNav
+         * zeroes the menus' navigation word (FE +0x2A3C) at every call and
+         * sets it (1 up, 2 down) only on its 0.2 s gate's pass: a nonzero
+         * value here is the menu moving this pass (seen in its code). */
+        uint32_t nav = M_MEM32(FE_VA + 0x2A3Cu);
+        if (nav)
+            bw_lat_ev(BW_LAT_MENU, bw_lat_now(), nav, 0, 0, 0, 0, 0, 0.0, 0.0);
+    }
     if (bw_fix_enabled(BW_FIX_MENU_MOUSE))
         m_mouse_frame();
 }

@@ -1924,6 +1924,10 @@ static void bridge_HalReturnToFirmware(void)
                     waited);
     }
 
+    {
+        extern void bw_log_drain(int wait_ms);   /* Blood Wake (au-vp): the log's ring before ExitProcess */
+        bw_log_drain(500);
+    }
     xbox_HalReturnToFirmware(routine);
 }
 
@@ -2982,6 +2986,71 @@ static long long kernel_clock_ms(void)
  * thread write the same words. */
 enum { VBL_ACK_FAST_MS = 2, VBL_ACK_LATE_MS = 1000, VBL_ACK_SLOW_STEP_MS = 16 };
 
+/* Blood Wake carried patch (lane au-vp, docs/audio/vp.md): the watch that
+ * releases the XDK vblank DPC, prompt whatever the host's scheduling.
+ * The DPC runs on the timer thread holding the one-CPU gate and spins on
+ * PMC_INTR_0 until this thread sees its ack; a posted interrupt (the APU's:
+ * a trapped front end makes no sound meanwhile) waits for the gate. Seen
+ * with BW_APU_HOTSTAT's watch: the gate held 10-27 ms, dozens of times in a
+ * 130 s boot, on a quiet PC with the window covered or minimized, the timer
+ * thread spinning in the DPC's ack loop, preempted and running in turn. The
+ * watch's 2 ms of SwitchToThread can hand the rest of a slice to the very
+ * DPC spinning on the same core (parked cores, a background window), so the
+ * ack waited for the spinner's quantum, and its 1 ms waits last as long as
+ * the timer resolution, which Windows 11 may ignore for such a window. Now
+ * the watch runs at time-critical priority (it waits nearly all the time)
+ * and steps on a high-resolution waitable timer: 0.25 ms for the first 2 ms,
+ * then 1 ms, so it preempts a spinning DPC the moment a step ends.
+ * Scheduling only; every edition, always on. BW_VBL_ACK_HRT=0: the yields,
+ * the plain waits and the normal priority, as before. */
+static HANDLE vbl_ack_hrt(void)
+{
+#ifdef _WIN32
+    static XBOX_THREAD_LOCAL HANDLE t;
+    static XBOX_THREAD_LOCAL int tried;
+    static volatile LONG said;
+    if (!tried) {
+        const char *e = getenv("BW_VBL_ACK_HRT");
+        tried = 1;
+        if (!(e && e[0] == '0'))
+            t = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+        if (!InterlockedExchange(&said, 1)) {
+            fprintf(stderr, "  [KERNEL] BW the vblank ack's watch: %s (BW_VBL_ACK_HRT)\n",
+                    t ? "time-critical, 0.25 then 1 ms steps on a high-resolution timer (au-vp)"
+                      : "yields, then plain 1 ms waits, at normal priority (as before)");
+            fflush(stderr);
+        }
+    }
+    return t;
+#else
+    return NULL;
+#endif
+}
+
+/* One step of the watch: the rearm event or the step's end (step_us on the
+ * high-resolution timer; a plain step_ms wait without it). 1 on the event. */
+static int vbl_ack_step_us(HANDLE rearm, DWORD step_ms, DWORD step_us)
+{
+#ifdef _WIN32
+    HANDLE t = step_us ? vbl_ack_hrt() : NULL;
+    if (t) {
+        HANDLE hs[2];
+        LARGE_INTEGER due;
+        DWORD r;
+        hs[0] = rearm;
+        hs[1] = t;
+        due.QuadPart = -(LONGLONG)step_us * 10;
+        SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE);
+        r = WaitForMultipleObjects(2, hs, FALSE, 50);
+        if (r != WAIT_OBJECT_0 + 1)
+            CancelWaitableTimer(t);
+        return r == WAIT_OBJECT_0;
+    }
+#endif
+    return WaitForSingleObject(rearm, step_ms) == WAIT_OBJECT_0;
+}
+
 int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
                        volatile LONG *tick_busy, HANDLE rearm, long *late_ms)
 {
@@ -3004,12 +3073,17 @@ int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_int
         if (!*tick_busy && !(*pmc_intr & NV2A_PMC_INTR_PCRTC))
             return XBOX_VBL_ACK_NONE;   /* nobody is waiting on it */
         if (now - start <= VBL_ACK_FAST_MS) {
-            SwitchToThread();
+            if (vbl_ack_hrt()) {         /* Blood Wake (au-vp): 0.25 ms steps, not a yield */
+                if (vbl_ack_step_us(rearm, 0, 250))
+                    return XBOX_VBL_ACK_REARMED;
+            } else {
+                SwitchToThread();
+            }
             now = kernel_clock_ms();
             continue;
         }
         step = now - start <= VBL_ACK_LATE_MS ? 1 : VBL_ACK_SLOW_STEP_MS;
-        if (WaitForSingleObject(rearm, step) == WAIT_OBJECT_0) {
+        if (vbl_ack_step_us(rearm, step, step == 1 ? 1000 : 0)) {   /* Blood Wake (au-vp): 1 ms on the high-resolution timer */
             /* The next vblank: it is that one's ack now. */
             return XBOX_VBL_ACK_REARMED;
         }
@@ -3038,6 +3112,10 @@ static DWORD WINAPI kernel_vblank_ack_thread(LPVOID unused)
     int r = XBOX_VBL_ACK_ON_TIME;
 
     (void)unused;
+#ifdef _WIN32
+    if (vbl_ack_hrt())                   /* Blood Wake (au-vp): it preempts a spinning DPC at once */
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#endif
     for (;;) {
         long late_ms;
 
@@ -6316,6 +6394,10 @@ static void bridge_HalDisableSystemInterrupt(void)
  * The implementation calls ExitProcess, so this never actually returns. */
 static void bridge_HalInitiateShutdown(void)
 {
+    {
+        extern void bw_log_drain(int wait_ms);   /* Blood Wake (au-vp): the log's ring before ExitProcess */
+        bw_log_drain(500);
+    }
     xbox_HalInitiateShutdown();
     g_eax = 0;
 }

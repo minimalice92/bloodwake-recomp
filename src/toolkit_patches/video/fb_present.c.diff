@@ -218,7 +218,7 @@
          return 0;
      }
      if (m == WM_SYSKEYDOWN && w == VK_RETURN)
-@@ -275,6 +432,9 @@
+@@ -275,9 +432,21 @@
          InterlockedExchange(&s_fb_running, 0);
          if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
              fprintf(stderr, "  [FBWIN] window closed: exiting\n");
@@ -228,7 +228,19 @@
              recomp_exit_hook_run("window");
              fflush(stdout);
              fflush(stderr);
-@@ -285,6 +445,8 @@
++            {
++                /* Blood Wake carried patch (au-vp): the game's log goes
++                 * through a ring and a writer thread (src/main.c); what is
++                 * still in them reaches the file before the process ends.
++                 * Every closing of the window comes here: its close box, the
++                 * play host's quit and the menu's Quit Game. */
++                extern void bw_log_drain(int wait_ms);
++                bw_log_drain(500);
++            }
+             TerminateProcess(GetCurrentProcess(), 0);
+         }
+         return 0;
+@@ -285,6 +454,8 @@
      case WM_KEYDOWN:
      case WM_SYSKEYDOWN:
          xbox_InputKeySet((int)w, 1);
@@ -237,7 +249,7 @@
          /* A Shift, Ctrl or Alt is also its side's key, for bindings to
           * "lshift" and the like; wParam stays the either-side one. */
          {
-@@ -339,6 +501,10 @@
+@@ -339,6 +510,10 @@
              int vk = xbox_InputWin32MouseVk(m, (uint32_t)w, &down);
              if (vk)
                  xbox_InputKeySet(vk, down);
@@ -248,7 +260,7 @@
              if (down)
                  SetCapture(h);
              else if (!(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)))
-@@ -346,14 +512,155 @@
+@@ -346,14 +521,155 @@
          }
          return m == WM_XBUTTONDOWN || m == WM_XBUTTONUP ? TRUE : 0;
  
@@ -404,7 +416,7 @@
  /* The display formats an Xbox front buffer is actually set to. The pitch says
   * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
   * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
-@@ -435,6 +742,19 @@
+@@ -435,6 +751,19 @@
      return 0;
  }
  
@@ -424,7 +436,7 @@
  /* GDI: the frame letterboxed into the client area, like the D3D11
   * presenter; the borders are cleared when the size changes. */
  static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
-@@ -455,6 +775,33 @@
+@@ -455,6 +784,33 @@
      } else {
          h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
      }
@@ -458,7 +470,7 @@
      SetStretchBltMode(hdc, HALFTONE);
      SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
      StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
-@@ -466,9 +813,15 @@
+@@ -466,9 +822,15 @@
   * for vsync, so returns 1 when the loop is already paced), else GDI. */
  static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
  {
@@ -474,7 +486,7 @@
      return 0;
  }
  
-@@ -483,13 +836,21 @@
+@@ -483,13 +845,21 @@
      (void)unused;
  
      {
@@ -498,7 +510,7 @@
      }
      {
          /* RECOMP_WINDOW_SCALE (1-8, default 2, as in the SDL window): the
-@@ -506,11 +867,26 @@
+@@ -506,11 +876,26 @@
          for (;; scale--) {
              r.left = 0; r.top = 0;
              r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
@@ -525,7 +537,7 @@
          hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                 work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
-@@ -523,9 +899,10 @@
+@@ -523,9 +908,10 @@
          return 0;
      }
      hdc = GetDC(hwnd);
@@ -537,7 +549,7 @@
              fb_toggle_fullscreen(hwnd);
      }
  
-@@ -547,13 +924,11 @@
+@@ -547,13 +933,11 @@
          gpu_present_init(hwnd, s_fb_width, s_fb_height);
  
      while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
@@ -555,7 +567,7 @@
              /* A finished frame, published by the flip. Copied into s_rgb so
               * the dump path and GDI see one consistent image even if the
               * next flip lands mid-blit. */
-@@ -604,19 +979,42 @@
+@@ -604,19 +988,42 @@
              if (now - t0 >= 1000) {
                  LONG f = s_flips;
                  wchar_t tb[128];
