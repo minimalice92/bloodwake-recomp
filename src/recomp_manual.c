@@ -1119,3 +1119,78 @@ void sub_000253B0(void)
     if (hold)
         bw_hifps_bolt_release(emitter, phase);
 }
+
+/* D-011 hook, every edition, observation only (I1, the CPU-write latch;
+ * lane gfx-regen, docs/gfx/lanes/regen.md, design docs/gfx/lanes/ideas.md
+ * section 6): D3D_LockPixelContainer 0x0012E4C0 (resource, face, level,
+ * locked, rect, flags), stdcall `ret 0x18`. D3DSurface_LockRect 0x001287B0
+ * and D3DTexture_LockRect 0x00128630 are its only callers (seen in the
+ * names file), so this sees every lock of a surface or texture level. Its
+ * body waits for the GPU to finish with the resource (D3D_BlockOnResource,
+ * unless flag 0x20) and writes the level's pitch and CPU address into
+ * *locked (seen, 0x12E4C0-0x12E55B). The arguments are read before the body
+ * (it pops them), the result after; nothing here writes guest memory or
+ * changes a register the body returns. bw_gpu_lock_note
+ * (src/gpu/core/bwg_latch.c) hands the lock to the graphics thread, so a CPU
+ * write into a picture the GPU drew reaches the GPU's copy (the loading
+ * screen's progress bar, which the game writes straight into the front
+ * buffer). g_bw_lockwatch 0: the body alone runs, as before. */
+extern void sub_0012E4C0_gen(void);
+extern volatile int g_bw_lockwatch;
+extern void bw_gpu_lock_note(uint32_t res, uint32_t level, uint32_t pitch, uint32_t bits,
+                             const int32_t *rect, uint32_t flags);
+
+void sub_0012E4C0(void)
+{
+    uint32_t res, level, locked, rect, flags;
+    int32_t r[4] = { 0, 0, 0, 0 };
+    if (!g_bw_lockwatch) {
+        sub_0012E4C0_gen();
+        return;
+    }
+    res = BW_MEM32(g_esp + 4);
+    level = BW_MEM32(g_esp + 12);
+    locked = BW_MEM32(g_esp + 16);
+    rect = BW_MEM32(g_esp + 20);
+    flags = BW_MEM32(g_esp + 24);
+    if (rect) {
+        r[0] = (int32_t)BW_MEM32(rect);
+        r[1] = (int32_t)BW_MEM32(rect + 4);
+        r[2] = (int32_t)BW_MEM32(rect + 8);
+        r[3] = (int32_t)BW_MEM32(rect + 12);
+    }
+    sub_0012E4C0_gen();
+    if (locked)
+        bw_gpu_lock_note(res, level, BW_MEM32(locked) /* Pitch */, BW_MEM32(locked + 4) /* pBits */,
+                         rect ? r : NULL, flags);
+}
+
+/* D-011 hook, every edition, observation only (lane gfx-regen: no
+ * first-seen vertex-shader hitches, docs/gfx/lanes/regen.md):
+ * D3DDevice_CreateVertexShader 0x00127820 (declaration, function, pHandle,
+ * usage), stdcall `ret 0x10`. Its callers are the 16 shader groups
+ * Shaders_Init runs from Graphics_Init at boot (seen: every call site in the
+ * generated code lies in Shaders_CreateGroup01..16, 0x32300-0x33850). The
+ * body copies the program into a shader object and returns S_OK (0) in eax.
+ * After it, bw_gpu_vsh_created (src/gpu/bw_d3d11.c) copies the program's
+ * words and the declaration's stream formats and starts their translation
+ * and compile on the graphics back end's worker threads, so each program's
+ * GPU shader is ready before the game first draws with it. Nothing here
+ * writes guest memory or changes a register the body returns.
+ * g_bw_vshwatch 0: the body alone runs, as before. */
+extern void sub_00127820_gen(void);
+extern volatile int g_bw_vshwatch;
+extern void bw_gpu_vsh_created(uint32_t decl, uint32_t function, uint32_t hr);
+
+void sub_00127820(void)
+{
+    uint32_t decl, function;
+    if (!g_bw_vshwatch) {
+        sub_00127820_gen();
+        return;
+    }
+    decl = BW_MEM32(g_esp + 4);
+    function = BW_MEM32(g_esp + 8);
+    sub_00127820_gen();
+    bw_gpu_vsh_created(decl, function, g_eax);
+}

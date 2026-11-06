@@ -114,6 +114,20 @@ set(GAME_SOURCES
     src/gpu/bw_hdr.c          # a screen in HDR mode, every edition: scRGB, BT.2408 mapping, the EDID (0.2.5 item 97)
     src/gpu/bw_texrestore.c   # Remastered texture restoration (T1, VFX_TEX_RESTORE)
     src/gpu/bw_pscache.c      # persistent pixel-shader cache (T1, every edition)
+    src/gpu/bw_gfxcap.c       # BW_GFXCAP: frame capture and its replay (test aid, lane gfx-cap)
+    src/gpu/core/bwg_core.c   # the renderer's API-neutral core (docs/gfx/arch.md 3.2, lane gfx-core): shared basics
+    src/gpu/core/bwg_pace.c   #   the present's pacing, the screen wait, the letterbox
+    src/gpu/core/bwg_gate.c   #   the latency mode's shared parts: the GPU's progress and time, the horizon (gfx-lat11)
+    src/gpu/core/bwg_state.c  #   NV2A states to blend, depth, raster and sampler descriptions
+    src/gpu/core/bwg_surf.c   #   the guest surfaces and depth buffers by address
+    src/gpu/core/bwg_tex.c    #   the texture cache policy
+    src/gpu/core/bwg_draw.c   #   the per-draw preparation without API calls
+    src/gpu/bw_gfxcls.c       # BW_GFXCAP_CLASSES: the replay's region masks (test aid, lane gfx-capef)
+    src/gpu/bw_gfxcap_draws.c # BW_GFXCAP_DRAWS: the capture's draws decoder in C (test aid, lane gfx-capef)
+    src/gpu/core/bwg_ideas.c  #   the adopted ideas' shared parts (arch.md 3.14, lane gfx-ideas): I5's feedback counter
+    src/gpu/bw_edgeprobe.c    # BW_GPU_EDGEPROBE: the edge-pixel residual's probe (test aid, lane gfx-ideas)
+    src/gpu/core/bwg_latch.c  #   I1, the CPU-write latch: locks into the GPU's copy (lane gfx-regen)
+    src/gpu/bw_vshpre.c       # the game's vertex programs compiled at load time (lane gfx-regen)
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -346,6 +360,7 @@ target_sources(xbox_apu PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_wasapi.c    # lat-a: the WASAPI output (Remastered)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_out.c       # au-out: MMCSS, the rebuild worker, the device line
     ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_hot.c       # au-hot: BW_APU_HOTSTAT (a test aid, inert when off)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_apu_gain.c      # au-gain: the clean-level output gain (GAIN-1), BW_AUDIO_PEAKLOG
     # BW_DSP_TRACE=<dir>: the DSP trace recorder (au-trace; a test aid, inert
     # when unset; docs/audio/trace_format.md).
     ${CMAKE_CURRENT_SOURCE_DIR}/src/toolkit_patches/apu/bw_dsp_trace.c)

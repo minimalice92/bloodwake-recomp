@@ -1,7 +1,9 @@
 /* bw_vfx.h - Remastered's visual-enhancement suite (D-016), agent D9.
  *
- * The settings, the one place that decides the render scale, and the GPU
- * helpers the D3D11 back end (bw_d3d11.c) calls at a few marked hooks.
+ * The settings and the one place that decides the render scale: no graphics
+ * API here (the shared core, src/gpu/core, includes this header; GC-3). The
+ * GPU helpers the D3D11 back end calls at a few marked hooks are declared in
+ * bw_vfx_d3d11.h.
  * Nothing here runs in Original: there bw_vfx_active()
  * is 0, every query returns the value the back end used before (scale 1,
  * B8G8R8A8 targets, no MSAA, no anisotropy), and the back end takes its old
@@ -11,8 +13,7 @@
 
 #define COBJMACROS
 #include <windows.h>
-#include <d3d11.h>
-#include <dxgi1_4.h>    /* IDXGISwapChain3: HDR colour space */
+#include <dxgiformat.h> /* DXGI_FORMAT (D3D11's and D3D12's) */
 #include <stdint.h>
 
 typedef struct {
@@ -80,35 +81,9 @@ DXGI_FORMAT bw_vfx_target_format(uint32_t bpp);   /* the colour target's format 
 UINT     bw_vfx_msaa(void);                       /* sample count for every target */
 UINT     bw_vfx_aniso(void);                      /* max anisotropy for mipped samplers */
 
-/* ---- GPU helpers ----------------------------------------------------------
- * All on the back end's device thread, with its device and context. They
- * change pipeline state; the back end rebinds its own afterwards. */
-int  bw_vfx_gpu_init(ID3D11Device *dev, ID3D11DeviceContext *ctx);
-/* Draw src (sw x sh texels) into dst (dw x dh pixels): mode 0 bilinear
- * stretch, 1 box average (downsampling by any factor). */
-void bw_vfx_blit(ID3D11ShaderResourceView *src, UINT sw, UINT sh,
-                 ID3D11RenderTargetView *dst, UINT dw, UINT dh, int mode);
-
-/* ---- the frame ------------------------------------------------------------
- * The finished frame (src, sw x sh physical pixels) through the enabled
- * effects into `dst` (the swap chain's view, vp its letterbox rectangle), or
- * with dst NULL into an off-screen output of the output size (BW_GPU_PRESENT=0
- * runs). Writes the output shots. Returns 1 if it drew. */
-int  bw_vfx_present(ID3D11ShaderResourceView *src, UINT sw, UINT sh,
-                    ID3D11RenderTargetView *dst, const D3D11_VIEWPORT *vp);
-/* The scene before the HUD for the next bw_vfx_present (NULL: none this
- * frame). Bloom reads it, and OLED care dims only where the frame differs. */
-void bw_vfx_set_scene(ID3D11ShaderResourceView *scene);
-
-/* The title's DAC gamma ramp as D10's 256x1 lookup (bw_d3d11.c gamma_lut:
- * the fade-in at every mission start, the brightness slider), applied at the
- * end of the chain; NULL for none. Set before each bw_vfx_present. */
-void bw_vfx_set_gamma_lut(ID3D11ShaderResourceView *lut);
-
-/* The off-screen output's format; the suite's note when a swap chain is made
- * (its format and colour space are bw_hdr.c's, every edition). */
+/* The off-screen output's format (the suite's note when a swap chain is
+ * made: bw_vfx_d3d11.h). */
 DXGI_FORMAT bw_vfx_swap_format(void);
-void bw_vfx_swap_created(IDXGISwapChain1 *swap);
 /* HDR highlights this session (VFX_HDR on, or auto on a screen in HDR mode
  * whose peak is known); decided once, before the first render targets. */
 int bw_vfx_hdr_highlights(void);
@@ -119,17 +94,6 @@ int bw_vfx_hdr_highlights(void);
  * once per upload from the blocks themselves; nothing is matched by name or
  * hash. 0 in Original. */
 int  bw_vfx_is_glyph_sheet(const uint8_t *dxt1, uint32_t w, uint32_t h);
-
-/* Ambient occlusion (VFX_AO), per view before its HUD: depth (D24 as
- * R24_UNORM_X8, multisampled or not) of the target, the view rectangle,
- * the target's colour view (multiplied by the occlusion), the near and far
- * planes and the view's focal length in pixels. */
-void bw_vfx_ao_apply(ID3D11ShaderResourceView *depth, int depth_ms, UINT w, UINT h,
-                     ID3D11RenderTargetView *target, const D3D11_RECT *rect,
-                     float zn, float zf, float focal);
-
-/* A linear, clamped sampler (the text filter binds it at s4). */
-ID3D11SamplerState *bw_vfx_linear_sampler(void);
 
 /* The draw-distance factor for the RenderItem_IsVisible hook (game thread;
  * recomp_manual.c). 1 in Original. */

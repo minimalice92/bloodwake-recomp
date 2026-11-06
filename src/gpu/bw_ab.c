@@ -8,7 +8,8 @@
  * odd frame of a single run: adjacent frames then differ by the fix and by
  * one frame of motion only (tools/bw_shown.py pairs). <fix> is one of
  * points, polyoffset, ffpfog, conv, gamma, texrestore (T1: odd frames draw
- * the original textures in 3D), or hideffp (a diagnostic: odd frames leave
+ * the original textures in 3D), gpusprites (gfx-sprites: odd frames draw
+ * point sprites the CPU way), or hideffp (a diagnostic: odd frames leave
  * the fixed-function batches out). The output shots' log line says which
  * half each shot is (bw_vfx_post.c).
  *

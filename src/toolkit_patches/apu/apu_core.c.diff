@@ -403,7 +403,7 @@
      default:
          if (addr < 0x20000) {
              qatomic_set(&d->regs[addr], (uint32_t)val);
-@@ -504,6 +794,567 @@
+@@ -504,6 +794,459 @@
  
  static WaveOutState g_waveout = { 0 };
  
@@ -411,121 +411,13 @@
 +#include "../../bw_latlog.h"   /* Blood Wake (lat-m): BW_LATLOG test aid (press to sound) */
 +#include "bw_apu_out.h"        /* Blood Wake (au-out): MMCSS for the frame thread */
 +
-+/* Blood Wake carried patch (Remastered, BW_FIX AUDIO_MAKEUP_GAIN, D-016):
-+ * the game mixes quietly (gameplay -23..-29 dBFS RMS, title music about -39,
-+ * peaks -4..-12), and neither the stub nor the DSPs undo the bins' headroom.
-+ * The finished stereo period gets a makeup gain (+4 dB, BW_AUDIO_GAIN_DB)
-+ * and a look-ahead peak limiter at -1 dBFS, so the whole mix comes up
-+ * together: music, effects and voice keep the game's balance, and nothing
-+ * clips. The limiter (stereo-linked, 1 ms look-ahead, 100 ms release) is the
-+ * min-filter/box-filter kind, which never lets a sample past the ceiling and
-+ * changes gain smoothly. At +6 dB an Admiral battle had 8% of its samples
-+ * limited, by up to 4.1 dB (run 20261027-031905-*-ed-bat-remastered): an
-+ * audible duck of the whole mix on explosions. The default is +4 dB, where
-+ * only the loudest peaks (battle peaks reach -3.7 dBFS) are touched.
-+ * BW_AUDIO_GAIN_DB=<dB> forces a gain in any edition (0 turns it off). */
-+#define BW_LIM_LA 48                         /* look-ahead, samples */
-+static int s_bwg_on = -1;
-+static float s_bwg_gain = 1.0f, s_bwg_ceiling = 0.891251f, s_bwg_rel;
-+
-+static int bw_gain_on(void)
-+{
-+    if (s_bwg_on < 0) {
-+        const char *e = getenv("BW_AUDIO_GAIN_DB");
-+        double db = 4.0;
-+        int i;
-+        s_bwg_on = bw_fix_enabled(BW_FIX_AUDIO_MAKEUP_GAIN);
-+        if (e && *e) {
-+            db = atof(e);
-+            s_bwg_on = db != 0.0;
-+        }
-+        s_bwg_gain = (float)pow(10.0, db / 20.0);
-+        s_bwg_rel = (float)(1.0 - exp(-1.0 / (0.100 * 48000.0)));
-+        (void)i;
-+        if (s_bwg_on)
-+            fprintf(stderr, "[APU] BW output gain %+.1f dB with a -1 dBFS look-ahead limiter"
-+                            " (Remastered AUDIO_MAKEUP_GAIN; BW_AUDIO_GAIN_DB)\n", db);
-+    }
-+    return s_bwg_on;
-+}
-+
-+/* The limiter, for N interleaved channels (2 for the stereo period, 6 for
-+ * the 5.1 one); one state per stream. */
-+typedef struct {
-+    float x[BW_LIM_LA][6], r[BW_LIM_LA + 1], h[BW_LIM_LA];
-+    float hsum, hlast;
-+    unsigned i;
-+    double min_gain;                         /* deepest limiting, for the log */
-+    unsigned long limited;
-+    int inited;
-+} BwLim;
-+static BwLim s_lim2, s_lim6;
-+
-+static void bw_lim_period(BwLim *L, int16_t *buf, int n, int ch, int log)
-+{
-+    int k, j, c;
-+    if (!L->inited) {
-+        for (j = 0; j <= BW_LIM_LA; j++)
-+            L->r[j] = 1.0f;
-+        for (j = 0; j < BW_LIM_LA; j++)
-+            L->h[j] = 1.0f;
-+        L->hsum = (float)BW_LIM_LA;
-+        L->hlast = 1.0f;
-+        L->min_gain = 1.0;
-+        L->inited = 1;
-+    }
-+    for (k = 0; k < n; k++) {
-+        int16_t *s = buf + k * ch;
-+        float v[6], pk = 0.0f, m, h, g;
-+        unsigned i = L->i % BW_LIM_LA;
-+        for (c = 0; c < ch; c++) {
-+            v[c] = s[c] / 32768.0f * s_bwg_gain;
-+            if (fabsf(v[c]) > pk)
-+                pk = fabsf(v[c]);
-+        }
-+        /* the gain this sample needs, and the least over the look-ahead;
-+         * the need window is one longer than the delay, so every box term
-+         * covers the sample leaving the delay line */
-+        L->r[L->i % (BW_LIM_LA + 1)] = pk > s_bwg_ceiling ? s_bwg_ceiling / pk : 1.0f;
-+        for (j = 0, m = 1.0f; j <= BW_LIM_LA; j++)
-+            if (L->r[j] < m)
-+                m = L->r[j];
-+        /* release: rise toward 1 slowly, never above the window's need */
-+        h = L->hlast + (1.0f - L->hlast) * s_bwg_rel;
-+        if (h > m)
-+            h = m;
-+        L->hlast = h;
-+        /* box filter over the look-ahead: smooth, and still under the need
-+         * of the sample leaving the delay line */
-+        L->hsum += h - L->h[i];
-+        L->h[i] = h;
-+        g = L->hsum / BW_LIM_LA;
-+        for (c = 0; c < ch; c++) {
-+            float o = L->x[i][c] * g;        /* the delayed sample */
-+            L->x[i][c] = v[c];
-+            if (o > 1.0f) o = 1.0f;
-+            if (o < -1.0f) o = -1.0f;
-+            s[c] = (int16_t)lrintf(o * 32767.0f);
-+        }
-+        L->i++;
-+        if (g < 0.999f) {
-+            L->limited++;
-+            if (g < L->min_gain)
-+                L->min_gain = g;
-+        }
-+    }
-+    if (log && L->i % (48000 * 30) < (unsigned)n && L->limited) {
-+        fprintf(stderr, "[APU] BW limiter: %lu samples limited in 30 s, deepest %.1f dB\n",
-+                L->limited, 20.0 * log10(L->min_gain));
-+        L->limited = 0;
-+        L->min_gain = 1.0;
-+    }
-+}
-+
-+static void bw_gain_period(int16_t period[][2], int n)
-+{
-+    bw_lim_period(&s_lim2, &period[0][0], n, 2, 1);
-+}
++/* Blood Wake carried patch (every edition, call GAIN-1; bw_apu_gain.c): the
++ * finished mix gets one fixed gain, set so the loudest peak measured across
++ * the game lands just under -1 dBFS: a pure volume change, no limiting and
++ * no delay (docs/audio/gain.md). It replaced 0.2.4's +4 dB with a look-ahead
++ * limiter (Remastered AUDIO_MAKEUP_GAIN), which ducked big battle explosions
++ * by up to 5 dB. BW_AUDIO_GAIN_DB=<dB> sets it in any edition (0 = none). */
++#include "bw_apu_gain.h"
 +
 +/* Blood Wake (Remastered AUDIO_SURROUND): the carried apu_xaudio2.c's source
 + * voice channels, and BW_AUDIO_WAV6=<path>, a 6-channel WAV of exactly what
@@ -971,7 +863,7 @@
  void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
  {
      (void)errp;
-@@ -517,9 +1368,17 @@
+@@ -517,9 +1260,17 @@
          const char *wav = getenv("RECOMP_AUDIO_WAV");
          const char *secs = getenv("RECOMP_AUDIO_WAV_SECS");
          if (wav && *wav)
@@ -990,7 +882,7 @@
      /* Try XAudio2 first (lower latency) */
      if (xa2_init()) {
          /* Pacing marks in samples (xa2_pacing_marks): high is all the
-@@ -528,11 +1387,12 @@
+@@ -528,11 +1279,12 @@
          int low, high;
          xa2_pacing_marks(xa2_get_buffer_size(), xa2_get_buffer_count(),
                           MIXER_FRAME_SAMPLES, &low, &high);
@@ -1004,7 +896,7 @@
              fprintf(stderr, "[APU] device buffers hold under two EP periods;"
                              " expect underruns\n");
          return;
-@@ -574,7 +1434,7 @@
+@@ -574,7 +1326,7 @@
  void mcpx_apu_monitor_finalize(MCPXAPUState *d)
  {
      (void)d;
@@ -1013,12 +905,13 @@
      if (xa2_is_active()) {
          xa2_shutdown();
          return;
-@@ -907,19 +1767,68 @@
+@@ -907,19 +1659,69 @@
          }
          mixer_render(extra, MIXER_FRAME_SAMPLES);
          mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
-+        if (bw_gain_on())
-+            bw_gain_period(period, MIXER_FRAME_SAMPLES);
++        /* Blood Wake (GAIN-1): the clean-level gain, and BW_AUDIO_PEAKLOG and
++         * BW_AUDIO_WAV_PRE (test aids) before it */
++        bw_gain_stage2(&period[0][0], MIXER_FRAME_SAMPLES, !(xa2_is_active() && d->pace_stalled));
      }
  
      /* A period dropped while pacing is stalled never reaches the device,
@@ -1058,8 +951,8 @@
 +                memset(g_bw_frame6, 0, sizeof p6);
 +                if (g_audio_muted)
 +                    memset(p6, 0, sizeof p6);
-+                else if (bw_gain_on())
-+                    bw_lim_period(&s_lim6, &p6[0][0], MIXER_FRAME_SAMPLES, 6, 0);
++                else
++                    bw_gain_stage6(&p6[0][0], MIXER_FRAME_SAMPLES);
 +                apu_wav6_write(&p6[0][0], MIXER_FRAME_SAMPLES);
 +                out = &p6[0][0];
 +            }
@@ -1086,7 +979,7 @@
          }
          return;
      }
-@@ -937,6 +1846,18 @@
+@@ -937,6 +1739,18 @@
   * accept (4096 samples, 85 ms) still fit. */
  #define PACE_STALL_US 200000
  
@@ -1105,7 +998,7 @@
  /* One pacing decision, taken at an EP-period boundary. Returns 0 to render
   * the next period now, or how many microseconds to wait before asking again.
   *
-@@ -982,6 +1903,7 @@
+@@ -982,6 +1796,7 @@
  
      if (xa2_is_active()) {
          int q    = xa2_queued_samples();
@@ -1113,7 +1006,7 @@
          int low  = d->monitor.queued_bytes_low / SAMPLE_BYTES;
          int high = d->monitor.queued_bytes_high / SAMPLE_BYTES;
  
-@@ -1007,8 +1929,31 @@
+@@ -1007,8 +1822,31 @@
  
          if (d->pace_stalled)
              ;                              /* host clock, as without a queue */
@@ -1147,7 +1040,7 @@
          else if (q <= low)
              ahead_us = (int64_t)high * EP_FRAME_US / MIXER_FRAME_SAMPLES;
          else
-@@ -1018,8 +1963,11 @@
+@@ -1018,8 +1856,11 @@
      }
  
      if (d->next_frame_time_us == 0 ||
@@ -1160,7 +1053,7 @@
  
      /* In the band the lead a render-ahead built is already in the queue;
       * keeping it in the schedule as well would idle until the queue had
-@@ -1029,6 +1977,13 @@
+@@ -1029,6 +1870,13 @@
  
      if (d->next_frame_time_us - now_us > ahead_us)
          return d->next_frame_time_us - now_us - ahead_us;
@@ -1174,7 +1067,7 @@
      return 0;
  }
  
-@@ -1038,19 +1993,111 @@
+@@ -1038,19 +1886,111 @@
      d->next_frame_time_us += EP_FRAME_US;
  }
  
@@ -1290,7 +1183,7 @@
      d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us);
  }
  
-@@ -1081,9 +2128,33 @@
+@@ -1081,9 +2021,33 @@
      float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
      memset(mixbins, 0, sizeof(mixbins));
  
@@ -1324,7 +1217,7 @@
  
      d->ep_frame_div++;
  
-@@ -1104,6 +2175,41 @@
+@@ -1104,6 +2068,41 @@
  static int s_irq_trace = -1;
  static uint64_t s_irq_next_ns;
  
@@ -1366,7 +1259,7 @@
  static void apu_irq_stats_line(void)
  {
      uint64_t now;
-@@ -1122,9 +2228,43 @@
+@@ -1122,9 +2121,43 @@
      s_irq_next_ns = now + 5000000000ull;
  }
  
@@ -1410,7 +1303,7 @@
      qemu_mutex_lock(&d->lock);
  
      while (!qatomic_read(&d->exiting)) {
-@@ -1134,7 +2274,11 @@
+@@ -1134,7 +2167,11 @@
                  xa2_expect_drain();     /* a pause, not an underrun */
              hs_rebase();
              qemu_cond_signal(&d->idle_cond);
@@ -1422,7 +1315,7 @@
              d->is_idle = false;
              continue;
          }
-@@ -1143,7 +2287,13 @@
+@@ -1143,7 +2180,13 @@
           * need continuous frame delivery regardless of APU register state.
           * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
          throttle(d);
@@ -1436,7 +1329,7 @@
  
          /* The doorbell ack stands in for the GP DSP, which on hardware runs
           * whatever the front end is doing. Tying it to se_frame stopped it
-@@ -1151,6 +2301,8 @@
+@@ -1151,6 +2194,8 @@
           * forever to post its next command: Burnout 3 stalls in
           * sub_002F805E polling the same doorbell it was acked on at init. */
          mcpx_apu_dsp_ack_poll(d);
@@ -1445,7 +1338,7 @@
  
          int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                  NV_PAPU_SECTL_XCNTMODE);
-@@ -1187,12 +2339,18 @@
+@@ -1187,12 +2232,18 @@
              apu_irq_stats.fe_trapped_frames++;
          } else {
              /* Lightweight: just monitor frame (test tone + software mixer) */
@@ -1465,7 +1358,7 @@
  
          /* The SSL tick: the sequencer's periodic sample-limit interrupt.
           *
-@@ -1211,8 +2369,18 @@
+@@ -1211,8 +2262,18 @@
                      && (sectl & NV_PAPU_SECTL_XCNTMODE)
                             != NV_PAPU_SECTL_XCNTMODE_OFF) {
                  d->sample_count -= ssl;
@@ -1486,7 +1379,7 @@
              }
          }
  
-@@ -1224,8 +2392,17 @@
+@@ -1224,8 +2285,17 @@
              update_irq(d);
              d->set_irq = false;
          }
@@ -1504,7 +1397,7 @@
  
          /* Let the guest in once per frame.
           *
-@@ -1237,16 +2414,45 @@
+@@ -1237,16 +2307,45 @@
           * thread starved there indefinitely: Burnout 3 froze on its vehicle
           * select, blocked in voice_lock at raised IRQL, which in turn held
           * off every USB interrupt. */
@@ -1553,7 +1446,7 @@
          }
      }
  
-@@ -1342,7 +2548,7 @@
+@@ -1342,7 +2441,7 @@
      d->pause_requested = true;
  
      qemu_mutex_init(&d->lock);
@@ -1562,7 +1455,7 @@
      qemu_cond_init(&d->cond);
      qemu_cond_init(&d->idle_cond);
  
-@@ -1382,7 +2588,7 @@
+@@ -1382,7 +2481,7 @@
  
      fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
  
@@ -1571,7 +1464,7 @@
      mcpx_apu_wait_for_idle(d);
      qatomic_set(&d->exiting, true);
      qemu_cond_signal(&d->cond);
-@@ -1493,7 +2699,7 @@
+@@ -1493,7 +2592,7 @@
      g_test_tone.active = true;
  
      /* Make sure waveOut is running - enable SECTL and resume APU thread */
@@ -1580,7 +1473,7 @@
      d->regs[NV_PAPU_SECTL] = NV_PAPU_SECTL_XCNTMODE & ~NV_PAPU_SECTL_XCNTMODE_OFF;
      d->regs[NV_PAPU_FECTL] = NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
      /* Initialize empty voice lists so VP frame doesn't crash */
-@@ -1612,7 +2818,7 @@
+@@ -1612,7 +2711,7 @@
      /* The frame thread takes the APU lock before the mixer lock. */
      extern MCPXAPUState *g_state;
      if (g_state) {

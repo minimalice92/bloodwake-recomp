@@ -21,6 +21,7 @@
 #include "bw_gpu_failtest.h"   /* 0.2.5 item 25: BW_GPU_FAILTEST (test aid) */
 #include <dxgi1_6.h>           /* item 45: IDXGIOutput6, the screen's colour mode */
 #include "bw_hdr.h"            /* item 97: the screen, shared with the plain present */
+#include "bw_gfxcap.h"         /* BW_GFXCAP (test aid): the clock as an input, the pictures */
 
 #include <math.h>
 #include <stdio.h>
@@ -589,6 +590,55 @@ static int shot_due(void)
     return due;
 }
 
+/* BW_GFXCAP_PICS (test aid, lane gfx-capab): the output picture of this flip
+ * exactly as drawn, on both sides of a capture, so the live and replayed
+ * pictures compare bit for bit. Raw rows after a BWSHOT01 header (width,
+ * height, bytes a pixel, 0, the DXGI format). */
+static void gfxcap_pic(ID3D11RenderTargetView *dst, const D3D11_VIEWPORT *vp, DXGI_FORMAT f)
+{
+    char path[MAX_PATH + 64];
+    ID3D11Resource *res = NULL;
+    ID3D11Texture2D *stg = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_BOX box;
+    UINT x0 = (UINT)vp->TopLeftX, y0 = (UINT)vp->TopLeftY;
+    UINT w = (UINT)(vp->Width + 0.5f), h = (UINT)(vp->Height + 0.5f), bpp, y;
+    uint32_t hd[8] = {0};
+    FILE *fp;
+    if (!bw_gfxcap_pic_path(path, sizeof path) || !dst || !w || !h)
+        return;
+    bpp = (f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R16G16B16A16_UNORM) ? 8u : 4u;
+    ID3D11View_GetResource((ID3D11View *)dst, &res);
+    if (!res)
+        return;
+    memset(&td, 0, sizeof td);
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = f;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_vfx_dev, &td, NULL, &stg))) {
+        box.left = x0; box.top = y0; box.front = 0;
+        box.right = x0 + w; box.bottom = y0 + h; box.back = 1;
+        ID3D11DeviceContext_CopySubresourceRegion(g_vfx_ctx, (ID3D11Resource *)stg, 0, 0, 0, 0, res, 0, &box);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(g_vfx_ctx, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+            if ((fp = fopen(path, "wb")) != NULL) {
+                memcpy(hd, "BWSHOT01", 8);
+                hd[2] = w; hd[3] = h; hd[4] = bpp; hd[6] = (uint32_t)f;
+                fwrite(hd, 4, 8, fp);
+                for (y = 0; y < h; y++)
+                    fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, bpp, w, fp);
+                fclose(fp);
+                fprintf(stderr, "[GFXCAP] picture %s (%ux%u, format %u)\n", path, w, h, (unsigned)f);
+            }
+            ID3D11DeviceContext_Unmap(g_vfx_ctx, (ID3D11Resource *)stg, 0);
+        }
+        ID3D11Texture2D_Release(stg);
+    }
+    ID3D11Resource_Release(res);
+}
+
 /* Test aid: BW_VFX_SHOT_RECT=x,y,w,h writes only that crop of the picture
  * (output pixels from its top left). Unset or invalid: the whole picture. */
 static void shot_rect(UINT dw, UINT dh, UINT *x, UINT *y, UINT *w, UINT *h)
@@ -759,6 +809,8 @@ int bw_vfx_present(ID3D11ShaderResourceView *src, UINT sw, UINT sh,
     QueryPerformanceFrequency(&fq);
     dt = last.QuadPart ? (float)((double)(now.QuadPart - last.QuadPart) / (double)fq.QuadPart) : 1.0f / 30.0f;
     if (dt > 0.25f) dt = 0.25f;
+    if (g_bw_gfxcap)
+        dt = bw_gfxcap_dt(dt);          /* BW_GFXCAP: OLED care's clock is an input (recorded, replayed) */
     last = now;
     s_frame++;
     memset(&k, 0, sizeof k);
@@ -913,6 +965,8 @@ int bw_vfx_present(ID3D11ShaderResourceView *src, UINT sw, UINT sh,
     bw_vfx_update_cb(s_pcb, &k, sizeof k);
     bw_vfx_fullscreen(dst, &vp, s_ps[PS_FINAL], s_pcb, srv, 5);
     tq_end();
+    if (g_bw_gfxcap)
+        gfxcap_pic(dst, &vp, outf);     /* BW_GFXCAP_PICS (test aid) */
 
     if (shot_due()) {
         ID3D11View_GetResource((ID3D11View *)dst, &dst_res);

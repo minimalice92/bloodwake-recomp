@@ -798,121 +798,13 @@ static WaveOutState g_waveout = { 0 };
 #include "../../bw_latlog.h"   /* Blood Wake (lat-m): BW_LATLOG test aid (press to sound) */
 #include "bw_apu_out.h"        /* Blood Wake (au-out): MMCSS for the frame thread */
 
-/* Blood Wake carried patch (Remastered, BW_FIX AUDIO_MAKEUP_GAIN, D-016):
- * the game mixes quietly (gameplay -23..-29 dBFS RMS, title music about -39,
- * peaks -4..-12), and neither the stub nor the DSPs undo the bins' headroom.
- * The finished stereo period gets a makeup gain (+4 dB, BW_AUDIO_GAIN_DB)
- * and a look-ahead peak limiter at -1 dBFS, so the whole mix comes up
- * together: music, effects and voice keep the game's balance, and nothing
- * clips. The limiter (stereo-linked, 1 ms look-ahead, 100 ms release) is the
- * min-filter/box-filter kind, which never lets a sample past the ceiling and
- * changes gain smoothly. At +6 dB an Admiral battle had 8% of its samples
- * limited, by up to 4.1 dB (run 20261027-031905-*-ed-bat-remastered): an
- * audible duck of the whole mix on explosions. The default is +4 dB, where
- * only the loudest peaks (battle peaks reach -3.7 dBFS) are touched.
- * BW_AUDIO_GAIN_DB=<dB> forces a gain in any edition (0 turns it off). */
-#define BW_LIM_LA 48                         /* look-ahead, samples */
-static int s_bwg_on = -1;
-static float s_bwg_gain = 1.0f, s_bwg_ceiling = 0.891251f, s_bwg_rel;
-
-static int bw_gain_on(void)
-{
-    if (s_bwg_on < 0) {
-        const char *e = getenv("BW_AUDIO_GAIN_DB");
-        double db = 4.0;
-        int i;
-        s_bwg_on = bw_fix_enabled(BW_FIX_AUDIO_MAKEUP_GAIN);
-        if (e && *e) {
-            db = atof(e);
-            s_bwg_on = db != 0.0;
-        }
-        s_bwg_gain = (float)pow(10.0, db / 20.0);
-        s_bwg_rel = (float)(1.0 - exp(-1.0 / (0.100 * 48000.0)));
-        (void)i;
-        if (s_bwg_on)
-            fprintf(stderr, "[APU] BW output gain %+.1f dB with a -1 dBFS look-ahead limiter"
-                            " (Remastered AUDIO_MAKEUP_GAIN; BW_AUDIO_GAIN_DB)\n", db);
-    }
-    return s_bwg_on;
-}
-
-/* The limiter, for N interleaved channels (2 for the stereo period, 6 for
- * the 5.1 one); one state per stream. */
-typedef struct {
-    float x[BW_LIM_LA][6], r[BW_LIM_LA + 1], h[BW_LIM_LA];
-    float hsum, hlast;
-    unsigned i;
-    double min_gain;                         /* deepest limiting, for the log */
-    unsigned long limited;
-    int inited;
-} BwLim;
-static BwLim s_lim2, s_lim6;
-
-static void bw_lim_period(BwLim *L, int16_t *buf, int n, int ch, int log)
-{
-    int k, j, c;
-    if (!L->inited) {
-        for (j = 0; j <= BW_LIM_LA; j++)
-            L->r[j] = 1.0f;
-        for (j = 0; j < BW_LIM_LA; j++)
-            L->h[j] = 1.0f;
-        L->hsum = (float)BW_LIM_LA;
-        L->hlast = 1.0f;
-        L->min_gain = 1.0;
-        L->inited = 1;
-    }
-    for (k = 0; k < n; k++) {
-        int16_t *s = buf + k * ch;
-        float v[6], pk = 0.0f, m, h, g;
-        unsigned i = L->i % BW_LIM_LA;
-        for (c = 0; c < ch; c++) {
-            v[c] = s[c] / 32768.0f * s_bwg_gain;
-            if (fabsf(v[c]) > pk)
-                pk = fabsf(v[c]);
-        }
-        /* the gain this sample needs, and the least over the look-ahead;
-         * the need window is one longer than the delay, so every box term
-         * covers the sample leaving the delay line */
-        L->r[L->i % (BW_LIM_LA + 1)] = pk > s_bwg_ceiling ? s_bwg_ceiling / pk : 1.0f;
-        for (j = 0, m = 1.0f; j <= BW_LIM_LA; j++)
-            if (L->r[j] < m)
-                m = L->r[j];
-        /* release: rise toward 1 slowly, never above the window's need */
-        h = L->hlast + (1.0f - L->hlast) * s_bwg_rel;
-        if (h > m)
-            h = m;
-        L->hlast = h;
-        /* box filter over the look-ahead: smooth, and still under the need
-         * of the sample leaving the delay line */
-        L->hsum += h - L->h[i];
-        L->h[i] = h;
-        g = L->hsum / BW_LIM_LA;
-        for (c = 0; c < ch; c++) {
-            float o = L->x[i][c] * g;        /* the delayed sample */
-            L->x[i][c] = v[c];
-            if (o > 1.0f) o = 1.0f;
-            if (o < -1.0f) o = -1.0f;
-            s[c] = (int16_t)lrintf(o * 32767.0f);
-        }
-        L->i++;
-        if (g < 0.999f) {
-            L->limited++;
-            if (g < L->min_gain)
-                L->min_gain = g;
-        }
-    }
-    if (log && L->i % (48000 * 30) < (unsigned)n && L->limited) {
-        fprintf(stderr, "[APU] BW limiter: %lu samples limited in 30 s, deepest %.1f dB\n",
-                L->limited, 20.0 * log10(L->min_gain));
-        L->limited = 0;
-        L->min_gain = 1.0;
-    }
-}
-
-static void bw_gain_period(int16_t period[][2], int n)
-{
-    bw_lim_period(&s_lim2, &period[0][0], n, 2, 1);
-}
+/* Blood Wake carried patch (every edition, call GAIN-1; bw_apu_gain.c): the
+ * finished mix gets one fixed gain, set so the loudest peak measured across
+ * the game lands just under -1 dBFS: a pure volume change, no limiting and
+ * no delay (docs/audio/gain.md). It replaced 0.2.4's +4 dB with a look-ahead
+ * limiter (Remastered AUDIO_MAKEUP_GAIN), which ducked big battle explosions
+ * by up to 5 dB. BW_AUDIO_GAIN_DB=<dB> sets it in any edition (0 = none). */
+#include "bw_apu_gain.h"
 
 /* Blood Wake (Remastered AUDIO_SURROUND): the carried apu_xaudio2.c's source
  * voice channels, and BW_AUDIO_WAV6=<path>, a 6-channel WAV of exactly what
@@ -1767,8 +1659,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         mixer_render(extra, MIXER_FRAME_SAMPLES);
         mix_into(period, (const int16_t (*)[2])extra, MIXER_FRAME_SAMPLES);
-        if (bw_gain_on())
-            bw_gain_period(period, MIXER_FRAME_SAMPLES);
+        /* Blood Wake (GAIN-1): the clean-level gain, and BW_AUDIO_PEAKLOG and
+         * BW_AUDIO_WAV_PRE (test aids) before it */
+        bw_gain_stage2(&period[0][0], MIXER_FRAME_SAMPLES, !(xa2_is_active() && d->pace_stalled));
     }
 
     /* A period dropped while pacing is stalled never reaches the device,
@@ -1804,8 +1697,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                 memset(g_bw_frame6, 0, sizeof p6);
                 if (g_audio_muted)
                     memset(p6, 0, sizeof p6);
-                else if (bw_gain_on())
-                    bw_lim_period(&s_lim6, &p6[0][0], MIXER_FRAME_SAMPLES, 6, 0);
+                else
+                    bw_gain_stage6(&p6[0][0], MIXER_FRAME_SAMPLES);
                 apu_wav6_write(&p6[0][0], MIXER_FRAME_SAMPLES);
                 out = &p6[0][0];
             }

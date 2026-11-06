@@ -20,15 +20,49 @@
      if (s_const_load < NV2A_VSH_CONSTANTS)
          memcpy(&s_const[s_const_load][s_const_word], &word, 4);
      else if (vsh_dump_enabled()) {
-@@ -108,6 +114,7 @@
+@@ -106,8 +112,41 @@
+     }
+ }
  
++/* Blood Wake carried patch (BW_GFXCAP step B, lane gfx-capab): the
++ * interpreter's whole state as one block, for a capture opened mid-scene
++ * (docs/gfx/capture.md section 5), and its parts for the method preamble. */
++typedef struct {
++    uint32_t program[NV2A_VSH_SLOTS][4];
++    float    cst[NV2A_VSH_CONSTANTS][4];
++    uint32_t load_slot, load_word, start_slot, const_load, const_word, cxt_write, const_gen;
++} BwVshBlock;
++
++size_t nv2a_vsh_bw_state(void *out)
++{
++    BwVshBlock *b = (BwVshBlock *)out;
++    if (b) {
++        memcpy(b->program, s_program, sizeof s_program);
++        memcpy(b->cst, s_const, sizeof s_const);
++        b->load_slot = s_load_slot; b->load_word = s_load_word; b->start_slot = s_start_slot;
++        b->const_load = s_const_load; b->const_word = s_const_word;
++        b->cxt_write = s_cxt_write; b->const_gen = s_const_gen;
++    }
++    return sizeof(BwVshBlock);
++}
++
++void nv2a_vsh_bw_state_load(const void *in)
++{
++    const BwVshBlock *b = (const BwVshBlock *)in;
++    memcpy(s_program, b->program, sizeof s_program);
++    memcpy(s_const, b->cst, sizeof s_const);
++    s_load_slot = b->load_slot; s_load_word = b->load_word; s_start_slot = b->start_slot;
++    s_const_load = b->const_load; s_const_word = b->const_word;
++    s_cxt_write = b->cxt_write; s_const_gen = b->const_gen;
++}
++
  void nv2a_vsh_set_constant(uint32_t index, const float v[4])
  {
 +    s_const_gen++;
      if (index < NV2A_VSH_CONSTANTS)
          memcpy(s_const[index], v, sizeof s_const[index]);
  }
-@@ -190,6 +197,7 @@
+@@ -190,6 +229,7 @@
  
  void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
  {
@@ -36,7 +70,7 @@
      if (index < NV2A_VSH_CONSTANTS && comp < 4)
          memcpy(&s_const[index][comp], &word, 4);
  }
-@@ -329,6 +337,12 @@
+@@ -329,6 +369,12 @@
      return r;
  }
  
@@ -49,7 +83,7 @@
  int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
  {
      static int dump = -1;
-@@ -401,8 +415,10 @@
+@@ -401,8 +447,10 @@
          if (omask) {
              const vec4 *src = field(ins, 3, 2, 1) ? &ires : &mres;
              if (!field(ins, 3, 11, 1)) {                  /* to c[] */
@@ -61,7 +95,7 @@
              } else if (oaddr == 0) {
                  write_masked(opos.v, src, omask);
              } else if (oaddr < 13) {
-@@ -425,6 +441,7 @@
+@@ -425,6 +473,7 @@
              memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
              memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
              memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);

@@ -1,7 +1,10 @@
 --- xboxrecomp/src/apu/apu_vp.c
 +++ src/toolkit_patches/apu/apu_vp.c
-@@ -22,6 +22,19 @@
+@@ -20,8 +20,22 @@
+  */
+ 
  #include "apu_state.h"
++#include "bw_vp_fast.h"   /* Blood Wake (au-vp): the HRTF and the sinc resampler, faster, the same bits */
  #include "apu.h"
  #include "fpconv.h"
 +#include <process.h>
@@ -20,7 +23,7 @@
  
  /* #define DEBUG_MCPX */
  
-@@ -47,9 +60,11 @@
+@@ -47,9 +61,11 @@
   * Notify status helper
   * ============================================================ */
  
@@ -32,7 +35,7 @@
      hwaddr notify_offset = d->regs[NV_PAPU_FENADDR];
      notify_offset += 16 * (MCPX_HW_NOTIFIER_BASE_OFFSET +
                             v * MCPX_HW_NOTIFIER_COUNT + notifier);
-@@ -67,9 +82,17 @@
+@@ -67,9 +83,17 @@
   * Filter helpers
   * ============================================================ */
  
@@ -50,7 +53,7 @@
      memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
      d->vp.filters[v].gain_valid = false;     /* a new voice starts at its level */
      hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
-@@ -78,6 +101,7 @@
+@@ -78,6 +102,7 @@
      }
      d->vp.filters[v].rs_have = 0;
      d->vp.filters[v].rs_pos = 0.0f;
@@ -58,7 +61,7 @@
  }
  
  static bool voice_should_mute(uint16_t v)
-@@ -86,6 +110,36 @@
+@@ -86,6 +111,36 @@
      return m || mcpx_apu_debug_is_muted(v);
  }
  
@@ -95,7 +98,7 @@
  /* ============================================================
   * Utility functions
   * ============================================================ */
-@@ -124,12 +178,63 @@
+@@ -124,12 +179,63 @@
                  v | ((val << ctz32(mask)) & mask));
  }
  
@@ -159,7 +162,7 @@
      voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                     NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
  
-@@ -148,8 +253,30 @@
+@@ -148,8 +254,30 @@
   * the frame thread holds d->lock across every voice of a frame, so taking
   * d->lock here made each lock wait out the whole frame. The title only has to
   * wait while the voice processor is working on the voice it locks. */
@@ -190,7 +193,7 @@
      while (InterlockedCompareExchange(&d->vp.voice_spin[v], 1, 0))
          SwitchToThread();
  }
-@@ -178,23 +305,811 @@
+@@ -178,23 +306,811 @@
   * HRIR coefficient setter
   * ============================================================ */
  
@@ -1005,7 +1008,7 @@
      unsigned int selected_handle, list;
  
      switch (method) {
-@@ -212,32 +1127,30 @@
+@@ -212,32 +1128,30 @@
          bool locked = is_voice_locked(d, (uint16_t)selected_handle);
          if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
  
@@ -1060,7 +1063,7 @@
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_OFFSET,
                         NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
          d->vp.ssl[selected_handle].ssl_seg = 0;
-@@ -286,8 +1199,34 @@
+@@ -286,8 +1200,34 @@
          voice_reset_filters(d, (uint16_t)selected_handle);
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
@@ -1095,7 +1098,7 @@
          break;
      }
  
-@@ -298,6 +1237,8 @@
+@@ -298,6 +1238,8 @@
          if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
  
          uint16_t rr;
@@ -1104,7 +1107,7 @@
          rr = (uint16_t)voice_get_mask(d, (uint16_t)selected_handle,
              NV_PAVS_VOICE_TAR_LFO_ENV, NV_PAVS_VOICE_TAR_LFO_ENV_EA_RELEASERATE);
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_CUR_ECNT,
-@@ -313,20 +1254,35 @@
+@@ -313,20 +1255,35 @@
          voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                         NV_PAVS_VOICE_PAR_STATE_EFCUR,
                         NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE);
@@ -1145,7 +1148,7 @@
  
      case NV1BA0_PIO_SET_CURRENT_HRTF_ENTRY:
          d->vp.hrtf.current_entry =
-@@ -375,9 +1331,9 @@
+@@ -375,9 +1332,9 @@
          if (current_voice < MCPX_HW_MAX_3D_VOICES &&
              handle != HRTF_NULL_HANDLE) {
              assert(handle < HRTF_ENTRY_COUNT);
@@ -1158,7 +1161,7 @@
          }
          break;
      }
-@@ -441,7 +1397,8 @@
+@@ -441,7 +1398,8 @@
          hwaddr sge_address =
              d->regs[NV_PAPU_VPSGEADDR] + d->vp.inbuf_sge_handle * 8;
          stl_le_phys(address_space_memory, sge_address,
@@ -1168,7 +1171,7 @@
          break;
      }
  
-@@ -533,13 +1490,63 @@
+@@ -533,13 +1491,63 @@
              set_hrir_coeff_tar(d, 0, 30, left30);
              set_hrir_coeff_tar(d, 1, 30, right30);
              d->vp.hrtf.entries[d->vp.hrtf.current_entry].itd = s6p9_to_float(itd);
@@ -1233,7 +1236,7 @@
          } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                     method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
              assert((method & 3) == 0);
-@@ -690,6 +1697,21 @@
+@@ -690,6 +1698,21 @@
                                                     4096.0f / decay_rate);
          }
          if (value <= (sustain_level + 0.2f) || (value > 255.0f)) {
@@ -1255,7 +1258,7 @@
              cur++;
              voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur);
          } else {
-@@ -1174,6 +2196,8 @@
+@@ -1174,6 +2197,8 @@
  
      bool adpcm =
          (container_size_index == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM);
@@ -1264,7 +1267,7 @@
  
      if (adpcm) {
          /* The block is 36 bytes per channel times the descriptor's 5-bit
-@@ -1406,6 +2430,371 @@
+@@ -1406,6 +2431,441 @@
  }
  
  /* ============================================================
@@ -1289,17 +1292,7 @@
 +#define M_PI 3.14159265358979323846
 +#endif
 +
-+#define BW_SINC_ZC 8                   /* zero crossings a side at full band */
-+#define BW_SINC_RES 512                 /* table points per zero crossing */
-+#define BW_SINC_MAXHALF 32              /* taps a side at the narrowest */
-+#define BW_SINC_HIST 256
-+
-+typedef struct {
-+    int have;
-+    int n;                              /* samples in hist */
-+    double pos;                         /* next output, in source samples from hist[0] */
-+    float hist[BW_SINC_HIST][2];
-+} BwSinc;
++/* BW_SINC_*, BwSinc, the table and the output loop: bw_vp_fast.h (au-vp) */
 +static BwSinc *s_bw_sinc;               /* one per voice, allocated on first use */
 +static float s_bw_sinc_tab[BW_SINC_ZC * BW_SINC_RES + 2];
 +
@@ -1313,26 +1306,7 @@
 +        else
 +            on = bw_fix_enabled(BW_FIX_AUDIO_SINC_RESAMPLE);
 +        if (on) {
-+            int i, k;
-+            double beta = 8.0, i0b = 1.0, t = 1.0;
-+            for (k = 1; k < 50; k++) {           /* I0(beta) by its series */
-+                t *= (beta / 2.0 / k) * (beta / 2.0 / k);
-+                i0b += t;
-+            }
-+            for (i = 0; i <= BW_SINC_ZC * BW_SINC_RES + 1; i++) {
-+                double x = (double)i / BW_SINC_RES, r = x / BW_SINC_ZC, a, w, s, term;
-+                if (r >= 1.0) {
-+                    s_bw_sinc_tab[i] = 0.0f;
-+                    continue;
-+                }
-+                a = beta * sqrt(1.0 - r * r);
-+                for (k = 1, w = 1.0, term = 1.0; k < 50; k++) {
-+                    term *= (a / 2.0 / k) * (a / 2.0 / k);
-+                    w += term;
-+                }
-+                s = x == 0.0 ? 1.0 : sin(M_PI * x) / (M_PI * x);
-+                s_bw_sinc_tab[i] = (float)(s * w / i0b);
-+            }
++            bw_sinc_build_table(s_bw_sinc_tab);   /* bw_vp_fast.h (moved there unchanged) */
 +            s_bw_sinc = (BwSinc *)calloc(MCPX_HW_MAX_VOICES, sizeof(BwSinc));
 +            if (!s_bw_sinc)
 +                on = 0;
@@ -1349,22 +1323,27 @@
 +        s_bw_sinc[v].have = 0;
 +}
 +
-+static inline float bw_sinc_k(double x)  /* x >= 0, in zero crossings */
-+{
-+    double fi = x * BW_SINC_RES;
-+    int i = (int)fi;
-+    float f = (float)(fi - i);
-+    if (i >= BW_SINC_ZC * BW_SINC_RES)
-+        return 0.0f;
-+    return s_bw_sinc_tab[i] + f * (s_bw_sinc_tab[i + 1] - s_bw_sinc_tab[i]);
-+}
++/* au-vp (docs/audio/vp.md): the switches, read once with au-hot's (bw_hrtf_ftz)
++ *   BW_APU_VP_FAST=0     both fast paths off (the scalar ones, as before)
++ *   BW_APU_HRTF_FAST=0   the toolkit's HRTF filter (hrtf_filter_process)
++ *   BW_APU_SINC_SIMD=0   the sinc resampler's scalar loop
++ *   BW_APU_VP_PROOF=1    test aid: the scalar paths beside the fast ones on the
++ *                        same state, outputs and state compared bit for bit,
++ *                        and the bins against the shadow bins mixed from the
++ *                        scalar HRTF's output, as floats and as the DSP's
++ *                        24-bit words ([APU-VP-PROOF] every 5 s) */
++static int s_hf_fast = 1, s_sinc_simd = 1, s_vp_proof;
++static struct {
++    unsigned long long hcalls, hdiff_out, hdiff_state, hfixed, hgather, scalls, sout, sdiff, frames;
++    int shown;
++} s_vpp;
 +
 +static int voice_resample_sinc(MCPXAPUState *d, uint16_t v, float samples[][2],
 +                               int requested_num, float rate)
 +{
 +    BwSinc *s = &s_bw_sinc[v];
 +    double step, fc, half, last;
-+    int need, got = 0, out, lo, hi, j, keep;
++    int need, got = 0, out, keep;
 +
 +    if (!(rate > 0.0f)) rate = 1.0f;
 +    step = 1.0 / rate;
@@ -1396,29 +1375,34 @@
 +        s->n += got;
 +    }
 +
-+    for (out = 0; out < requested_num; out++) {
-+        double p = s->pos;
-+        float acc0 = 0.0f, acc1 = 0.0f, wsum = 0.0f;
-+        lo = (int)ceil(p - half);
-+        hi = (int)floor(p + half);
-+        if (hi >= s->n)
-+            break;                       /* the source isn't there yet */
-+        if (lo < 0) lo = 0;
-+        if (g_bw_hot)
-+            s_hot_taps += hi - lo + 1;   /* au-hot */
-+        for (j = lo; j <= hi; j++) {
-+            float w = bw_sinc_k(fabs(p - j) * fc);
-+            acc0 += w * s->hist[j][0];
-+            acc1 += w * s->hist[j][1];
-+            wsum += w;
-+        }
-+        if (wsum != 0.0f) {
-+            samples[out][0] = acc0 / wsum;
-+            samples[out][1] = acc1 / wsum;
++    {
++        /* the outputs (bw_vp_fast.h): the scalar loop as it always was, or 4
++         * outputs at a time in SSE lanes, the same bits (au-vp) */
++        int *taps = g_bw_hot ? &s_hot_taps : NULL;   /* au-hot */
++        if (s_vp_proof > 0) {
++            float ref[32][2];
++            double p0 = s->pos, pref;
++            int tr = 0, tf = 0, nr;
++            nr = bw_sinc_out_scalar(s, ref, requested_num, step, fc, half, s_bw_sinc_tab, &tr);
++            pref = s->pos;
++            s->pos = p0;
++            out = s_sinc_simd ? bw_sinc_out_simd(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, &tf)
++                              : bw_sinc_out_scalar(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, &tf);
++            if (taps)
++                *taps += tf;
++            s_vpp.scalls++;
++            s_vpp.sout += (unsigned long long)nr;
++            if (nr != out || tr != tf || memcmp(&pref, &s->pos, sizeof pref) ||
++                memcmp(ref, samples, sizeof(float) * 2 * (size_t)nr)) {
++                s_vpp.sdiff++;
++                if (s_vpp.shown++ < 20)
++                    fprintf(stderr, "[APU-VP-PROOF] DIFFERS: the sinc, voice %u: %d / %d outputs, taps %d / %d,"
++                                    " pos %.17g / %.17g\n", (unsigned)v, nr, out, tr, tf, pref, s->pos);
++            }
 +        } else {
-+            samples[out][0] = samples[out][1] = 0.0f;
++            out = s_sinc_simd ? bw_sinc_out_simd(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, taps)
++                              : bw_sinc_out_scalar(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, taps);
 +        }
-+        s->pos += step;
 +    }
 +
 +    /* drop what no later output can reach */
@@ -1488,6 +1472,24 @@
 +        const char *pr = getenv("BW_APU_HRTF_PROOF");
 +        s_hrtf_ftz = !(e && e[0] == '0');
 +        s_hrtf_proof = pr && (pr[0] == '1' || pr[0] == '2') ? pr[0] - '0' : 0;
++        {
++            /* au-vp: the fast paths, on in every edition (bit-identical);
++             * the proof aid takes au-hot's shadow bins (one proof at a time) */
++            const char *fa = getenv("BW_APU_VP_FAST"), *fh = getenv("BW_APU_HRTF_FAST");
++            const char *fs = getenv("BW_APU_SINC_SIMD"), *fp = getenv("BW_APU_VP_PROOF");
++            int all = !(fa && fa[0] == '0');
++            s_hf_fast = all && !(fh && fh[0] == '0');
++            s_sinc_simd = all && !(fs && fs[0] == '0');
++            s_vp_proof = fp && fp[0] == '1';
++            if (s_vp_proof)
++                s_hrtf_proof = 0;
++            fprintf(stderr, "[APU] BW voice processor (au-vp): the HRTF filter %s; the sinc resampler's outputs %s%s\n",
++                    s_hf_fast ? "4 samples at a time with a straight history (BW_APU_HRTF_FAST=0: the toolkit's)"
++                              : "the toolkit's (BW_APU_HRTF_FAST=0)",
++                    s_sinc_simd ? "4 at a time (BW_APU_SINC_SIMD=0: one at a time)" : "one at a time",
++                    s_vp_proof ? "; BW_APU_VP_PROOF: the scalar paths beside them, compared bit for bit, and the"
++                                 " bins against the scalar HRTF's" : "");
++        }
 +        fprintf(stderr, "[APU] BW HRTF filter: %s (BW_APU_HRTF_FTZ)%s\n",
 +                s_hrtf_ftz ? "flush-to-zero around it, so no denormal stalls (au-hot; the bins unchanged)"
 +                           : "the exact float path, denormal stalls and all",
@@ -1509,6 +1511,66 @@
 + * code: stmxcsr, ldmxcsr, the filter's call, ldmxcsr; no x87 anywhere in
 + * the VP, seen with dumpbin). */
 +#pragma fenv_access (on)
++/* au-vp: the filter that runs (the fast one unless BW_APU_HRTF_FAST=0) */
++static void bw_hrtf_call(HrtfFilter *f, float samples[][2])
++{
++    if (s_hf_fast)
++        bw_hrtf_fast(f, samples, samples, NULL);
++    else
++        hrtf_filter_process(f, samples, samples);
++}
++
++/* au-vp's proof (BW_APU_VP_PROOF=1): one snapshot of the voice's filter (its
++ * targets frozen, call AH-5), the toolkit's filter on a copy of it and of the
++ * input, the filter that runs on the snapshot, both in the frame's mode
++ * (au-hot's flush-to-zero unless BW_APU_HRTF_FTZ=0); outputs and the whole
++ * state compared bit for bit; the snapshot's moving parts back into the
++ * voice; the toolkit's output to the shadow bins. */
++static __declspec(noinline) void bw_hrtf_vp_proof(HrtfFilter *f, int v, float samples[][2])
++{
++    static HrtfFilter snap, ref;
++    float refio[NUM_SAMPLES_PER_FRAME][2];
++    BwHfInfo info = { 0, 0 };
++    unsigned m = _mm_getcsr();
++    snap = *f;
++    ref = snap;
++    memcpy(refio, samples, sizeof refio);
++    if (s_hrtf_ftz)
++        _mm_setcsr(m | 0x8040);
++    hrtf_filter_process(&ref, refio, refio);
++    if (s_hf_fast)
++        bw_hrtf_fast(&snap, samples, samples, &info);
++    else
++        hrtf_filter_process(&snap, samples, samples);   /* the control: the toolkit's against itself */
++    _mm_setcsr(m);
++    s_vpp.hcalls++;
++    s_vpp.hfixed += info.fixed;
++    s_vpp.hgather += (unsigned long long)info.gather_blocks;
++    if (memcmp(refio, samples, sizeof refio)) {
++        s_vpp.hdiff_out++;
++        if (s_vpp.shown++ < 20)
++            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
++                for (int c = 0; c < 2; c++)
++                    if (memcmp(&refio[i][c], &samples[i][c], 4)) {
++                        fprintf(stderr, "[APU-VP-PROOF] DIFFERS: the HRTF, voice %d sample %d ear %d: %.9g against"
++                                        " the toolkit's %.9g (fixed %d)\n", v, i, c, (double)samples[i][c],
++                                (double)refio[i][c], info.fixed);
++                        i = NUM_SAMPLES_PER_FRAME;
++                        break;
++                    }
++    }
++    if (memcmp(&ref, &snap, sizeof ref))
++        s_vpp.hdiff_state++;
++    f->buf_pos = snap.buf_pos;
++    f->itd_cur = snap.itd_cur;
++    for (int c = 0; c < 2; c++) {
++        memcpy(f->ch[c].buf, snap.ch[c].buf, sizeof f->ch[c].buf);
++        memcpy(f->ch[c].hrir_coeff_cur, snap.ch[c].hrir_coeff_cur, sizeof f->ch[c].hrir_coeff_cur);
++    }
++    memcpy(s_hp_out, refio, sizeof s_hp_out);
++    s_hp_cur = 1;
++}
++
 +static __declspec(noinline) void bw_hrtf_run(HrtfFilter *f, int v, float samples[][2])
 +{
 +    float in[NUM_SAMPLES_PER_FRAME][2];
@@ -1535,13 +1597,17 @@
 +            memcpy(s->ch[c].hrir_coeff_tar, run->ch[c].hrir_coeff_tar, sizeof s->ch[c].hrir_coeff_tar);
 +        }
 +    }
++    if (s_vp_proof > 0) {
++        bw_hrtf_vp_proof(f, v, samples);   /* au-vp: the fast filter against the toolkit's */
++        return;
++    }
 +    if (s_hrtf_ftz) {
 +        unsigned m = _mm_getcsr();
 +        _mm_setcsr(m | 0x8040);          /* FTZ (bit 15) and DAZ (bit 6) */
-+        hrtf_filter_process(run, samples, samples);
++        bw_hrtf_call(run, samples);
 +        _mm_setcsr(m);
 +    } else {
-+        hrtf_filter_process(run, samples, samples);
++        bw_hrtf_call(run, samples);
 +    }
 +    if (run != f) {
 +        /* the snapshot's moving parts back into the voice's filter (its
@@ -1556,7 +1622,7 @@
 +    }
 +    if (s_hrtf_proof > 0) {
 +        int nd = 0;
-+        hrtf_filter_process(&s_hp_f[v], in, s_hp_out);   /* the exact path, the default mode */
++        hrtf_filter_process(&s_hp_f[v], in, s_hp_out);   /* the exact path, the default mode (the toolkit's) */
 +        double mx = 0.0;
 +        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
 +            for (int c = 0; c < 2; c++)
@@ -1622,7 +1688,14 @@
 +                }
 +            }
 +        }
-+    if (++s_hp.frames % 7500 == 0)
++    if (s_vp_proof > 0 && (s_hp.frames + 1) % 7500 == 0)
++        fprintf(stderr, "[APU-VP-PROOF] %llu frames: the HRTF %llu runs (%llu at the fixed point, %llu blocks"
++                        " gathered), %llu with an output not bit-identical, %llu with a state not; the sinc %llu calls,"
++                        " %llu outputs, %llu not bit-identical; the bins %llu samples, %llu differ as the DSP's 24-bit"
++                        " words, %llu as floats%s\n", s_hp.frames + 1, s_vpp.hcalls, s_vpp.hfixed, s_vpp.hgather,
++                s_vpp.hdiff_out, s_vpp.hdiff_state, s_vpp.scalls, s_vpp.sout, s_vpp.sdiff, s_hp.bins, s_hp.bins24,
++                s_hp.binsf, s_hf_fast || s_sinc_simd ? "" : " (both fast paths off: the control)");
++    if (++s_hp.frames % 7500 == 0 && s_hrtf_proof > 0)
 +        fprintf(stderr, "[APU-HRTF-PROOF] %llu frames: %llu bin samples compared, %llu differ as the DSP's 24-bit"
 +                        " words, %llu as floats (the largest %.3g); %llu filter runs, %llu with an output not"
 +                        " bit-identical (%llu samples); multipass reads %llu (%llu of a shadow bin that differed)%s\n",
@@ -1636,7 +1709,7 @@
   * Voice processing (main per-voice function)
   * ============================================================ */
  
-@@ -1422,6 +2811,7 @@
+@@ -1422,6 +2882,7 @@
                                   NV_PAVS_VOICE_PAR_STATE_PAUSED) != 0;
  
      struct McpxApuDebugVoice *dbg = &g_dbg.vp.v[v];
@@ -1644,7 +1717,7 @@
      dbg->active = true;
      dbg->stereo = stereo;
      dbg->paused = paused;
-@@ -1443,6 +2833,15 @@
+@@ -1443,6 +2904,15 @@
                                          NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
      float rate = 1.0f / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
      dbg->rate = rate;
@@ -1660,7 +1733,7 @@
  
      /* Step amplitude envelope */
      float ea_value = voice_step_envelope(
-@@ -1459,6 +2858,9 @@
+@@ -1459,6 +2929,9 @@
      bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                      NV_PAVS_VOICE_CFG_FMT_MULTIPASS) != 0;
      dbg->multipass = multipass;
@@ -1670,7 +1743,7 @@
  
      if (multipass) {
          /* Read from multipass bin */
-@@ -1471,17 +2873,42 @@
+@@ -1471,17 +2944,42 @@
          }
          bool clear_mix = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                          NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX) != 0;
@@ -1684,7 +1757,7 @@
 +            if (pk > s_bw_mp_peak) s_bw_mp_peak = pk;
 +            s_bw_mp_lpf[v] = 1;
 +        }
-+        if (s_hrtf_proof > 0) {
++        if (s_hrtf_proof > 0 || s_vp_proof > 0) {
 +            /* au-hot's proof: a multipass voice reads a bin; the shadow's would
 +             * have to be the same for the proof to cover what follows */
 +            s_hp.mp_reads++;
@@ -1693,7 +1766,7 @@
 +        }
          if (clear_mix) {
              memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
-+            if (s_hrtf_proof > 0)
++            if (s_hrtf_proof > 0 || s_vp_proof > 0)
 +                memset(&s_hp_bins[mp_bin][0], 0, sizeof(s_hp_bins[0]));
          }
      } else {
@@ -1715,7 +1788,7 @@
              if (count < 0) break;
              /* An active voice that keeps producing nothing is an underrun,
               * not a reason to spin. Asking it again at once cannot change the
-@@ -1490,6 +2917,8 @@
+@@ -1490,6 +2988,8 @@
              if (count == 0 && ++empty > 4) break;
              sample_count += count;
          }
@@ -1724,7 +1797,7 @@
      }
  
      int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-@@ -1532,6 +2961,39 @@
+@@ -1532,6 +3032,39 @@
          dbg->bin[i] = (uint8_t)bin[i];
          dbg->vol[i] = vol[i];
      }
@@ -1764,7 +1837,7 @@
      if (s_vstat_on > 0) {
          s_vstat[v].ea = ea_value;
          s_vstat[v].rate = rate;
-@@ -1539,11 +3001,13 @@
+@@ -1539,11 +3072,13 @@
          s_vstat[v].bin0 = (uint8_t)bin[0]; s_vstat[v].bin1 = (uint8_t)bin[1];
      }
  
@@ -1779,7 +1852,7 @@
      bool lpf = false;
      if (v < MCPX_HW_MAX_3D_VOICES) {
          lpf = (fmode == 1);
-@@ -1564,11 +3028,75 @@
+@@ -1564,11 +3099,75 @@
              setup_svf(filter, fc_f, q_f, F_LP);
              for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                  samples[i][ch] = run_svf(filter, samples[i][ch]);
@@ -1855,7 +1928,7 @@
      /* HRTF processing for 3D voices. RECOMP_APU_HRTF=0 turns it off: it is
       * on by default (xemu's), and so far checked on one title. */
      static int hrtf_on = -1;
-@@ -1576,16 +3104,65 @@
+@@ -1576,16 +3175,65 @@
          const char *e = getenv("RECOMP_APU_HRTF");
          hrtf_on = !(e && e[0] == '0');
      }
@@ -1922,7 +1995,7 @@
      for (int b = 0; b < 8; b++) {
          float g = ea_value;
          float hr;
-@@ -1595,6 +3172,8 @@
+@@ -1595,6 +3243,8 @@
              hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
          }
          g *= attenuate(vol[b]) / hr;
@@ -1931,7 +2004,7 @@
          /* The volumes are target registers: the hardware moves the level
           * toward them rather than jumping. Stepping to each frame's level
           * every 32 samples turned a voice whose volume the title changes
-@@ -1605,10 +3184,60 @@
+@@ -1605,10 +3255,60 @@
          float step = (g - g0) / NUM_SAMPLES_PER_FRAME;
          f->gain_prev[b] = g;
          for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -1951,7 +2024,7 @@
 +             * (room-filtered) signal, not an ear */
 +            float x = (bw_room_ok && b >= 4) ? bw_room[i] : samples[i][ch];
 +            mixbins[bin[b]][i] += (g0 + step * (i + 1)) * x;
-+            if (s_hrtf_proof > 0) {
++            if (s_hrtf_proof > 0 || s_vp_proof > 0) {
 +                /* au-hot's proof: the same mix from the exact path's output */
 +                float xe = (bw_room_ok && b >= 4) ? bw_room[i] : s_hp_cur ? s_hp_out[i][ch] : samples[i][ch];
 +                s_hp_bins[bin[b]][i] += (g0 + step * (i + 1)) * xe;
@@ -1993,7 +2066,7 @@
  
      /* VP monitor mix */
      if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
-@@ -1668,7 +3297,13 @@
+@@ -1668,7 +3368,13 @@
  void mcpx_apu_vp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
  {
@@ -2002,12 +2075,12 @@
 +    bw_audit_frame();                    /* Blood Wake: BW_APU_AUDIT */
      memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 +    bw_hrtf_ftz();                       /* au-hot: the switches, read once */
-+    if (s_hrtf_proof > 0)
++    if (s_hrtf_proof > 0 || s_vp_proof > 0)
 +        bw_hrtf_proof_begin(mixbins);
  
      for (int list = 0; list < 3; list++) {
          hwaddr top, current, next;
-@@ -1685,6 +3320,8 @@
+@@ -1685,6 +3391,8 @@
              }
  
              uint16_t v = (uint16_t)d->regs[current];
@@ -2016,7 +2089,7 @@
              d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                 NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
  
-@@ -1700,15 +3337,36 @@
+@@ -1700,15 +3408,36 @@
              } else {
                  /* Process voice directly (single-threaded) */
                  voice_spin_lock(d, v);
@@ -2036,8 +2109,8 @@
          }
      }
 +    bwd3_orphan_check(d, bwd3_reached);
-+    if (s_hrtf_proof > 0)
-+        bw_hrtf_proof_end(d, mixbins);   /* au-hot: the bins against the exact path's */
++    if (s_hrtf_proof > 0 || s_vp_proof > 0)
++        bw_hrtf_proof_end(d, mixbins);   /* au-hot: the bins against the exact path's (au-vp: the scalar's) */
 +    bw_audit_bins(mixbins);              /* Blood Wake: BW_APU_AUDIT */
 +    if (g_bw_hot) {
 +        int n = 0;                       /* au-hot: denormals in the bins */
@@ -2053,7 +2126,7 @@
      if (s_ring_on > 0 && ++s_ring_frames % 1500 == 0)
          vp_ring_report(++s_ring_secs);
  
-@@ -1774,4 +3432,5 @@
+@@ -1774,4 +3503,5 @@
      for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
          hrtf_filter_init(&d->vp.filters[v].hrtf);
      }

@@ -16,9 +16,9 @@ void bw_audio_thread_mmcss(const char *who);
  * (RECOMP_AUDIO_WAV) through a writer thread of its own, the same bytes in
  * the same order (BW_AUDIO_WAV_ASYNC=0: the frame thread writes, as
  * before); started: once after apu_wav_open; close: drains, then closes. And
- * the process's power throttling, once: with BW_PROC_QOS=1, always high QoS
- * and the timer resolution it asks for (unset: left to Windows, the default;
- * BW_TEST_ECOQOS=1 forces EcoQoS, a test switch). */
+ * the process's power throttling, once: always high QoS and the timer
+ * resolution it asks for (on by default since 0.3.1, call QOS-1; BW_PROC_QOS=0
+ * leaves both to Windows; BW_TEST_ECOQOS=1 forces EcoQoS, a test switch). */
 #include <stdint.h>
 void bw_wav_write(const int16_t *s, int n);
 void bw_wav_started(void);

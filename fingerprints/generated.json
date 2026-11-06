@@ -9,32 +9,32 @@
  "names": "none: functions keep their sub_ names (names/bw_names.json is not public)",
  "runs": [
   {
-   "seconds": 643,
-   "pipeline_seconds": 643,
-   "total_sha256": "0cdb6b825bd89e2c10868c977a20891350a0fe4343673b4c9d0daf71f1d2467f"
+   "seconds": 550,
+   "pipeline_seconds": 550,
+   "total_sha256": "720f81a60961f5bc24ac49861bf9d551e35bd4cbe837343fe270f5d4b7c9a50a"
   },
   {
-   "seconds": 644,
-   "pipeline_seconds": 643,
-   "total_sha256": "0cdb6b825bd89e2c10868c977a20891350a0fe4343673b4c9d0daf71f1d2467f"
+   "seconds": 551,
+   "pipeline_seconds": 550,
+   "total_sha256": "720f81a60961f5bc24ac49861bf9d551e35bd4cbe837343fe270f5d4b7c9a50a"
   }
  ],
  "inputs": {
   "tools/run_pipeline.py": "7a822ff9361f64833e61ddaee547da07ca4a8e4b141f9fe6a822a2a7b2b79358",
   "tools/xbr_patches.py": "8395b61776f84ea2500d7317a890dff1d5d1c1b693a5e5501d45a77b872162f3",
   "names/icall_seeds.json": "fdcefa05897c424a4587d8c4ce6d85019df5acb71a77361dd37d21ebf079eaf6",
-  "src/recomp_manual.c": "f200bb7565ac7b6a1c147b9956a48a21cb2a4cf5a771f019a66138ec484b64f9",
+  "src/recomp_manual.c": "7b242284296a5be494addcbb279c6c81c84f1eb4e25ac658e23e359e72e5cb4b",
   "src/bw_audio_hooks.c": "dfc39cbea4c411ddad491edb3f7e876afdb6ab6447a7be77b41bbf19ca1bedd6",
   "src/bw_cheat_hooks.c": "fdffe54b13973ddff6c6ba9839b9835f10ff5f675363d5f5020831761a722c3f",
   "src/bw_fix_hooks.c": "dd5cea23d69e1b9e65a6bec762f458064a065b2a64fd5dcf569a876d51435c16",
-  "src/bw_hifps_hooks.c": "2487d03f16dade48d57cd06683d949ad24d1246b41e66312133ea297eea20277",
+  "src/bw_hifps_hooks.c": "47a39836e60b24afa279552dd279bca52b4ae8c27d03524ef731ee35dce2303a",
   "src/bw_menu_hooks.c": "ad474e06fd7d25003fbd8f2318448c8204ecc5745059a2d3076fdbd6342c577a",
   "src/bw_remaster_hooks.c": "0c6c7876c502765eed09098f9ef3fe621b38dc2e4869d837958e9fca11eb15ad",
   "src/bw_visextra_hooks.c": "d4d0f9b4240f8adc039d94668480417b04afac8421d2bd500a86a864f27a211d"
  },
  "file_count": 37,
- "total_bytes": 33266895,
- "total_sha256": "0cdb6b825bd89e2c10868c977a20891350a0fe4343673b4c9d0daf71f1d2467f",
+ "total_bytes": 33267007,
+ "total_sha256": "720f81a60961f5bc24ac49861bf9d551e35bd4cbe837343fe270f5d4b7c9a50a",
  "files": {
   "recomp_0000.c": {
    "size": 1005003,
@@ -149,8 +149,8 @@
    "sha256": "f5a97c2f4f7b8fb4ab4641ddd3ff4be7e200c1908b37d86dae33f65b77857844"
   },
   "recomp_0028.c": {
-   "size": 1207183,
-   "sha256": "59f2d09d481a75fe9cabacf1e1ec5fd855eef6f864cb8acdded82f94d03045f3"
+   "size": 1207199,
+   "sha256": "a696387bdf6728a22aa0149e26c5d5277e53b009abf4e7b78f67d7fd907e99a5"
   },
   "recomp_0029.c": {
    "size": 1591284,
@@ -173,8 +173,8 @@
    "sha256": "95c4eabfb59651a1368ce4de2c8cf7d4d584b1ce169abfc97d40dc02bfe40227"
   },
   "recomp_funcs.h": {
-   "size": 217636,
-   "sha256": "b6cecdfbd59bf5a1f27680b3501a2b9ffe0f6dfe5571323ba2f0424bb833cd28"
+   "size": 217732,
+   "sha256": "e54dbed65f3943ad3440b71e61e3514bc70417514bbcd8c23eb07b2dbf69c53e"
   },
   "recomp_stubs_unresolved.c": {
    "size": 2216,
@@ -184,5 +184,12 @@
    "size": 76308,
    "sha256": "a14e666bb81bbb3c77d0f337e8c0e1bf3ba625d4483ea87b79603cca3a9991ef"
   }
+ },
+ "manual_scan": {
+  "skip": 45,
+  "wrap": 60,
+  "referenced": 62,
+  "enter": 0,
+  "sha256": "e99c06ee18e714bab1cbd14f89f8bc1ba8e993b7fe7af31d6339e677f5a92e09"
  }
 }

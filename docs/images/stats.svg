@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 478" width="600" height="478" role="img" aria-labelledby="t d">
   <title id="t">The project in numbers</title>
-  <desc id="d">100%: recompiled: 0 functions failed, the whole game plays. 8,110: functions named: the whole program. ~3 days: from the first plan to the first release. 70+: AI agents, in batches, with an AI lead. 0: crashes in 948 mission runs of soak tests. 17: bugs from 2001 fixed in Remastered.</desc>
+  <desc id="d">100%: recompiled: 0 functions failed, the whole game plays. 8,110: functions named: the whole program. ~3 days: from the first plan to the first release. 70+: AI agents, in batches, with an AI lead. 0: crashes in 948 mission runs of soak tests. 18: bugs from 2001 fixed in Remastered.</desc>
   <defs><linearGradient id="tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#112036"/><stop offset="1" stop-color="#0b1626"/></linearGradient></defs>
   <g font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
     <g transform="translate(0,0)">
@@ -41,7 +41,7 @@
     <g transform="translate(307,328)">
       <rect x="1" y="1" width="291" height="148" rx="16" fill="url(#tile)" stroke="#24405f" stroke-width="1.5"/>
       <rect x="22" y="22" width="36" height="4" rx="2" fill="#4fb3ff"/>
-      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">17</text>
+      <text x="22" y="78" font-size="46" font-weight="800" fill="#f4f7fb">18</text>
       <text x="22" y="108" font-size="19" fill="#b4c3d4">bugs from 2001 fixed</text>
       <text x="22" y="132" font-size="19" fill="#b4c3d4">in Remastered</text>
     </g>

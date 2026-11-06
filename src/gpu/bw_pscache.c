@@ -226,7 +226,15 @@ int bw_pscache_verify(void)
     return s_verify;
 }
 
-static const void *find_h(uint64_t h1, uint64_t h2, uint32_t textlen, size_t *size)
+/* gfx-regen: the table is shared with the load-time vertex-shader compile's
+ * workers (bw_vshpre.c), which look and store from their own threads; every
+ * reader takes this lock shared and every writer exclusive. A blob handed
+ * out stays valid: an entry's bytes are only replaced by different bytes for
+ * the same text (item 41's rejected bytecode), which the workers never store
+ * (they store only a text the table lacked). */
+static SRWLOCK s_lock = SRWLOCK_INIT;
+
+static const void *find_h_locked(uint64_t h1, uint64_t h2, uint32_t textlen, size_t *size)
 {
     unsigned i;
     if (s_on <= 0 || !s_n)
@@ -237,6 +245,15 @@ static const void *find_h(uint64_t h1, uint64_t h2, uint32_t textlen, size_t *si
             return s_ent[i].blob;
         }
     return NULL;
+}
+
+static const void *find_h(uint64_t h1, uint64_t h2, uint32_t textlen, size_t *size)
+{
+    const void *p;
+    AcquireSRWLockShared(&s_lock);
+    p = find_h_locked(h1, h2, textlen, size);
+    ReleaseSRWLockShared(&s_lock);
+    return p;
 }
 
 const void *bw_pscache_find(const char *src, size_t len, size_t *size)
@@ -267,8 +284,9 @@ static int store_h(const char *kind, uint64_t tag, uint64_t h1, uint64_t h2, uin
     h.textlen = textlen;
     h.blobsize = (uint32_t)size;
     h.blobsum = fnv64(blob, size, 0xCBF29CE484222325ull);
+    AcquireSRWLockExclusive(&s_lock);   /* gfx-regen: the workers store too */
     {
-        const void *old = find_h(h1, h2, textlen, &have);
+        const void *old = find_h_locked(h1, h2, textlen, &have);
         if (old == NULL)
             add(h.h1, h.h2, h.textlen, blob, h.blobsize);
         else if (have != size || memcmp(old, blob, size)) {
@@ -291,6 +309,7 @@ static int store_h(const char *kind, uint64_t tag, uint64_t h1, uint64_t h2, uin
                     kind[0] == 'v' ? "vertex" : "pixel", kind, (unsigned long long)h.h1);
         }
     }
+    ReleaseSRWLockExclusive(&s_lock);
     _snwprintf(fin, MAX_PATH * 2, L"%ls\\%hs_%016llX.bin", s_dirw, kind, (unsigned long long)h.h1);
     _snwprintf(tmp, MAX_PATH * 2, L"%ls\\%hs_%016llX.%lu.%lu.tmp", s_dirw, kind,
                (unsigned long long)h.h1, (unsigned long)GetCurrentProcessId(),
@@ -337,13 +356,111 @@ void bw_pscache_store_vs(const char *src, size_t len, int ws, const void *blob, 
         return;
     vs_hash(src, len, ws, &h1, &h2);
     if (store_h("vs", s_tag_vs, h1, h2, (uint32_t)len, blob, size))
-        s_vs_stored++;
+        InterlockedIncrement((volatile LONG *)&s_vs_stored);
+}
+
+/* gfx-regen: whether the cache holds this vertex shader, from any thread
+ * (bw_vshpre.c's workers), without counting a hit. */
+int bw_pscache_has_vs(const char *src, size_t len, int ws)
+{
+    uint64_t h1, h2;
+    size_t sz = 0;
+    if (s_on <= 0)
+        return 0;
+    vs_hash(src, len, ws, &h1, &h2);
+    return find_h(h1, h2, (uint32_t)len, &sz) != NULL;
 }
 
 void bw_pscache_vs_counts(unsigned *hits, unsigned *stored)
 {
     *hits = s_vs_hits;
     *stored = s_vs_stored;
+}
+
+/* ---- gfx-ffp: keys and the manifest (BW_GPU_VSH_SYNC's warm-up) ---------- */
+
+void bw_pscache_vs_key(const char *src, size_t len, int ws, uint64_t *h1, uint64_t *h2)
+{
+    vs_hash(src, len, ws, h1, h2);
+}
+
+const void *bw_pscache_find_vs_key(uint64_t h1, uint64_t h2, uint32_t textlen, size_t *size)
+{
+    return find_h(h1, h2, textlen, size);
+}
+
+static void manifest_path(uint64_t stamp, wchar_t *out, size_t n)
+{
+    _snwprintf(out, n, L"%ls\\vs_manifest_%016llX.txt", s_dirw, (unsigned long long)stamp);
+    out[n - 1] = 0;
+}
+
+unsigned bw_pscache_manifest_read(uint64_t stamp, BwVsManifestEntry **out)
+{
+    wchar_t path[MAX_PATH * 2];
+    char line[160];
+    BwVsManifestEntry *v = NULL;
+    unsigned n = 0, cap = 0;
+    FILE *f;
+    *out = NULL;
+    if (s_on <= 0)
+        return 0;
+    manifest_path(stamp, path, MAX_PATH * 2);
+    if (!(f = _wfopen(path, L"r")))
+        return 0;
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a, b;
+        unsigned len, ws;
+        char kind;
+        unsigned i;
+        /* "<h1> <h2> <textlen> <ws> <kind>"; anything else (a line cut short
+         * by another copy of the game writing at the same moment) is skipped */
+        if (sscanf(line, "%llx %llx %u %u %c", &a, &b, &len, &ws, &kind) != 5
+                || (kind != 'p' && kind != 'f') || ws > 1)
+            continue;
+        for (i = 0; i < n && !(v[i].h1 == a && v[i].h2 == b && v[i].textlen == len && v[i].ws == (int)ws); i++)
+            ;
+        if (i < n)
+            continue;                   /* listed twice (two copies met it in the same run) */
+        if (n == cap) {
+            unsigned nc = cap ? cap * 2 : 64;
+            BwVsManifestEntry *nv = (BwVsManifestEntry *)realloc(v, nc * sizeof *nv);
+            if (!nv)
+                break;
+            v = nv;
+            cap = nc;
+        }
+        v[n].h1 = a;
+        v[n].h2 = b;
+        v[n].textlen = len;
+        v[n].ws = (int)ws;
+        v[n].kind = kind;
+        n++;
+    }
+    fclose(f);
+    *out = v;
+    return n;
+}
+
+void bw_pscache_manifest_add(uint64_t stamp, const BwVsManifestEntry *e)
+{
+    wchar_t path[MAX_PATH * 2];
+    char line[96];
+    FILE *f;
+    int len;
+    if (s_on <= 0)
+        return;
+    manifest_path(stamp, path, MAX_PATH * 2);
+    len = _snprintf(line, sizeof line, "%016llX %016llX %u %d %c\n", (unsigned long long)e->h1,
+                    (unsigned long long)e->h2, e->textlen, e->ws ? 1 : 0, e->kind);
+    if (len <= 0 || len >= (int)sizeof line)
+        return;
+    /* one write of one short line, appended (several copies of the game may
+     * append at once; a torn line is skipped when read) */
+    if ((f = _wfopen(path, L"ab")) != NULL) {
+        fwrite(line, 1, (size_t)len, f);
+        fclose(f);
+    }
 }
 
 void bw_pscache_note(int compiled, double ms)

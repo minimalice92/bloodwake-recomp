@@ -19,20 +19,23 @@
  * Not restored: normal maps (pixel statistics), the water's textures and the
  * effect sprites and atlas (by content key), cube maps, 32-bit and linear
  * textures, render targets, textures smaller than 16 texels across, and
- * anything an overlay (HUD, menu) draw samples: those keep the original. */
+ * anything an overlay (HUD, menu) draw samples: those keep the original.
+ *
+ * This header names no graphics API (the shared core, src/gpu/core, keeps a
+ * BwTrSlot in each texture record; GC-3): the slot holds its chain's back-end
+ * objects untyped, and the D3D11 side (bw_texrestore_d3d11.h) names them. */
 #ifndef BW_TEXRESTORE_H
 #define BW_TEXRESTORE_H
 
 #define COBJMACROS
 #include <windows.h>
-#include <d3d11.h>
 #include <stdint.h>
 #include <stddef.h>
 
 /* Per cached texture. Zeroed = not tried yet. */
 typedef struct BwTrSlot {
-    ID3D11Texture2D *tex;
-    ID3D11ShaderResourceView *srv;
+    void *api[2];               /* the restored chain's back-end objects (D3D11: the
+                                 * texture and its view, BW_TR_TEX and BW_TR_SRV) */
     uint32_t bytes;             /* VRAM of tex (estimated from its levels) */
     uint32_t ticket;            /* the request being worked on (state 3) */
     uint8_t state;              /* 0 untried, 1 restored, 2 left as shipped, 3 being made */
@@ -67,12 +70,6 @@ void bw_tr_init(void);
  * thread. */
 void bw_tr_request(BwTrSlot *s, uint32_t color, const uint8_t *src, uint32_t w, uint32_t h,
                    uint32_t levels, uint32_t addr_u, uint32_t addr_v, uint32_t addr);
-/* Once per frame on the device thread (the flip): finish the textures the
- * worker has ready, within BW_TEXRESTORE_FRAME_MS (0.3 ms; the first texture always). Changes pipeline state;
- * returns 1 if it drew, whether or not each texture then came out (0.2.5
- * item 47: a failure after the enlargement drew used to return 0), and the
- * caller then rebinds its targets. */
-int  bw_tr_pump(ID3D11Device *dev, ID3D11DeviceContext *ctx);
 void bw_tr_release(BwTrSlot *s);
 
 /* 0.2.5 item 48: the slot for a 3D draw of this texture with these NV097
@@ -83,15 +80,6 @@ void bw_tr_release(BwTrSlot *s);
  * each texture is counted and logged. Returns s itself when the modes match
  * or s isn't restored (or being made). Device thread. */
 BwTrSlot *bw_tr_slot_for(BwTrSlot *s, uint32_t addr_u, uint32_t addr_v, uint32_t addr);
-
-/* Menu and title photos (kind 1, BW_TEXRESTORE_MENUS: the JPEG screens) and
- * movie frames (kind 2, BW_TEXRESTORE_MOVIES, item 11): the same deblock on
- * the `grid` (8: JPEG and Bink blocks), on the GPU, from src (w x h) into a
- * new B8G8R8A8 texture returned with its view; 0 if it couldn't. Device
- * thread; changes pipeline state (the caller rebinds its targets). */
-int  bw_tr_deblock_gpu(ID3D11Device *dev, ID3D11DeviceContext *ctx, ID3D11ShaderResourceView *src,
-                       uint32_t w, uint32_t h, int grid, int kind, ID3D11Texture2D **out_tex,
-                       ID3D11ShaderResourceView **out_srv);
 
 /* A [TEXRESTORE] summary line now and then (call once per frame). */
 void bw_tr_frame(void);

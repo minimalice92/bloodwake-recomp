@@ -2,10 +2,13 @@
 #ifndef BW_VFX_INT_H
 #define BW_VFX_INT_H
 
-#include "bw_vfx.h"
+#include "bw_vfx_d3d11.h"
 
 extern ID3D11Device *g_vfx_dev;
 extern ID3D11DeviceContext *g_vfx_ctx;
+/* I3 (BW_GPU_DELTA, bw_d3d11.c): bumped by anything that sets pipeline state
+ * outside the back end's draw paths, so their bindings shadow is forgotten */
+extern unsigned g_bw_ctx_epoch;
 
 ID3D11PixelShader *bw_vfx_compile_ps(const char *src, size_t len, const char *entry);
 ID3D11Buffer *bw_vfx_make_cb(UINT bytes);

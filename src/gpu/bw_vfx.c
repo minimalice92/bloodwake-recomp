@@ -572,6 +572,7 @@ void bw_vfx_fullscreen_bs(ID3D11RenderTargetView *dst, const D3D11_VIEWPORT *vp,
     ID3D11SamplerState *ss[2] = { s_lin, s_pt };
     ID3D11ShaderResourceView *none[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
     ID3D11DeviceContext *c = g_vfx_ctx;
+    g_bw_ctx_epoch++;                   /* I3: the draw paths' bindings shadow is stale now */
     ID3D11DeviceContext_PSSetShaderResources(c, 0, 8, none);
     ID3D11DeviceContext_OMSetRenderTargets(c, 1, &dst, NULL);
     ID3D11DeviceContext_RSSetViewports(c, 1, vp);
@@ -605,4 +606,18 @@ void bw_vfx_blit(ID3D11ShaderResourceView *src, UINT sw, UINT sh,
     vp.Width = (float)dw; vp.Height = (float)dh;
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
     bw_vfx_fullscreen(dst, &vp, s_blit_ps[mode ? 1 : 0], s_cb, &src, 1);
+}
+
+/* Lane gfx-regen (I1): the seed's bilinear stretch into a rectangle of dst. */
+void bw_vfx_blit_vp(ID3D11ShaderResourceView *src, UINT sw, UINT sh,
+                    ID3D11RenderTargetView *dst, const D3D11_VIEWPORT *vp)
+{
+    float k[16];
+    if (!s_fs_vs || !src || !dst || !vp || vp->Width <= 0.0f || vp->Height <= 0.0f)
+        return;
+    memset(k, 0, sizeof k);
+    k[0] = (float)sw; k[1] = (float)sh; k[2] = 1.0f / sw; k[3] = 1.0f / sh;
+    k[4] = vp->Width; k[5] = vp->Height; k[6] = 1.0f / vp->Width; k[7] = 1.0f / vp->Height;
+    bw_vfx_update_cb(s_cb, k, sizeof k);
+    bw_vfx_fullscreen(dst, vp, s_blit_ps[0], s_cb, &src, 1);
 }

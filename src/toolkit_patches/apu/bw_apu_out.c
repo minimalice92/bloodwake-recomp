@@ -48,19 +48,21 @@
  * every normal thread, below pro-audio software's "Pro Audio".) */
 #define BW_MMCSS_DEFAULT 'a'
 
-/* au-hot (docs/audio/hot.md): BW_AUDIO_HIGHQOS=1, the sound thread opts out
+/* au-hot (docs/audio/hot.md): BW_AUDIO_HIGHQOS, the sound thread opts out
  * of Windows 11's execution-speed throttling (its "high QoS"), so a game
  * whose window isn't in front keeps its sound threads off the efficiency
  * cores, where the voice processor runs 1.75 times slower (seen: the
  * resampler 5.9 against 3.4 ns a tap). Scheduling only: nothing it makes
- * changes. Off unless set; any edition. */
+ * changes. Any edition. On by default since 0.3.1 (call QOS-1, au-vp:
+ * the launcher's High Priority Mode); BW_AUDIO_HIGHQOS=0: left to Windows,
+ * as before (the undo, and the mode off). */
 static void bw_audio_thread_highqos(const char *who)
 {
     static int on = -1;
     THREAD_POWER_THROTTLING_STATE st;
     if (on < 0) {
         const char *e = getenv("BW_AUDIO_HIGHQOS");
-        on = e && e[0] == '1';
+        on = !(e && e[0] == '0');
     }
     if (!on)
         return;
@@ -69,7 +71,8 @@ static void bw_audio_thread_highqos(const char *who)
     st.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     st.StateMask = 0;                    /* the control, with the throttling off: high QoS */
     if (SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &st, sizeof st))
-        fprintf(stderr, "[APU] BW the %s thread: high QoS, no execution-speed throttling (BW_AUDIO_HIGHQOS)\n", who);
+        fprintf(stderr, "[APU] BW the %s thread: high QoS, no execution-speed throttling (BW_AUDIO_HIGHQOS;"
+                        " =0 leaves it to Windows)\n", who);
     else
         fprintf(stderr, "[APU] BW the %s thread: high QoS refused (error %lu)\n", who, GetLastError());
 }
@@ -384,9 +387,10 @@ int bw_out_describe(void *devp, char *buf, size_t n)
  *    drops, as apu_wav_write does once the file is closed.
  *    BW_AUDIO_WAV_ASYNC=0: written by the frame thread, as before (the undo).
  *
- * 2. The process's quality of service: BW_PROC_QOS=1 (opt-in; the lead's call:
- *    0.3.1's High Priority Mode, not 0.3.0's fix, which is the vblank ack's
- *    high-resolution steps in kernel_bridge.c and is independent of it).
+ * 2. The process's quality of service: BW_PROC_QOS (on by default since 0.3.1,
+ *    call QOS-1: the launcher's High Priority Mode, which sets =0 when off;
+ *    0.3.0's fix is the vblank ack's high-resolution steps in kernel_bridge.c
+ *    and is independent of it; in 0.3.0 this was opt-in, =1).
  *    Windows 11 may run a process whose window is hidden, minimized or behind
  *    another at reduced speed (EcoQoS: execution-speed throttling), and may
  *    ignore its timer resolution request (timeBeginPeriod(1)) then. The sound
@@ -400,7 +404,7 @@ int bw_out_describe(void *devp, char *buf, size_t n)
  *    never late). The fix opts the whole process out of both: ControlMask
  *    EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION with StateMask 0 ("always high
  *    QoS", "always honour the timer resolution"). Scheduling only: nothing the
- *    game computes changes. Unset or 0 leaves both to Windows (the default).
+ *    game computes changes. =0 leaves both to Windows (the undo).
  *    BW_TEST_ECOQOS=1 (a test switch): the opposite, EcoQoS forced on the
  *    process, to reproduce a throttled game on demand.
  */
@@ -583,13 +587,14 @@ void bw_proc_qos(void)
         st.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
         ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
         what = "EcoQoS forced on (BW_TEST_ECOQOS=1, a test switch)";
-    } else if (e && e[0] == '1') {
+    } else if (!(e && e[0] == '0')) {
         st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
         st.StateMask = 0;
         ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
-        what = "always high QoS and always the timer resolution it asks for (au-vp)";
+        what = "always high QoS and always the timer resolution it asks for (au-vp; BW_PROC_QOS=0 leaves both"
+               " to Windows)";
     } else {
-        what = "left to Windows (BW_PROC_QOS=1 opts out of its throttling)";
+        what = "left to Windows (BW_PROC_QOS=0)";
     }
     memset(&rb, 0, sizeof rb);
     rb.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;

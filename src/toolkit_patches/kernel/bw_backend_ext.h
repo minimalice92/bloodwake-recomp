@@ -79,6 +79,31 @@ typedef struct {
     uint16_t offset;              /* the attribute's byte offset in a vertex of its stream */
 } BwXVsInput;
 
+/* Blood Wake (gfx-ffp, BW_GPU_FFP): a fixed-function batch on the GPU. The
+ * executor hands it over untransformed, like a vertex-program batch (the
+ * same inputs, raw streams or gathered floats, and triangle list), with
+ * `program` NULL and `ffp` describing the fixed-function state that
+ * ffp_vertex, lit_color and ffp_fog_distance read. The back end draws it
+ * with a vertex shader generated from that state, rule for rule as those
+ * three functions (bw_ffp_hlsl, bw_vsh_hlsl.c). */
+enum {                            /* BwXFfp.in[]: what each input is for */
+    BW_FFP_POS, BW_FFP_NRM, BW_FFP_COL, BW_FFP_TC0, BW_FFP_TC1, BW_FFP_TC2, BW_FFP_TC3,
+    BW_FFP_FOG, BW_FFP_ROLES
+};
+typedef struct {
+    int8_t in[BW_FFP_ROLES];      /* the input k (ATTRk, the batch's input order) each role reads; -1: none */
+    uint8_t lit;                  /* lit_color's path: lighting on, with a normal array */
+    uint8_t colmat;               /* lit: bit 0 ambient, bit 1 diffuse from the vertex colour (COLOR_MATERIAL 1) */
+    uint8_t fog_on;               /* ffp_fog_distance computes a distance (else 0) */
+    uint8_t fog_gen;              /* SET_FOG_GEN_MODE (with fog_on) */
+    uint32_t light_mask;          /* lit: SET_LIGHT_ENABLE_MASK (2 bits a light); else 0 */
+    float composite[16];          /* the composite matrix, as the executor holds it */
+    float modelview[16];          /* model-view 0 (method 0x0480) */
+    float ambient[4];             /* SCENE_AMBIENT_COLOR rgb (0x0A10), MATERIAL_ALPHA (0x03B4) */
+    float imm_fog[4];             /* fog generation 0 or 6 with no array: v4's or v5's current value */
+    float light[8][32];           /* lit: each light's method block (0x1000 + 0x80 i), as floats */
+} BwXFfp;
+
 typedef struct {
     BwXBatch xb;                  /* everything except vertices and count */
     const uint32_t (*program)[4]; /* from the start slot ... */
@@ -101,7 +126,36 @@ typedef struct {
     /* P1: bumped by every write to c[0..191] (nv2a_vsh_constants_gen); the
      * same value as the last batch's means `consts` did not change */
     uint32_t consts_gen;
+    /* gfx-sprites (I6): point sprites on the GPU. Set only for a point batch
+     * the back end took (points_ok below); 0 for every other batch. `indices`
+     * is then a point list (one index per point, nindices points), and the
+     * back end makes each point's quad by bw_draw_points's rules
+     * (nv2a_pb_exec.c): the size in logical pixels, stage 3's sprite
+     * coordinates, the winding from the cull state, points behind the eye
+     * dropped. */
+    uint32_t points;              /* 1: a point list */
+    float point_size;             /* > 0: every point's size in logical pixels
+                                     (SET_POINT_SIZE / 8, clamped to 1..63.875);
+                                     0: the program's oPts.x, clamped the same way */
+    uint32_t point_sprite;        /* SET_POINT_SMOOTH_ENABLE: stage 3's coordinates
+                                     run (0,0) top-left to (1,1) bottom-right */
+    uint32_t point_cw;            /* the quads' winding: clockwise on the surface (y down) */
+    /* gfx-ffp: non-NULL for a fixed-function batch (program NULL, ninstr 0);
+     * sent only to a back end whose ffp_ok() says yes */
+    const BwXFfp *ffp;
 } BwXVsBatch;
+
+/* gfx-sprites (I6), for checking: one vertex of the sprite expansion of the
+ * last point batch, as the back end's geometry stage made it, mapped back
+ * to the executor's terms (pos as bw_draw_points leaves it: surface pixels,
+ * z as produced, w). */
+typedef struct {
+    float pos[4];
+    float tc3[4];               /* stage 3's coordinates */
+    uint32_t point;             /* the point's position in the batch (0..nindices-1) */
+    uint32_t corner;            /* 0 TL, 1 TR, 2 BL, 3 BR (bw_draw_points's q[k]) */
+    float pad[2];
+} BwXSpriteOut;                 /* 12 floats */
 
 /* What the back end's vertex shader produced for one vertex, mapped back to
  * the executor's terms (pos as transform_vertex leaves it: surface pixels,
@@ -126,6 +180,21 @@ typedef struct {
      * raw streams, 0 while it needs the gathered floats (it reads them on
      * the CPU). Without it, streams are never sent. */
     int (*vsh_raw_ok)(void);
+    /* Optional (gfx-sprites, I6): 1 if the back end draws the next point
+     * batch of a vertex program on the GPU (draw_vsh with `points` set), 0
+     * to keep today's path (the executor transforms and expands it on the
+     * CPU, bw_draw_points). Without it, points stay on the CPU. */
+    int (*points_ok)(void);
+    /* Optional, for checking (gfx-sprites): run the last point batch through
+     * its vertex shader and the sprite expansion again, and read the
+     * expansion back: 6 vertices (two triangles, in drawing order) per
+     * point it kept. Returns 1 on success, with *count vertices in out
+     * (at most max). */
+    int (*sprite_readback)(BwXSpriteOut *out, uint32_t max, uint32_t *count);
+    /* Optional (gfx-ffp): 1 if draw_vsh takes fixed-function batches (ffp
+     * set). Without it, or 0, they stay on the CPU path as before. Asked once
+     * per fixed-function batch; the answer may change only at start-up. */
+    int (*ffp_ok)(void);
 } BwXBackend;
 
 /* One instruction field, (dword, lowest bit, width), as nv2a_vsh_interp.c. */
@@ -160,6 +229,11 @@ static inline uint32_t bw_vsh_inputs_used(const uint32_t (*p)[4], uint32_t n)
  * transformed batches while a toolkit back end is also registered. */
 void bw_backend_ext_register(const BwXBackend *backend);
 
+/* gfx-ffp: fixed-function batches so far: [0] drawn on the GPU (ffp_ok),
+ * [1] drawn on the CPU path, [2] of those, sent back because a gathered
+ * vertex couldn't be read. */
+void bw_exec_ffp_counts(unsigned long long out[3]);
+
 /* During clear(): the title's clear rectangle (SET_CLEAR_RECT_HORIZONTAL /
  * _VERTICAL) as x0, y0, x1, y1 with x1/y1 exclusive, in the title's
  * (logical, non-anti-aliased) pixels. Returns 0 if it never sent both. */
@@ -168,5 +242,10 @@ int bw_backend_clear_rect(uint32_t r[4]);
 /* The last value the title wrote to NV097 method `method` (the executor's
  * register mirror), e.g. 0x1D78 SET_ZMIN_MAX_CONTROL. */
 uint32_t bw_backend_reg(uint32_t method);
+
+/* gfx-sprites: during a draw, 1 if its batch is a point batch, whichever
+ * path draws it (the CPU's quads through draw, or draw_vsh's point list);
+ * for the region masks' sprite class (BW_GFXCLS_SPRITES, a test aid). */
+int bw_backend_batch_points(void);
 
 #endif

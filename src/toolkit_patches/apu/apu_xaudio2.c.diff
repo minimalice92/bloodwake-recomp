@@ -1486,7 +1486,7 @@
  }
  
  unsigned xa2_underruns(void)
-@@ -261,13 +1515,603 @@
+@@ -261,13 +1515,607 @@
      return g_xa2_underruns;
  }
  
@@ -1725,7 +1725,11 @@
 + * BW_WASAPI_SPREAD=0: back to back, as before; =<ms>[,<margin ms>[,<floor ms>]]
 + * sets the point and the room. BW_XA2_STATS adds the periods deferred, made at
 + * once, and the room, to the 5 s line. */
-+#define XA2_SPREAD_DEFAULT 0               /* off: a short pass in a loaded soak (docs/audio/spread.md); =1 turns it on */
++/* On by default since 0.3.1 (call SP-4, docs/audio/vp.md 3): 0 short passes and
++ * 0 underruns over 66 floor battles, the case suite and 64 loaded soak boots,
++ * once the stall fixes, the frame's hand-off fix and the VP's speed-ups gave
++ * the frame thread the room (au-vp). BW_WASAPI_SPREAD=0: back to back. */
++#define XA2_SPREAD_DEFAULT 1
 +static int     g_spread = -1;                /* 0 off, 1 the mid-pass point, 2 the steady pace */
 +static int64_t g_spread_us = 5333, g_spread_margin_us = 2500, g_spread_floor_us = 3000;
 +static int64_t g_grid_us;                  /* a pass time: the earliest wakes on the event */

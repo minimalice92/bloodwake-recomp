@@ -94,9 +94,15 @@ BW_FIX(AUDIO_SINC_RESAMPLE, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
        "REMASTER_LOG 2026-10-27 audio (D-016 reproduction quality); docs/day1/D2.md",
        "The voice processor resamples each voice with a windowed sinc (Kaiser, 16 taps, cutoff following the pitch) instead of linear interpolation (carried apu_vp.c). The hardware's method is unknown (xemu uses libsamplerate); Original keeps linear. ON by default: fewer images and less treble loss, same sounds")
 
+/* AUDIO_MAKEUP_GAIN is retired as an edition change (0.3.1, call GAIN-1, lane
+ * au-gain): the clean-level gain is a port change in every edition (a pure
+ * volume change, the waveform kept), so Original has it too, with
+ * BW_AUDIO_GAIN_DB=0 as its undo. The entry stays so no ID moves, and in
+ * Remastered and later -AUDIO_MAKEUP_GAIN (the launcher's "Louder output"
+ * unticked) still turns the gain off. */
 BW_FIX(AUDIO_MAKEUP_GAIN, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
-       "REMASTER_LOG 2026-10-27 audio (clean levels); docs/day1/D2.md",
-       "The final stereo output gets +4 dB (BW_AUDIO_GAIN_DB sets it) with a look-ahead peak limiter at -1 dBFS (carried apu_core.c), after the whole mix, so music, effects and voice keep the game's balance. The game mixes quietly (gameplay -23..-29 dBFS RMS, title music about -39). ON by default")
+       "REMASTER_LOG 2026-10-27 audio (clean levels); docs/day1/D2.md; docs/audio/gain.md (GAIN-1)",
+       "RETIRED as an edition change (0.3.1): the clean-level gain below is the port's output in every edition, Original included; in Remastered and later BW_FIX=-AUDIO_MAKEUP_GAIN turns it off, as BW_AUDIO_GAIN_DB=0 does in any edition. What it is: the finished mix (stereo, or 5.1) gets one fixed gain, set from the loudest peak measured across the game so that it lands just under -1 dBFS (docs/audio/gain.md): every sample is the mix's own times one factor, rounded to 16 bits, with no limiter and no delay, so the game's full dynamic range is kept, only louder. A guard holds anything louder than ever measured under -1 dBFS and logs it ([APU] BW gain guard). It replaced 0.2.4's +4 dB with a look-ahead limiter, which ducked big battle explosions by up to 5 dB (bw_apu_gain.c). ON by default")
 
 BW_FIX(AUDIO_HRTF_EARS, BW_ED_RX, 0, BW_FIXKIND_RUNTIME,
        "TOOLKIT_ISSUES TK-18; docs/day1/D2.md part 3",
@@ -192,6 +198,20 @@ BW_FIX(OCEAN_NATIVE, BW_ED_RX, 1, BW_FIXKIND_HOOK,
 BW_FIX(OCEAN_REFLECT_SINGLE, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
        "docs/day1/P2a.md sections 7-8; REMASTER_LOG 2026-10-28 'the distant-water line'",
        "The distant-water line: the sea's three passes draw with depth writes off and alpha blending (Ocean_SetPassStates 0x37FA0), so where a wave folds over itself at a grazing angle two front-facing layers cover the same pixels and the sky-reflection pass (pass 2, alpha about 0.58) is blended there twice: a thin dark line along the crest at night (mission 10, clock 0:16). Fixed: each tile of the lit pass (pass 1, drawn right before) is drawn again, depth only, into a private copy of the scene's depth (with a hair of extra depth bias), and the reflection pass tests against that copy (LESS_EQUAL, no writes), so only the nearest layer gets the reflection, once; the scene's own depth buffer is never written, so nothing drawn after the sea changes (seen: paused same-frame A/B in five scenes changes only pixels along wave folds on the water; Original and Remastered steps identical; about 0.1 ms per frame). BW_OCEAN_REFLECT_SINGLE=0 or launcher Fixes 'Distant-water line': As shipped. ON by default (the maintainer's call, 2026-10-28)")
+/* ---- The native finish, part 1 (lane gfx-sprites, docs/gfx/lanes/sprites.md;
+ * arch.md 3.4, I6). In the carried executor (gpu_vsh_batch), the translator
+ * (bw_vsh_hlsl.c), the core (bwg_draw.c) and the D3D11 back end.
+ * GPU_SPRITES and GPU_FFP below are retired as edition changes (0.3.1, GA-13,
+ * the maintainer 2026-11-05: "Original gets the 100% native treatment"): both
+ * are the port's renderer in every edition, Original included, outside this
+ * registry, as ORIG-1 is for the audio (the game's pictures within the
+ * measured residual, its logic unchanged: the Original A/B identical). The
+ * IDs stay so no ID moves; in Remastered and later -GPU_SPRITES / -GPU_FFP
+ * still keep the CPU path, aliases of BW_GPU_SPRITES=0 / BW_GPU_FFP=0, which
+ * work in every edition. ---- */
+BW_FIX(GPU_SPRITES, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/gfx/lanes/sprites.md; docs/gfx/arch.md 3.4 and 3.14 (I6, gate G7)",
+       "RETIRED as an edition change (0.3.1, GA-13): point sprites on the graphics card are the port's path in every edition, Original included; in Remastered and later BW_FIX=-GPU_SPRITES keeps the CPU path, as BW_GPU_SPRITES=0 does in any edition. What it is: point sprites (rain splashes, spray) drawn on the graphics card: the game's own vertex program runs as a vertex shader and a geometry shader makes each point's quad by the CPU path's rules (bw_draw_points: the size in logical pixels, stage 3's sprite coordinates, the winding from the cull state, points behind the eye dropped), instead of the processor transforming and expanding every point. The same quads (every on-screen corner within 0.0004 px of the CPU path's, 1.3 million points); over the 2,100 frames with particles in the graphics corpus and mission 27, 0.00009% of pixels differ, 93% by one step, at most 8 of 255, dE00 > 1 on under 0.001% of a picture's pixels, nothing in the HUD or sky (seen, docs/gfx/lanes/sprites.md). BW_GPU_SPRITES=0 or BW_FIX=-GPU_SPRITES: the CPU path again. ON by default (the maintainer's call, 2026-11-04: on 'unless the measurements show something even close to perceptible'); in Original too since GA-13 (2026-11-05; Original's residual in docs/gfx/lanes/sprites.md 5 and 03x.md)")
 /* ---- Menus (release 0.2.5, lane C3, docs/025/C3.md; hooks in src/bw_menu_hooks.c) ---- */
 BW_FIX(MENU_QUIT, BW_ED_RX, 1, BW_FIXKIND_HOOK,
        "docs/agents/BRIEF_025_fixes.md item 78; docs/025/C3.md; REMASTER_LOG 0.2.5 'Quit Game'",
@@ -218,3 +238,12 @@ BW_FIX(HEADPHONES_AT_BOOT, BW_ED_RX, 1, BW_FIXKIND_HOOK,
 BW_FIX(USB_TICK_1MS, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
        "docs/audio/usb.md; D-027",
        "The emulated USB controller passes the pad's state to the game every 1 ms instead of every 4 ms (the pad's own interrupt interval, what a console polls). Its other waits counted in passes (the frame counter, the interrupt hold-off, the start-up and arrival waits) are scaled to keep their length in milliseconds, and the game still reads the newest state each frame, so what a press does is unchanged (1460 of 1460 presses identical; seen). Measured: a press reaches the game's driver 1.47 ms sooner on average (2.5 ms at the p95) in 23 of 23 paired rounds; press to present 2.4-2.6 ms sooner; smoothness inside D-027's 10% gate; +1% of one core; every pad case passed (carried src/toolkit_patches/usb/ohci.c). BW_USB_TICK_MS=1..4 picks the pass itself (4 is the console's); BW_FIX=-USB_TICK_1MS keeps 4 ms. ON by default (lead's call at the au-usb merge)")
+/* ---- The native finish, part 2 (lane gfx-ffp, docs/gfx/lanes/ffp.md). In the
+ * carried executor (gpu_ffp_batch), the translator (bw_ffp_hlsl) and the D3D11
+ * back end (get_ffp, bw_xdraw_ffp, vsh_adopt). ---- */
+BW_FIX(GPU_FFP, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/gfx/lanes/ffp.md; docs/gfx/arch.md 3.1, 3.4 (gate G7)",
+       "RETIRED as an edition change (0.3.1, GA-13): the fixed function on the graphics card is the port's path in every edition, Original included; in Remastered and later BW_FIX=-GPU_FFP keeps the CPU path, as BW_GPU_FFP=0 does in any edition. What it is: the fixed function (the sky dome, the beach props: about 3% of draws) drawn on the graphics card: a vertex shader generated from the fixed-function state (the composite and model-view matrices, the lights, the material and colour material, the fog generation mode) does what the processor did per vertex (ffp_vertex, lit_color, ffp_fog_distance in the carried executor), rule for rule, then the vertex programs' own epilogue. The same vertices within the vertex path's tolerance (0.01 px); the residual over the graphics corpus is in the lane report. Measured over the graphics corpus against the CPU path: 1,635 of 65.7 million pixels differ (0.0025%, most by one step; PSNR-Y 96.7 dB), every vertex within 0.01 px (16 million checked). BW_GPU_FFP=0 or BW_FIX=-GPU_FFP keeps the CPU path. ON by default: the maintainer's call (2026-11-04: not perceptible); in Original too since GA-13 (2026-11-05; Original's residual in docs/gfx/lanes/ffp.md 2.9 and 03x.md)")
+BW_FIX(GPU_VSH_SYNC, BW_ED_RX, 1, BW_FIXKIND_RUNTIME,
+       "docs/gfx/lanes/ffp.md; docs/gfx/lanes/regen.md section 5; docs/gfx/arch.md 3.4, 3.5",
+       "RETIRED as an edition change (0.3.1, GA-13): no processor fallback while a vertex shader compiles is the port's path in every edition, Original included, since the load-time compile (lane gfx-regen) made every shader the game draws with while the loading screen is up (0 misses after load in the five smoke scenes from empty caches and in the 26-scene corpus); in Remastered and later BW_FIX=-GPU_VSH_SYNC keeps the old path, as BW_GPU_VSH_SYNC=0 does in any edition. What it is: a vertex program (or fixed-function state) whose shader isn't in the shader cache is compiled at once and drawn on the graphics card (counted), instead of being drawn by the processor for the frames until the compile worker is done; and a manifest of the shaders this PC has drawn with (vs_manifest_*.txt beside the shader cache: hashes and numbers only, nothing of the game) lets the first draw of the run make them all on the device before the game's first frame. ON by default (the lead's call under GA-13, 2026-11-05, once the misses reached 0)")

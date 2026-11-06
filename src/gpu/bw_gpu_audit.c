@@ -260,7 +260,7 @@ enum {
 };
 
 static const char *const s_fname[F_N] = {
-    "path (G vsh on GPU, C vsh on CPU, F fixed-function, S screen space, U dropped, ? none)",
+    "path (G vsh on GPU, C vsh on CPU, F fixed-function, H fixed-function on GPU, S screen space, U dropped, ? none)",
     "vertex source (A arrays, I inline, M immediate)",
     "primitive (1 points 2 lines 3 loop 4 lstrip 5 tris 6 tstrip 7 fan 8 quads 9 qstrip 10 polygon)",
     "transform execution mode (0x1E94 & 3: 0 fixed, 2 program)",
@@ -634,7 +634,7 @@ void bw_audit_draw(const BwAuditDraw *d)
         add(F_VSH_CWRITE, p->cwrite, v);
         add(F_VSH_A0, p->a0, v);
     }
-    if (d->path == 'F' && d->vattr_fmt) {
+    if ((d->path == 'F' || d->path == 'H') && d->vattr_fmt) {
         uint32_t mask = 0;
         for (i = 0; i < 16; i++)
             if ((d->vattr_fmt[i] >> 4) & 0xF)

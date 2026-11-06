@@ -120,6 +120,17 @@ Applies to: Remastered. Default: **Off**.
 | Off (default) | (no switch) |
 | On | `env:BW_HIFPS_VSYNC=1` |
 
+### High Priority Mode
+
+Full speed and precise timing, even when the game's window is behind other windows or minimized. Turn it off to save power on a laptop running on battery.
+
+Applies to: Original and Remastered. Default: **On**.
+
+| Choice | Under the hood |
+|---|---|
+| On (default) | (no switch) |
+| Off | `env:BW_PROC_QOS=0;env:BW_AUDIO_HIGHQOS=0` |
+
 ## Graphics
 
 ### Anti-aliasing
@@ -317,17 +328,6 @@ Applies to: Remastered. Default: **On**.
 | On (default) | `fix:+AUDIO_SINC_RESAMPLE` |
 | Off | `fix:-AUDIO_SINC_RESAMPLE` |
 
-### Louder output
-
-Lifts the game's quiet mix a little without clipping; music, effects and voices keep their balance.
-
-Applies to: Remastered. Default: **On**.
-
-| Choice | Under the hood |
-|---|---|
-| On (default) | `fix:+AUDIO_MAKEUP_GAIN` |
-| Off | `fix:-AUDIO_MAKEUP_GAIN` |
-
 ### Surround sound (5.1)
 
 With 5.1 or 7.1 speakers or a surround headset, the game's surround mix uses all of them. Stereo is unaffected.
@@ -494,6 +494,17 @@ Applies to: Remastered. Default: **On**.
 |---|---|
 | On (default) | `fix:+BATTLE_WATER_SOUNDS` |
 | Off | `fix:-BATTLE_WATER_SOUNDS` |
+
+### Headphones mode at start-up
+
+A saved Headphones sound mode only reached the sound chip after you picked it again in the game's options. On, it applies from the start. On stereo you won't hear a difference.
+
+Applies to: Remastered. Default: **On**.
+
+| Choice | Under the hood |
+|---|---|
+| On (default) | `fix:+HEADPHONES_AT_BOOT` |
+| Off | `fix:-HEADPHONES_AT_BOOT` |
 
 ### Mission 14 shield cutscene
 

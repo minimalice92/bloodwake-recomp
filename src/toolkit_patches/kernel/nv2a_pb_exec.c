@@ -42,6 +42,7 @@
 #include "nv2a_backend.h"
 #include "bw_backend_ext.h"   /* Blood Wake carried patch: extended back end */
 #include "../../gpu/bw_gpu_audit.h"   /* Blood Wake: BW_GPU_AUDIT=1 usage counts */
+#include "../../gpu/bw_gfxcap.h"      /* Blood Wake: BW_GFXCAP frame capture (lane gfx-cap) */
 extern int bw_ab_off(const char *fix);  /* Blood Wake: BW_GPU_AB (src/gpu/bw_ab.c) */
 #if defined(_WIN32)
 #include <windows.h>
@@ -134,7 +135,10 @@ static uint32_t dma_resolve(uint32_t offset)
      * black straight through the guest heap -- which faulted the title three
      * frames later on a pointer that had been overwritten, while the real
      * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
-    if (offset < xbox_ContiguousAllocatedBytes())
+    uint32_t hwm = xbox_ContiguousAllocatedBytes();
+    if (g_bw_gfxcap)                    /* Blood Wake: BW_GFXCAP, the allocator as recorded */
+        hwm = bw_gfxcap_contig_hwm(hwm);
+    if (offset < hwm)
         return XBOX_CONTIG_BASE + offset;
     if (!surface_hits_image(offset, 1))
         return offset;
@@ -3496,25 +3500,29 @@ static int bw_vclose(float a, float b, float abs_tol, float rel_tol)
 static void gpu_vsh_verify(uint32_t nv, uint32_t nins, uint32_t mask)
 {
     static int dumped;
-    static int every = -1;
+    static int every[2] = { -1, -1 };
     static BwXVsOut *g;
-    static unsigned batches, checked, bad_batches, shown;
-    static unsigned long long verts, bad_verts, odd_verts;
+    static unsigned batches[2], checked[2], bad_batches[2], shown, cpu_drops;
+    static unsigned long long verts[2], bad_verts[2], odd_verts[2];
     uint32_t l;
+    int ff = nins == 0;                 /* gfx-ffp: a fixed-function batch (gpu_ffp_batch) */
     int bad = 0;
 
-    if (every < 0) {
-        const char *e = getenv("BW_GPU_VSH_VERIFY");
-        every = e ? atoi(e) : 0;
+    if (every[0] < 0) {
+        /* gfx-ffp: BW_GPU_FFP_VERIFY=<n> samples the fixed-function batches
+         * on their own (else BW_GPU_VSH_VERIFY's n, counted apart) */
+        const char *e = getenv("BW_GPU_VSH_VERIFY"), *f = getenv("BW_GPU_FFP_VERIFY");
+        every[0] = e ? atoi(e) : 0;
+        every[1] = f ? atoi(f) : every[0];
     }
-    if (every <= 0 || !s_xbackend->vsh_readback || ++batches % (unsigned)every)
+    if (every[ff] <= 0 || !s_xbackend->vsh_readback || ++batches[ff] % (unsigned)every[ff])
         return;
     if (!g && !(g = (BwXVsOut *)malloc(NV_MAX_INDICES * sizeof *g)))
         return;
     if (!s_xbackend->vsh_readback(g, nv))
         return;
     xf_set_viewport();
-    checked++;
+    checked[ff]++;
     for (l = 0; l < nv; l++) {
         Nv2aVshOutput c;
         const BwXVsOut *o = &g[l];
@@ -3522,9 +3530,16 @@ static void gpu_vsh_verify(uint32_t nv, uint32_t nins, uint32_t mask)
         float cd0, cd1;
         int k, j;
 
-        if (!transform_vertex(s_bw_uidx[l], &c))
+        if (!transform_vertex(s_bw_uidx[l], &c)) {
+            /* gfx-ffp: ffp_vertex fails at |w| <= 1e-6, and the CPU path
+             * then drops the whole batch; the GPU drops only the triangles
+             * that use the vertex (bw_ffp_hlsl). Counted, not compared. */
+            if (ff && cpu_drops++ < 3)
+                fprintf(stderr, "[VSH-VERIFY] fixed function: vertex index %u has |w| <= 1e-6, so the CPU"
+                                " path drops this whole batch (%u so far)\n", s_bw_uidx[l], cpu_drops);
             return;
-        verts++;
+        }
+        verts[ff]++;
         {
             /* Inputs that are already NaN, infinite or denormal: the GPU
              * flushes denormals and multiplies by zero to zero (vmul), the
@@ -3552,7 +3567,7 @@ static void gpu_vsh_verify(uint32_t nv, uint32_t nins, uint32_t mask)
                         k2++;
                     }
                 }
-                odd_verts++;
+                odd_verts[ff]++;
                 continue;
             }
         }
@@ -3575,7 +3590,7 @@ static void gpu_vsh_verify(uint32_t nv, uint32_t nins, uint32_t mask)
         }
         if (!what)
             continue;
-        bad_verts++;
+        bad_verts[ff]++;
         bad = 1;
         /* A finite vertex that differs is a translation bug, not overflow:
          * print the program and this vertex's inputs, once. */
@@ -3618,11 +3633,15 @@ static void gpu_vsh_verify(uint32_t nv, uint32_t nins, uint32_t mask)
                     c.tex[0][0], c.tex[0][1], c.tex[0][2], c.tex[0][3]);
         }
     }
-    bad_batches += bad;
-    if (checked % 100 == 0)
+    bad_batches[ff] += bad;
+    if (checked[ff] % 100 == 0 && !ff)
         fprintf(stderr, "[VSH-VERIFY] %u batches checked, %u differ; %llu vertices, %llu differ,"
                         " %llu skipped (odd inputs)\n",
-                checked, bad_batches, verts, bad_verts, odd_verts);
+                checked[0], bad_batches[0], verts[0], bad_verts[0], odd_verts[0]);
+    else if (checked[ff] % 100 == 0)
+        fprintf(stderr, "[VSH-VERIFY] fixed function: %u batches checked, %u differ; %llu vertices,"
+                        " %llu differ, %llu skipped (odd inputs); %u whole batches the CPU path drops\n",
+                checked[1], bad_batches[1], verts[1], bad_verts[1], odd_verts[1], cpu_drops);
 }
 
 /* Blood Wake carried patch (P1): GPU-side vertex fetch. The gather in
@@ -3808,6 +3827,212 @@ static int bw_vfetch_build(BwXVsBatch *vb, uint32_t n, uint32_t mask,
     return 1;
 }
 
+/* ---- gfx-sprites (I6): point sprites on the GPU --------------------------
+ * A vertex-program point batch goes to the back end as a point list when it
+ * says it draws them (BwXBackend points_ok: every edition since GA-13, its
+ * switch on), with what bw_draw_points reads from the registers: the batch's size
+ * when point params are off, sprite mode and the winding. The back end's
+ * geometry shader makes each quad by bw_draw_points's rules (bw_vsh_hlsl.c,
+ * bw_vsh_sprite_gs_hlsl). Everything else about points, and every point
+ * batch when the switch is off, is today's CPU path. */
+static int bw_points_on(void);
+static float bw_point_size(uint32_t index);
+
+/* bw_draw_points's winding: 0 when the cull state keeps neither face
+ * (nothing is drawn), else 1 with *cw: clockwise on the surface (y down) is
+ * the kept face. Shared by both paths. */
+static int bw_points_wind(int *cw)
+{
+    int front_cw = s_reg[0x03A0 / 4] != 0x901;
+    int cull = s_reg[0x0308 / 4] != 0;
+    uint32_t face = s_reg[0x039C / 4];
+    if (cull && face == 0x408)
+        return 0;                                   /* both faces culled */
+    /* Clockwise on the surface (y down) is front when FRONT_FACE is CW. */
+    *cw = front_cw ^ (cull && face == 0x404);
+    return 1;
+}
+
+/* bw_backend_ext.h: the batch being drawn is a point batch (either path). */
+int bw_backend_batch_points(void)
+{
+    return s_gpu.prim == NV_PRIM_POINTS;
+}
+
+/* bw_point_size's last step: at least 1 (NaN too), at most 63.875. */
+static float bw_point_clamp(float sz)
+{
+    if (!(sz >= 1.0f))
+        sz = 1.0f;
+    return sz > 63.875f ? 63.875f : sz;
+}
+
+/* BW_GPU_SPRITES_VERIFY=<n> (a test aid, inert unset): every n-th point batch
+ * drawn on the GPU, the back end runs it again through its vertex shader and
+ * the sprite expansion into a stream-output buffer (sprite_readback), and
+ * each quad is compared with the one bw_draw_points makes from the CPU
+ * interpreter's vertex: which points are kept, the six vertices' corners and
+ * order, x and y within the vertex path's tolerance (0.01 px plus 1e-4
+ * relative, as BW_GPU_VSH_VERIFY), z within 1, w, and stage 3's coordinates.
+ * The largest x/y difference is reported. */
+static void gpu_sprite_verify(uint32_t n, int cw, int sprite)
+{
+    static int every = -1;
+    static BwXSpriteOut *g;
+    static int32_t *first;
+    static unsigned batches, checked, bad_batches, shown;
+    static unsigned long long npts, kept_both, keep_diff, verts, bad_verts;
+    /* [0] every quad both kept, [1] those whose centre is on the surface's
+     * window (64 px of margin): a point far off screen has coordinates where
+     * a float step is a large part of a pixel */
+    static struct { unsigned long long verts, over; double mx, my, sum, cen, half; } st[2];
+    static const int order[2][6] = { { 0, 2, 1, 1, 2, 3 }, { 0, 1, 2, 1, 3, 2 } };
+    int on;
+    uint32_t cnt = 0, v, i;
+    int bad = 0;
+
+    if (every < 0) {
+        const char *e = getenv("BW_GPU_SPRITES_VERIFY");
+        every = e ? atoi(e) : 0;
+    }
+    if (every <= 0 || !s_xbackend->sprite_readback || ++batches % (unsigned)every)
+        return;
+    if (!g && !(g = (BwXSpriteOut *)malloc((size_t)NV_MAX_INDICES * 6 * sizeof *g)))
+        return;
+    if (!first && !(first = (int32_t *)malloc(NV_MAX_INDICES * sizeof *first)))
+        return;
+    if (!s_xbackend->sprite_readback(g, NV_MAX_INDICES * 6, &cnt))
+        return;
+    checked++;
+    for (i = 0; i < n; i++)
+        first[i] = -1;
+    for (v = 0; v + 5 < cnt; v += 6)
+        if (g[v].point < n && first[g[v].point] < 0)
+            first[g[v].point] = (int32_t)v;
+    if (cnt % 6) {
+        bad = 1;
+        if (shown++ < 24)
+            fprintf(stderr, "[SPR-VERIFY] batch %u: %u vertices streamed out, not a multiple of 6\n",
+                    s_gpu.batches_program, cnt);
+    }
+    xf_set_viewport();
+    for (i = 0; i < n; i++) {
+        Nv2aVshOutput c, q[4];
+        float sz, hx, hy, w;
+        int keep, j, k;
+        if (!transform_vertex(s_gpu.idx[i], &c))
+            return;
+        sz = bw_point_size(s_gpu.idx[i]);   /* right after transform_vertex */
+        npts++;
+        w = c.pos[3];
+        keep = w > 0.0f;
+        for (j = 0; j < 3 && keep; j++)
+            keep = isfinite(c.pos[j] * w);
+        if (keep)
+            keep = isfinite(w - NV_CLIP_W) && isfinite((c.pos[2] - s_xf_o[2]) * w);
+        if (keep != (first[i] >= 0)) {
+            keep_diff++;
+            bad = 1;
+            if (shown++ < 24)
+                fprintf(stderr, "[SPR-VERIFY] batch %u point %u (index %u): kept by the %s path only"
+                                " (cpu pos %g %g %g %g)\n", s_gpu.batches_program, i, s_gpu.idx[i],
+                        keep ? "CPU" : "GPU", c.pos[0], c.pos[1], c.pos[2], c.pos[3]);
+            continue;
+        }
+        if (!keep)
+            continue;
+        kept_both++;
+        on = c.pos[0] >= (float)s_gpu.clip_x - 64.0f && c.pos[0] <= (float)(s_gpu.clip_x + s_gpu.clip_w) + 64.0f
+          && c.pos[1] >= (float)s_gpu.clip_y - 64.0f && c.pos[1] <= (float)(s_gpu.clip_y + s_gpu.clip_h) + 64.0f;
+        hx = sz * 0.5f * aa_scale_x();
+        hy = sz * 0.5f * aa_scale_y();
+        for (k = 0; k < 4; k++) {                   /* as bw_draw_points */
+            q[k] = c;
+            q[k].pos[0] += (k & 1) ? hx : -hx;
+            q[k].pos[1] += (k & 2) ? hy : -hy;
+            if (sprite) {
+                q[k].tex[3][0] = (k & 1) ? 1.0f : 0.0f;
+                q[k].tex[3][1] = (k & 2) ? 1.0f : 0.0f;
+                q[k].tex[3][2] = 1.0f;
+                q[k].tex[3][3] = 1.0f;
+            }
+        }
+        for (j = 0; j < 6; j++) {
+            const BwXSpriteOut *o = &g[first[i] + j];
+            const Nv2aVshOutput *e = &q[order[cw ? 1 : 0][j]];
+            const char *what = NULL;
+            double dx = fabs((double)o->pos[0] - e->pos[0]), dy = fabs((double)o->pos[1] - e->pos[1]);
+            verts++;
+            if (o->point != i || o->corner != (uint32_t)order[cw ? 1 : 0][j]) what = "corner order";
+            else if (!bw_vclose(o->pos[3], e->pos[3], 1e-6f, 1e-5f)) what = "w";
+            else if (!bw_vclose(o->pos[0], e->pos[0], 0.01f, 1e-4f)
+                     || !bw_vclose(o->pos[1], e->pos[1], 0.01f, 1e-4f)) what = "xy";
+            else if (!bw_vclose(o->pos[2], e->pos[2], 1.0f, 1e-4f)) what = "z";
+            for (k = 0; k < 4 && !what; k++)
+                if (!bw_vclose(o->tc3[k], e->tex[3][k], 1e-3f, 1e-3f)) what = "tex3";
+            if (!what) {
+                int s2;
+                for (s2 = 0; s2 <= on; s2++) {
+                    st[s2].verts++;
+                    if (dx > st[s2].mx) st[s2].mx = dx;
+                    if (dy > st[s2].my) st[s2].my = dy;
+                    st[s2].sum += dx + dy;
+                    st[s2].over += dx > 0.01 || dy > 0.01;
+                }
+                continue;
+            }
+            bad_verts++;
+            bad = 1;
+            if (shown++ < 24)
+                fprintf(stderr, "[SPR-VERIFY] batch %u point %u corner %u differs in %s:\n"
+                        "  gpu pos %g %g %g %g tc3 %g %g %g %g (point %u corner %u)\n"
+                        "  cpu pos %g %g %g %g tc3 %g %g %g %g (size %g)\n",
+                        s_gpu.batches_program, i, (unsigned)order[cw ? 1 : 0][j], what,
+                        o->pos[0], o->pos[1], o->pos[2], o->pos[3],
+                        o->tc3[0], o->tc3[1], o->tc3[2], o->tc3[3], o->point, o->corner,
+                        e->pos[0], e->pos[1], e->pos[2], e->pos[3],
+                        e->tex[3][0], e->tex[3][1], e->tex[3][2], e->tex[3][3], sz);
+        }
+        {
+            /* The centre (the vertex shader against the interpreter) and the
+             * half size (the expansion itself), apart: from corners 0 and 3. */
+            const BwXSpriteOut *tl = NULL, *br = NULL;
+            for (j = 0; j < 6; j++) {
+                const BwXSpriteOut *o = &g[first[i] + j];
+                if (o->corner == 0) tl = o;
+                if (o->corner == 3) br = o;
+            }
+            if (tl && br) {
+                double cx = 0.5 * ((double)tl->pos[0] + br->pos[0]);
+                double cy = 0.5 * ((double)tl->pos[1] + br->pos[1]);
+                double ex = fabs(cx - c.pos[0]), ey = fabs(cy - c.pos[1]);
+                double hgx = fabs(0.5 * ((double)br->pos[0] - tl->pos[0]) - 0.5 * ((double)q[3].pos[0] - q[0].pos[0]));
+                double hgy = fabs(0.5 * ((double)br->pos[1] - tl->pos[1]) - 0.5 * ((double)q[3].pos[1] - q[0].pos[1]));
+                int s2;
+                for (s2 = 0; s2 <= on; s2++) {
+                    if (ex > st[s2].cen) st[s2].cen = ex;
+                    if (ey > st[s2].cen) st[s2].cen = ey;
+                    if (hgx > st[s2].half) st[s2].half = hgx;
+                    if (hgy > st[s2].half) st[s2].half = hgy;
+                }
+            }
+        }
+    }
+    bad_batches += bad;
+    if (checked % 20 == 0 || checked <= 3) {
+        int s2;
+        fprintf(stderr, "[SPR-VERIFY] %u point batches checked, %u differ; %llu points, %llu kept by"
+                        " both, %llu kept by one only; %llu quad vertices, %llu differ\n",
+                checked, bad_batches, npts, kept_both, keep_diff, verts, bad_verts);
+        for (s2 = 0; s2 < 2; s2++)
+            fprintf(stderr, "[SPR-VERIFY]   %s: %llu vertices, largest x/y difference %.6f / %.6f px,"
+                            " mean %.3g px, %llu over 0.01 px; the centre %.6f px, the half size %.6f px\n",
+                    s2 ? "on screen" : "all", st[s2].verts, st[s2].mx, st[s2].my,
+                    st[s2].verts ? st[s2].sum / (2.0 * (double)st[s2].verts) : 0.0, st[s2].over,
+                    st[s2].cen, st[s2].half);
+    }
+}
+
 static int bw_gpu_vsh_verify_on(void)
 {
     static int on = -1;
@@ -3823,7 +4048,7 @@ static int gpu_vsh_batch(void)
     static int near_z = -1, no_rc = -1;
     uint32_t n = s_gpu.idx_count, i, a, s, nins, mask, nin = 0, nv = 0, ni = 0;
     uint32_t vfirst = 0;
-    int raw;
+    int raw, pts = 0, pts_cw = 0;       /* gfx-sprites: a point list for the GPU */
     Nv2aSurface surf;
     Nv2aRenderState rs;
     BwXVsBatch vb;
@@ -3963,6 +4188,17 @@ bw_tris:
             BW_TRI(i, i + 3, i + 2);
         }
         break;
+    case NV_PRIM_POINTS:
+        /* gfx-sprites (I6): a point list, only when the back end draws
+         * sprites and the CPU path would draw this batch (points on, a face
+         * kept); else nothing here, so the CPU path draws it as before. */
+        if (bw_points_on() && s_xbackend->points_ok && bw_points_wind(&pts_cw)
+                && s_xbackend->points_ok()) {
+            for (i = 0; i < n; i++)
+                s_bw_tri[ni++] = s_bw_map[i];
+            pts = 1;
+        }
+        break;
     default:
         break;
     }
@@ -3997,13 +4233,339 @@ bw_tris:
     vb.fog_mode = s_gpu.fog_mode;
     vb.fog_param[0] = s_gpu.fog_param[0];
     vb.fog_param[1] = s_gpu.fog_param[1];
+    if (pts) {                                   /* gfx-sprites: bw_draw_points's registers */
+        vb.points = 1;
+        vb.point_size = s_reg[0x0318 / 4] ? 0.0f                          /* point params: oPts */
+                      : bw_point_clamp((float)s_reg[0x043C / 4] / 8.0f);   /* SET_POINT_SIZE */
+        vb.point_sprite = s_reg[0x031C / 4] != 0;
+        vb.point_cw = (uint32_t)pts_cw;
+    }
     if (!s_xbackend->draw_vsh(&surf, &vb))
         return 0;
     gpu_vsh_verify(nv, nins, mask);
+    if (pts)
+        gpu_sprite_verify(n, pts_cw, s_reg[0x031C / 4] != 0);
 
     xf_set_viewport();
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
+    note_blend_pair();
+    note_xf_formats();
+    s_gpu.tris_drawn += pts ? 2 * n : ni / 3;   /* gfx-sprites: two per point, at most */
+    note_drawn();
+    return 1;
+}
+
+/* Blood Wake carried patch (gfx-ffp): the fixed function on the GPU. With a
+ * back end whose ffp_ok() says yes (the D3D11 back end with BW_GPU_FFP, in
+ * every edition since GA-13), a fixed-function batch goes over untransformed, as
+ * a vertex-program batch does (gpu_vsh_batch): its inputs as raw streams or
+ * gathered floats, and its triangle list. Beside them goes the state that
+ * ffp_vertex, lit_color and ffp_fog_distance read (BwXFfp): the composite
+ * and model-view matrices, the lights, the material and colour-material
+ * fields, the fog generation mode, and which input each of them reads. The
+ * back end's shader does what those three functions do, rule for rule, then
+ * the program path's own epilogue (bw_vsh_hlsl.c bw_ffp_hlsl).
+ *
+ * Which inputs: each is an attribute fetch_attr can read in this batch (an
+ * array: size, stride, an offset, a format it knows). The position must be
+ * one (else ffp_vertex fails and the CPU path drops the batch: it does here
+ * too); the normal only when lighting is on (lit_color); the colour unless
+ * lighting is on without colour material; the four texture coordinate sets
+ * by texcoord_attr and attributes 10-12; the fog generation's v4 or v5. An
+ * input that isn't an array reads as ffp_vertex reads it: (0,0,0,1) for a
+ * coordinate, white for the colour, the current value for v4/v5.
+ *
+ * Left on the CPU path, as before (counted): points (bw_draw_points' own
+ * rules: gfx-sprites), RECOMP_FFP_FLIP_NORMALS (a compatibility option Blood
+ * Wake doesn't set), a gathered vertex that fetch_attr can't read (where the
+ * CPU path drops the batch or changes a vertex's colour), and whatever the
+ * back end declines (draw_vsh returns 0).
+ *
+ * The one rule a vertex shader can't keep: ffp_vertex fails for a vertex
+ * with |w| <= 1e-6, and the CPU path then drops the whole batch (the
+ * function's return reads as "no program loaded"). The shader makes that
+ * vertex's position NaN, so the finite-vertex filter (bw_vsh_gs_hlsl) drops
+ * every triangle that uses it, and BW_GPU_VSH_VERIFY counts such batches. */
+static unsigned long long s_bw_ffp_gpu, s_bw_ffp_cpu_fetch, s_bw_ffp_cpu;
+
+/* gfx-ffp: fixed-function batches so far: drawn on the GPU, drawn on the CPU
+ * (any reason), and of those, the ones a gathered vertex sent back (for the
+ * back end's BW_GPU_STATS line; bw_backend_ext.h) */
+void bw_exec_ffp_counts(unsigned long long out[3])
+{
+    out[0] = s_bw_ffp_gpu;
+    out[1] = s_bw_ffp_cpu;
+    out[2] = s_bw_ffp_cpu_fetch;
+}
+
+static int bw_ffp_attr_ok(const VertexAttr *a)
+{
+    /* an array fetch_attr reads (a batch that is not inline: batch_is_ffp) */
+    return a->size && a->stride && a->offset
+        && (a->type == 0 || a->type == 1 || a->type == 2 || a->type == 4 || a->type == 5 || a->type == 6);
+}
+
+/* ffp_fog_distance's own switch (BW_GPU_FFPFOG=0: distance 0) */
+static int bw_ffpfog_env(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *env = getenv("BW_GPU_FFPFOG");
+        on = !(env && env[0] == '0');
+    }
+    return on;
+}
+
+static int bw_ffp_verify_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *f = getenv("BW_GPU_FFP_VERIFY");
+        on = f ? atoi(f) > 0 : bw_gpu_vsh_verify_on();
+    }
+    return on;
+}
+
+static int gpu_ffp_batch(void)
+{
+    static int near_z = -1, no_rc = -1;
+    static BwXFfp f;
+    uint32_t n = s_gpu.idx_count, i, a, nin = 0, nv = 0, ni = 0, mask = 0, vfirst = 0;
+    const VertexAttr *ra[BW_FFP_ROLES];
+    uint32_t colmat;
+    int raw, r;
+    Nv2aSurface surf;
+    Nv2aRenderState rs;
+    BwXVsBatch vb;
+
+    if (!s_xbackend || !s_xbackend->draw_vsh || !s_xbackend->ffp_ok || !backend_draws()
+        || batch_uses_program() || !batch_is_ffp() || !s_xbackend->ffp_ok())
+        return 0;
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    if (!s_gpu.rc_seen || no_rc)
+        return 0;                                /* the toolkit's draw(), not the extended one */
+    if (surface_bpp() != 4 && surface_bpp() != 2)
+        return 0;
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES: case NV_PRIM_TRIANGLE_STRIP: case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON: case NV_PRIM_QUADS: case NV_PRIM_QUAD_STRIP:
+        break;
+    default:
+        return 0;                                /* points (and anything else): as before */
+    }
+    if (ffp_flip_normals() || !bw_ffp_attr_ok(&s_gpu.attr[0]))
+        return 0;
+
+    /* The inputs, as ffp_vertex, lit_color and ffp_fog_distance fetch them. */
+    memset(&f, 0, sizeof f);
+    for (r = 0; r < BW_FFP_ROLES; r++)
+        ra[r] = NULL;
+    ra[BW_FFP_POS] = &s_gpu.attr[0];
+    f.lit = (uint8_t)(s_reg[0x0314 / 4] && bw_ffp_attr_ok(&s_gpu.attr[2]));
+    colmat = s_reg[0x0298 / 4];
+    if (f.lit) {
+        ra[BW_FFP_NRM] = &s_gpu.attr[2];
+        f.colmat = (uint8_t)((((colmat >> 2) & 3) == 1 ? 1 : 0) | (((colmat >> 4) & 3) == 1 ? 2 : 0));
+        f.light_mask = s_reg[0x03BC / 4];
+    }
+    if ((!f.lit || f.colmat) && bw_ffp_attr_ok(color_attr()))
+        ra[BW_FFP_COL] = color_attr();
+    if (bw_ffp_attr_ok(texcoord_attr()))
+        ra[BW_FFP_TC0] = texcoord_attr();
+    for (a = 1; a < 4; a++)
+        if (bw_ffp_attr_ok(&s_gpu.attr[9 + a]))
+            ra[BW_FFP_TC0 + a] = &s_gpu.attr[9 + a];
+    f.fog_on = (uint8_t)(bw_ffpfog_env() && s_gpu.fog_enable && !bw_ab_off("ffpfog"));
+    /* 255 for anything above: like 4, 5 and 7, the planar distance */
+    f.fog_gen = (uint8_t)(s_reg[0x02A0 / 4] > 255u ? 255u : s_reg[0x02A0 / 4]);
+    if (f.fog_on && (f.fog_gen == 0 || f.fog_gen == 6)) {
+        a = f.fog_gen == 0 ? 4 : 5;
+        if (bw_ffp_attr_ok(&s_gpu.attr[a]))
+            ra[BW_FFP_FOG] = &s_gpu.attr[a];
+        memcpy(f.imm_fog, s_gpu.imm_attr[a], sizeof f.imm_fog);
+    }
+    for (r = 0; r < BW_FFP_ROLES; r++)
+        if (ra[r])
+            mask |= 1u << (uint32_t)(ra[r] - s_gpu.attr);
+    for (a = 0; a < NV2A_VSH_INPUTS; a++)
+        nin += (mask >> a) & 1;
+    for (r = 0; r < BW_FFP_ROLES; r++) {
+        uint32_t at;
+        if (!ra[r]) {
+            f.in[r] = -1;
+            continue;
+        }
+        at = (uint32_t)(ra[r] - s_gpu.attr);
+        f.in[r] = (int8_t)popcount32(mask & ((1u << at) - 1u));
+    }
+
+    if (!s_bw_map) {
+        s_bw_map = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *s_bw_map);
+        s_bw_tri = (uint32_t *)malloc(NV_MAX_INDICES * 3 * sizeof *s_bw_tri);
+        s_bw_uidx = (uint32_t *)malloc(NV_MAX_INDICES * sizeof *s_bw_uidx);
+        if (!s_bw_map || !s_bw_tri || !s_bw_uidx)
+            return 0;
+    }
+    memset(&vb, 0, sizeof vb);
+    raw = bw_vfetch_build(&vb, n, mask, &vfirst, &nv);
+    if (raw) {
+        for (i = 0; i < n; i++)
+            s_bw_map[i] = s_gpu.idx[i] - vfirst;
+        s_bw_vf_raw++;
+        if (bw_ffp_verify_on()) {
+            /* the check's odd-input test reads the gathered floats */
+            if ((size_t)nv * nin * 4 > s_bw_vin_cap) {
+                size_t want = (size_t)nv * nin * 4;
+                float *p = (float *)realloc(s_bw_vin, want * sizeof *p);
+                if (!p)
+                    return 0;
+                s_bw_vin = p;
+                s_bw_vin_cap = want;
+            }
+            for (i = 0; i < nv; i++) {
+                float *dst = s_bw_vin + (size_t)i * nin * 4;
+                s_bw_uidx[i] = vfirst + i;
+                for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+                    if (!(mask & (1u << a)))
+                        continue;
+                    fetch_attr(&s_gpu.attr[a], vfirst + i, dst);
+                    dst += 4;
+                }
+            }
+        }
+    } else {
+        vb.nstreams = 0;
+        s_bw_vf_gather++;
+        if ((size_t)n * nin * 4 > s_bw_vin_cap) {
+            size_t want = (size_t)n * nin * 4;
+            float *p = (float *)realloc(s_bw_vin, want * sizeof *p);
+            if (!p)
+                return 0;
+            s_bw_vin = p;
+            s_bw_vin_cap = want;
+        }
+        if (++s_bw_vbatch == 0) {
+            memset(s_bw_vstamp, 0, sizeof s_bw_vstamp);
+            s_bw_vbatch = 1;
+        }
+        for (i = 0; i < n; i++) {
+            uint32_t idx = s_gpu.idx[i], l;
+            float *dst;
+            if (idx < BW_VCACHE_N && s_bw_vstamp[idx] == s_bw_vbatch) {
+                s_bw_map[i] = s_bw_vslot[idx];
+                continue;
+            }
+            l = nv++;
+            s_bw_uidx[l] = idx;
+            dst = s_bw_vin + (size_t)l * nin * 4;
+            for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+                if (!(mask & (1u << a)))
+                    continue;
+                /* a vertex fetch_attr can't read: the CPU path drops the
+                 * batch (position) or changes that vertex's colour */
+                if (!fetch_attr(&s_gpu.attr[a], idx, dst)) {
+                    s_bw_ffp_cpu_fetch++;
+                    return 0;
+                }
+                dst += 4;
+            }
+            if (idx < BW_VCACHE_N) {
+                s_bw_vstamp[idx] = s_bw_vbatch;
+                s_bw_vslot[idx] = l;
+            }
+            s_bw_map[i] = l;
+        }
+    }
+
+    /* The triangle list, as gpu_vsh_batch builds it (the CPU path's order). */
+#define BW_TRI(p, q, r) do { s_bw_tri[ni++] = s_bw_map[p]; s_bw_tri[ni++] = s_bw_map[q]; \
+                             s_bw_tri[ni++] = s_bw_map[r]; } while (0)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3)
+            BW_TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1)
+                BW_TRI(i + 1, i, i + 2);
+            else
+                BW_TRI(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++)
+            BW_TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            BW_TRI(i, i + 1, i + 2);
+            BW_TRI(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            BW_TRI(i, i + 1, i + 3);
+            BW_TRI(i, i + 3, i + 2);
+        }
+        break;
+    default:
+        break;
+    }
+#undef BW_TRI
+    if (!ni)
+        return 0;
+
+    /* The state the three functions read. */
+    memcpy(f.composite, s_gpu.composite, sizeof f.composite);
+    memcpy(f.modelview, &s_reg[0x0480 / 4], sizeof f.modelview);
+    f.ambient[0] = reg_f(0x0A10);
+    f.ambient[1] = reg_f(0x0A14);
+    f.ambient[2] = reg_f(0x0A18);
+    f.ambient[3] = reg_f(0x03B4);
+    if (f.lit)
+        for (a = 0; a < 8; a++)
+            if ((f.light_mask >> (2 * a)) & 3)
+                memcpy(f.light[a], &s_reg[(0x1000 + a * 0x80) / 4], sizeof f.light[a]);
+
+    if (near_z < 0) {
+        const char *e = getenv("RECOMP_CLIP_NEAR_Z");
+        near_z = !(e && e[0] == '0');
+    }
+    current_surface(&surf);
+    current_render_state(&rs);
+    fill_xbatch(&vb.xb, &rs);
+    vb.program = NULL;
+    vb.ninstr = 0;
+    vb.consts = (const float (*)[4])nv2a_vsh_constant(0);
+    {
+        extern uint32_t nv2a_vsh_constants_gen(void);
+        vb.consts_gen = nv2a_vsh_constants_gen();
+    }
+    vb.inputs = raw ? NULL : s_bw_vin;
+    vb.input_mask = mask;
+    vb.ninputs = nin;
+    vb.nverts = nv;
+    vb.indices = s_bw_tri;
+    vb.nindices = ni;
+    vb.aa[0] = s_gpu.aa_sx;
+    vb.aa[1] = s_gpu.aa_sy;
+    vb.near_clip = near_z;
+    vb.fog_enable = s_gpu.fog_enable;
+    vb.fog_mode = s_gpu.fog_mode;
+    vb.fog_param[0] = s_gpu.fog_param[0];
+    vb.fog_param[1] = s_gpu.fog_param[1];
+    vb.ffp = &f;
+    if (!s_xbackend->draw_vsh(&surf, &vb))
+        return 0;
+    gpu_vsh_verify(nv, 0, mask);
+
+    xf_set_viewport();
+    s_gpu.batches_ffp++;
+    s_bw_ffp_gpu++;
     note_blend_pair();
     note_xf_formats();
     s_gpu.tris_drawn += ni / 3;
@@ -4072,15 +4634,10 @@ static float bw_point_size(uint32_t index)
 static void bw_draw_points(uint32_t n)
 {
     int sprite = s_reg[0x031C / 4] != 0;
-    int front_cw = s_reg[0x03A0 / 4] != 0x901;
-    int cull = s_reg[0x0308 / 4] != 0;
-    uint32_t face = s_reg[0x039C / 4];
     int cw;
     uint32_t i, k;
-    if (cull && face == 0x408)
+    if (!bw_points_wind(&cw))                       /* gfx-sprites: the rule, shared */
         return;                                     /* both faces culled */
-    /* Clockwise on the surface (y down) is front when FRONT_FACE is CW. */
-    cw = front_cw ^ (cull && face == 0x404);
     for (i = 0; i < n; i++) {
         const Nv2aVshOutput *v = &s_xf[i];
         Nv2aVshOutput q[4];
@@ -4123,6 +4680,13 @@ static void raster_batch_program(void)
      * out of odd frames, to see which objects they are (src/gpu/bw_ab.c). */
     if (s_bw_audit_path == 'F' && bw_ab_off("hideffp"))
         return;
+    /* gfx-ffp: the fixed function on the GPU (H), when the back end takes it */
+    if (s_bw_audit_path == 'F' && gpu_ffp_batch()) {
+        s_bw_audit_path = 'H';
+        return;
+    }
+    if (s_bw_audit_path == 'F')
+        s_bw_ffp_cpu++;
 
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
@@ -5141,6 +5705,36 @@ static void bw_mtrace(uint32_t subch, uint32_t method, uint32_t param)
  * appends its two indices if both fit. Returns 0 (the caller then goes word
  * by word) before the first method, or while a per-method trace or the GPU
  * audit wants every word. BW_PB_BULK=0 turns it off. */
+/* Blood Wake (BW_GFXCAP, lane gfx-cap; docs/gfx/capture.md): what an indexed
+ * or DRAW_ARRAYS batch can read of the title's vertex arrays, recorded before
+ * it is drawn. Every array with a size and a stride, over the batch's index
+ * range, whole 16-byte elements: a superset of what fetch_attr and the GPU
+ * vertex fetch (bw_vfetch_build) read. Only while recording. */
+static void bw_gfxcap_vertex_spans(void)
+{
+    uint32_t lo = 0xFFFFFFFFu, hi = 0, i, a;
+    if (!s_gpu.prim || !s_gpu.idx_count || s_gpu.inline_active)
+        return;
+    for (i = 0; i < s_gpu.idx_count; i++) {
+        uint32_t v = s_gpu.idx[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        const VertexAttr *at = &s_gpu.attr[a];
+        uint64_t b, e;
+        if (!at->size || !at->stride || !at->offset)
+            continue;
+        b = (uint64_t)at->offset + (uint64_t)lo * at->stride;
+        e = (uint64_t)at->offset + (uint64_t)hi * at->stride + 16u;
+        if (b >= 0x100000000ull)
+            continue;
+        if (e - b > (64u << 20))
+            e = b + (64u << 20);
+        bw_gfxcap_read((uint32_t)b, (uint32_t)(e - b));
+    }
+}
+
 static int s_bw_exec_inited;
 static unsigned long long s_bw_idx16_bulk, s_bw_idx16_single;   /* words, for the report */
 int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n)
@@ -5154,6 +5748,8 @@ int nv2a_pb_exec_idx16(const uint32_t *p, uint32_t n)
     }
     if (!on || !n || !s_bw_exec_inited || s_bw_mtrace_on != 0 || bw_audit_on())
         return 0;
+    if (BW_GFXCAP_REC())                  /* Blood Wake: BW_GFXCAP, the run as taken */
+        bw_gfxcap_idx16(p, n);
     s_reg[NV097_ARRAY_ELEMENT16 / 4] = p[n - 1];
     s_bw_idx16_bulk += n;
     if (!s_gpu.prim)
@@ -5231,10 +5827,18 @@ static void bw_present_immediate(void)
         s_backend->flip();
 }
 
+/* Blood Wake (BW_GFXCAP step B): file scope, so a mid-scene open can load
+ * the executor's state with it (bw_exec_state_load) */
+static int s_method_inited;
+/* Blood Wake (BW_GFXCAP step B): which registers of s_reg have been written
+ * since boot, for the mid-scene open's method preamble (bw_exec_preamble) */
+static uint8_t s_reg_set[0x2000 / 4];
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
 
+    if (BW_GFXCAP_REC())                  /* Blood Wake: BW_GFXCAP, every method in order */
+        bw_gfxcap_method(subch, method, param, s_sem_va);
     bw_mtrace(subch, method, param);
     if (bw_audit_on())                    /* Blood Wake: BW_GPU_AUDIT (src/gpu/bw_gpu_audit.c) */
         bw_audit_method(subch, method, param);
@@ -5247,8 +5851,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
     }
-    if (!inited) {
-        inited = 1;
+    if (!s_method_inited) {
+        s_method_inited = 1;
         s_bw_exec_inited = 1;              /* Blood Wake P1: nv2a_pb_exec_idx16 */
         s_gpu.aa_sx = s_gpu.aa_sy = 1.0f;
         /* Stencil state as the hardware resets it: GL_ALWAYS, masks 0xFF,
@@ -5265,8 +5869,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.min_x = s_gpu.min_y = 1e30f;
         s_gpu.max_x = s_gpu.max_y = -1e30f;
     }
-    if (subch == 0)                        /* the 3D class's register file */
+    if (subch == 0) {                      /* the 3D class's register file */
         s_reg[(method & 0x1FFCu) / 4] = param;
+        s_reg_set[(method & 0x1FFCu) / 4] = 1;      /* Blood Wake (BW_GFXCAP step B) */
+    }
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Cached: this runs for every method, and an
@@ -5477,8 +6083,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 draw_immediate();
             else if (s_gpu.inline_count)
                 draw_inline_array();
-            else
+            else {
+                if (BW_GFXCAP_REC())      /* Blood Wake: BW_GFXCAP, the arrays it reads */
+                    bw_gfxcap_vertex_spans();
                 draw_primitive();
+            }
             s_gpu.prim = 0;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
@@ -6115,4 +6724,245 @@ void nv2a_pb_exec_report(void)
     for (i = 0; i < s_unhandled_count; i++)       /* the sort moved them */
         s_unhandled_slot[(s_unhandled[i].method & 0x1FFC) / 4] = (uint16_t)(i + 1);
     fflush(stderr);
+}
+
+/* ---- Blood Wake (BW_GFXCAP step B, lane gfx-capab; docs/gfx/capture.md 5) --
+ * The executor's state for a capture opened mid-scene, in two forms:
+ *  - a block: every piece of state as it is (bw_exec_state_save / _load),
+ *    for the replay in this executable;
+ *  - a method preamble (bw_exec_preamble): methods that rebuild the same
+ *    state in a reset executor, for any engine.
+ * Plain data, no host pointers. A test aid: nothing here runs unless BW_GFXCAP
+ * opens a capture mid-scene. */
+extern size_t nv2a_vsh_bw_state(void *out);
+extern void nv2a_vsh_bw_state_load(const void *in);
+
+typedef struct { const char *name; void *p; size_t n; } BwExecPart;
+#define BW_EXEC_PARTS 14
+
+static int bw_exec_parts(BwExecPart *o)
+{
+    int k = 0;
+#define BW_PART(nm, ptr, sz) do { o[k].name = (nm); o[k].p = (void *)(ptr); o[k].n = (sz); k++; } while (0)
+    BW_PART("s_gpu", &s_gpu, sizeof s_gpu);
+    BW_PART("s_reg", s_reg, sizeof s_reg);
+    BW_PART("s_reg_set", s_reg_set, sizeof s_reg_set);
+    BW_PART("s_tex_reg", s_tex_reg, sizeof s_tex_reg);
+    BW_PART("s_tex_set", s_tex_set, sizeof s_tex_set);
+    BW_PART("s_sem_va", &s_sem_va, sizeof s_sem_va);
+    BW_PART("s_bw_prog", s_bw_prog, sizeof s_bw_prog);
+    BW_PART("s_bw_load_slot", &s_bw_load_slot, sizeof s_bw_load_slot);
+    BW_PART("s_bw_load_word", &s_bw_load_word, sizeof s_bw_load_word);
+    BW_PART("s_bw_start", &s_bw_start, sizeof s_bw_start);
+    BW_PART("s_bw_cxt_write", &s_bw_cxt_write, sizeof s_bw_cxt_write);
+    BW_PART("s_method_inited", &s_method_inited, sizeof s_method_inited);
+    BW_PART("s_bw_exec_inited", &s_bw_exec_inited, sizeof s_bw_exec_inited);
+    BW_PART("vsh", NULL, nv2a_vsh_bw_state(NULL));          /* the interpreter's block */
+#undef BW_PART
+    return k;
+}
+
+/* The block: every part in order. out NULL: its size. */
+size_t bw_exec_state_save(uint8_t *out)
+{
+    BwExecPart pt[BW_EXEC_PARTS];
+    int i, n = bw_exec_parts(pt);
+    size_t at = 0;
+    for (i = 0; i < n; i++) {
+        if (out) {
+            if (pt[i].p)
+                memcpy(out + at, pt[i].p, pt[i].n);
+            else
+                nv2a_vsh_bw_state(out + at);
+        }
+        at += pt[i].n;
+    }
+    return at;
+}
+
+int bw_exec_state_load(const uint8_t *in, size_t len)
+{
+    BwExecPart pt[BW_EXEC_PARTS];
+    int i, n = bw_exec_parts(pt);
+    size_t at = 0;
+    if (len != bw_exec_state_save(NULL))
+        return 0;
+    for (i = 0; i < n; i++) {
+        if (pt[i].p)
+            memcpy(pt[i].p, in + at, pt[i].n);
+        else
+            nv2a_vsh_bw_state_load(in + at);
+        at += pt[i].n;
+    }
+    return 1;
+}
+
+/* Blood Wake (BW_GFXCAP step B): s_gpu's fields by offset, so a state
+ * comparison can name what differs (bw_exec_state_compare). */
+static const char *bw_gpu_field(size_t off)
+{
+#define BW_F(f) { #f, (size_t)((const char *)&s_gpu.f - (const char *)&s_gpu), sizeof s_gpu.f }
+    const struct { const char *n; size_t o, z; } t[] = {
+        BW_F(attr), BW_F(prim), BW_F(idx), BW_F(idx_count),
+        BW_F(inline_buf), BW_F(inline_count), BW_F(imm_attr), BW_F(imm_used),
+        BW_F(imm_count), BW_F(inline_active), BW_F(draws), BW_F(verts),
+        BW_F(nonzero_draws), BW_F(min_x), BW_F(max_x), BW_F(min_y),
+        BW_F(max_y), BW_F(color_offset), BW_F(color_base), BW_F(pitch),
+        BW_F(format), BW_F(drawn_offset), BW_F(drawn_pitch), BW_F(drawn_x),
+        BW_F(drawn_y), BW_F(drawn_w), BW_F(drawn_h), BW_F(drawn_bpp),
+        BW_F(drawn_stale), BW_F(pixels), BW_F(pixel_max), BW_F(clip_x),
+        BW_F(clip_w), BW_F(clip_y), BW_F(clip_h), BW_F(clip_raw_h),
+        BW_F(clip_raw_v), BW_F(aa_sx), BW_F(aa_sy), BW_F(clear_color),
+        BW_F(clears), BW_F(unhandled_total), BW_F(flip_read), BW_F(flip_write),
+        BW_F(flip_modulo), BW_F(flips), BW_F(tris_drawn), BW_F(tris_skipped_offscreen),
+        BW_F(batches_untransformed), BW_F(batches_textured), BW_F(batches_no_uv), BW_F(batches_no_tex),
+        BW_F(blend_enable), BW_F(blend_sfactor), BW_F(blend_dfactor), BW_F(blend_equation),
+        BW_F(blend_color), BW_F(color_mask), BW_F(zpass_enable), BW_F(zpass_count),
+        BW_F(reports), BW_F(blend_pairs), BW_F(blend_npairs), BW_F(texs),
+        BW_F(rc), BW_F(rc_seen), BW_F(clip_plane_mode), BW_F(dot_rgbmapping),
+        BW_F(other_stage_input), BW_F(alpha_test), BW_F(alpha_func), BW_F(alpha_ref),
+        BW_F(fog_enable), BW_F(fog_mode), BW_F(fog_color), BW_F(fog_param),
+        BW_F(xf_mode), BW_F(batches_program), BW_F(verts_program), BW_F(tris_behind),
+        BW_F(xf_degenerate), BW_F(xf_offscreen), BW_F(xf_drawn), BW_F(xf_depth_fail),
+        BW_F(xf_pixels), BW_F(xf_min), BW_F(xf_max), BW_F(xf_fmt),
+        BW_F(xf_nfmt), BW_F(xf_seeded), BW_F(depth_test), BW_F(depth_func),
+        BW_F(depth_mask), BW_F(zeta_offset), BW_F(zstencil_clear), BW_F(clear_rect_h),
+        BW_F(clear_rect_v), BW_F(clear_rect_set), BW_F(composite), BW_F(composite_set),
+        BW_F(batches_ffp),
+    };
+#undef BW_F
+    size_t i;
+    for (i = 0; i < sizeof t / sizeof t[0]; i++)
+        if (off >= t[i].o && off < t[i].o + t[i].z)
+            return t[i].n;
+    return "(padding)";
+}
+/* The executor's state against a block: the number of parts that differ, and
+ * (up to cap) what differs in each: s_gpu's fields by name, the registers by
+ * method, the other parts by offset. */
+int bw_exec_state_compare(const uint8_t *in, size_t len, char *why, size_t cap)
+{
+    BwExecPart pt[BW_EXEC_PARTS];
+    int i, n = bw_exec_parts(pt), bad = 0;
+    size_t at = 0, w = 0, total = bw_exec_state_save(NULL);
+    uint8_t *now;
+    if (why && cap)
+        why[0] = 0;
+    if (len != total || !(now = (uint8_t *)malloc(total)))
+        return -1;
+    bw_exec_state_save(now);
+    for (i = 0; i < n; at += pt[i].n, i++) {
+        size_t a, nd = 0;
+        const char *last_field = NULL;
+        uint32_t last_m = 0xFFFFFFFFu;
+        int shown = 0;
+        for (a = 0; a < pt[i].n; a++) {
+            if (now[at + a] == in[at + a])
+                continue;
+            if (!nd++) {
+                bad++;
+                if (why && w + 64 < cap)
+                    w += (size_t)snprintf(why + w, cap - w, "%s%s:", w ? "; " : "", pt[i].name);
+            }
+            if (!why || w + 64 >= cap || shown >= 48)
+                continue;
+            if (pt[i].p == (void *)&s_gpu) {            /* a field, once */
+                const char *f = bw_gpu_field(a);
+                if (f != last_field) {
+                    w += (size_t)snprintf(why + w, cap - w, " %s", f);
+                    last_field = f;
+                    shown++;
+                }
+            } else if (pt[i].p == (void *)s_reg || pt[i].p == (void *)s_reg_set) {
+                uint32_t m = pt[i].p == (void *)s_reg ? (uint32_t)(a & ~(size_t)3) : (uint32_t)a * 4u;
+                if (m != last_m) {
+                    w += (size_t)snprintf(why + w, cap - w, " %04X", m);
+                    last_m = m;
+                    shown++;
+                }
+            } else if (shown++ < 4)
+                w += (size_t)snprintf(why + w, cap - w, " +0x%zX", a);
+        }
+        if (nd && why && w + 24 < cap)
+            w += (size_t)snprintf(why + w, cap - w, " (%zu bytes)", nd);
+    }
+    free(now);
+    return bad;
+}
+
+/* Methods (and parameters) that act rather than set state, which the
+ * preamble leaves out: no-operations and notifies, the flip's increment and
+ * stall, clears, the draw methods, reports, the semaphore release, the
+ * program and constant uploads and their load pointers (rebuilt below), and
+ * the immediate vertex data (restored from its current values below). */
+static int bw_preamble_skips(uint32_t m)
+{
+    return (m >= 0x0100 && m <= 0x011C) || m == 0x012C || m == 0x0130
+        || (m >= 0x0B00 && m < 0x0C00) || (m >= 0x1500 && m < 0x1530)
+        || m == 0x1710 || m == 0x1714 || m == 0x17C8 || m == 0x17D0
+        || (m >= 0x17FC && m < 0x1820) || (m >= 0x1880 && m < 0x1B00)
+        || m == 0x1D70 || m == 0x1D94 || m == 0x1E9C || m == 0x1EA4;
+}
+
+/* The method preamble: pairs (subchannel << 16 | method, parameter) that
+ * rebuild this executor's state in a reset one. Returns how many (0 when
+ * max is too small; pairs NULL: just the count). */
+uint32_t bw_exec_preamble(uint32_t *pairs, uint32_t max)
+{
+    uint32_t n = 0, i, a, c, w;
+    uint8_t *vb = (uint8_t *)malloc(nv2a_vsh_bw_state(NULL));
+    const uint32_t *prog;
+    const float *cst;
+    uint32_t load_slot, load_word, start, const_load, const_word, cxt;
+#define BW_EMIT(m, v) do { if (pairs && n < max) { pairs[2 * n] = (m); pairs[2 * n + 1] = (v); } n++; } while (0)
+    if (!vb)
+        return 0;
+    nv2a_vsh_bw_state(vb);
+    prog = (const uint32_t *)vb;                                    /* program[136][4] */
+    cst = (const float *)(vb + NV2A_VSH_SLOTS * 16);                /* constants[192][4] */
+    memcpy(&load_slot, vb + NV2A_VSH_SLOTS * 16 + NV2A_VSH_CONSTANTS * 16, 4);
+    memcpy(&load_word, vb + NV2A_VSH_SLOTS * 16 + NV2A_VSH_CONSTANTS * 16 + 4, 4);
+    memcpy(&start, vb + NV2A_VSH_SLOTS * 16 + NV2A_VSH_CONSTANTS * 16 + 8, 4);
+    memcpy(&const_load, vb + NV2A_VSH_SLOTS * 16 + NV2A_VSH_CONSTANTS * 16 + 12, 4);
+    memcpy(&const_word, vb + NV2A_VSH_SLOTS * 16 + NV2A_VSH_CONSTANTS * 16 + 16, 4);
+    memcpy(&cxt, vb + NV2A_VSH_SLOTS * 16 + NV2A_VSH_CONSTANTS * 16 + 20, 4);
+    /* 1. every register written since boot, in method order */
+    for (i = 0; i < 0x2000 / 4; i++)
+        if (s_reg_set[i] && !bw_preamble_skips(i * 4))
+            BW_EMIT(i * 4, s_reg[i]);
+    /* 2. the immediate attributes written so far, as their current values */
+    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+        if (s_gpu.imm_used & (1u << a))
+            for (c = 0; c < 4; c++) {
+                uint32_t u;
+                memcpy(&u, &s_gpu.imm_attr[a][c], 4);
+                BW_EMIT(0x1A00 + a * 16 + c * 4, u);
+            }
+    /* 3. program memory, through its load slot from 0 */
+    BW_EMIT(0x1E9C, 0);
+    for (w = 0; w < NV2A_VSH_SLOTS * 4; w++)
+        BW_EMIT(0x0B00 + (w & 31) * 4, prog[w]);
+    /* 4. the constant file, through its load slot from 0 (after the
+     *    registers, so the constants that share their methods end right) */
+    BW_EMIT(0x1EA4, 0);
+    for (w = 0; w < NV2A_VSH_CONSTANTS * 4; w++) {
+        uint32_t u;
+        memcpy(&u, &cst[w], 4);
+        BW_EMIT(0x0B80 + (w & 31) * 4, u);
+    }
+    /* 5. the load pointers as they were, words already loaded rewritten */
+    BW_EMIT(0x1E9C, load_slot);
+    for (w = 0; w < load_word && load_slot < NV2A_VSH_SLOTS; w++)
+        BW_EMIT(0x0B00 + w * 4, prog[load_slot * 4 + w]);
+    BW_EMIT(0x1EA4, const_load);
+    for (w = 0; w < const_word && const_load < NV2A_VSH_CONSTANTS; w++) {
+        uint32_t u;
+        memcpy(&u, &cst[const_load * 4 + w], 4);
+        BW_EMIT(0x0B80 + w * 4, u);
+    }
+    BW_EMIT(0x1EA0, start);
+    BW_EMIT(0x1E98, cxt);
+#undef BW_EMIT
+    free(vb);
+    return (pairs && n > max) ? 0 : n;
 }

@@ -27,7 +27,6 @@ The same game, with the **original art and sound**, looking, running and soundin
 
 ### Sound
 - **Higher-quality resampling**: cleaner, brighter sound when the game changes a sound's pitch (engines, speed).
-- **Louder output**: the game mixes quietly; this lifts the whole mix a little, with a limiter so nothing clips. The balance between music, effects and voices stays the same.
 - **Surround**: the game's own surround mix on 5.1 or 7.1 speakers or a surround headset.
 - **Low latency**: sound reacts a little sooner.
 
@@ -45,9 +44,14 @@ Each fix is on by default in Remastered and has its own switch in the launcher's
 - A gap at one mission's map edge, through which you could sail off the map.
 - Two textures that were never shipped, shown as black holes and flat white (replaced by the closest match from the game's own textures).
 - A shield cutscene that played at the wrong time.
+- A saved Headphones sound mode that only took effect after you picked it again in the options.
 - The far-away boat-wake foam, built from a mask read in the wrong order.
 
 The full list, with what each one changes, is in [SETTINGS.md](SETTINGS.md) under Fixes.
+
+## In both editions
+- **High Priority Mode** (Display tab, on by default): the game keeps its full speed and precise timing even when its window is behind other windows or minimized. Turn it off to save power on a laptop running on battery; the sound's own safeguards against gaps stay on either way.
+- **The sound at the game's own level**: the mix goes out exactly as the game makes it, nothing boosted, squashed or ducked.
 
 ## Planned
 A third edition, **Expanded**, will add the developers' cut and half-finished content, completed. It isn't in this repository yet. <!-- audit:allow expanded -->

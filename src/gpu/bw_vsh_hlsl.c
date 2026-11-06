@@ -150,12 +150,18 @@ static void put_src(Buf *b, const char *var, const uint32_t *ins, int which,
     put(b, ";\n");
 }
 
-#define BW_VSH_OUT \
-    "struct VSOut { float4 p : SV_Position; noperspective float4 d0 : COLOR0;\n" \
+/* VSOut's members (the text every vertex shader carries, unchanged). */
+#define BW_VSH_OUT_BODY \
+    " float4 p : SV_Position; noperspective float4 d0 : COLOR0;\n" \
     "  noperspective float4 d1 : COLOR1; noperspective float fog : FOG;\n" \
     "  float4 tc0 : TEXCOORD0; float4 tc1 : TEXCOORD1;\n" \
     "  float4 tc2 : TEXCOORD2; float4 tc3 : TEXCOORD3; float fogp : FOG1;\n" \
-    "  float2 clip : SV_ClipDistance0; };\n"
+    "  float2 clip : SV_ClipDistance0;"
+#define BW_VSH_OUT "struct VSOut {" BW_VSH_OUT_BODY " };\n"
+/* gfx-sprites (I6): a point batch's vertex shader output, VSOut's members
+ * then the point's centre in surface pixels and its size (sp: x, y, z as
+ * transform_vertex leaves them, oPts.x), for the sprite geometry shader. */
+#define BW_VSH_OUT_P "struct VSOutP {" BW_VSH_OUT_BODY "\n  float4 sp : SPRITE0; };\n"
 
 /* raster_xf_clipped drops a whole triangle when a vertex's clip distances
  * are not finite. The game does send such vertices: w around 1e30 with
@@ -169,6 +175,74 @@ const char bw_vsh_gs_hlsl[] =
     "  [unroll] for (int i = 0; i < 3; i++)\n"
     "    if (any(!isfinite(v[i].p)) || any(!isfinite(v[i].clip))) return;\n"
     "  s.Append(v[0]); s.Append(v[1]); s.Append(v[2]);\n"
+    "}\n";
+
+/* gfx-sprites (I6): point sprites on the GPU. Each point of a point list
+ * becomes the quad bw_draw_points (nv2a_pb_exec.c) makes on the CPU, rule
+ * for rule, in the same arithmetic order:
+ *   - behind the eye (w not above 0, after transform_vertex's w rules):
+ *     dropped; a centre that isn't finite: dropped (the finite filter's
+ *     rule, which the CPU path's clipper applies per triangle);
+ *   - the size: spr0.z when the batch has one (point params off:
+ *     SET_POINT_SIZE / 8), else the program's oPts.x; below 1 or NaN is 1,
+ *     above 63.875 is 63.875;
+ *   - half the size, times the anti-aliasing scale (never below 1: spr0.x,
+ *     spr0.y), either side of the centre in surface pixels; then the
+ *     combiner path's own mapping to the surface (bw_d3d11.c s_xvs_hlsl):
+ *     x * surf.z * 2 - 1, the widescreen remap, 1 - y * surf.w * 2, times w;
+ *     z and w, the colours, fog and clip distances the centre's;
+ *   - in sprite mode (spr1.x) stage 3's coordinates (0,0) top-left to (1,1)
+ *     bottom-right, z and q 1; the other stages keep the vertex's;
+ *   - two triangles in the CPU path's order, wound clockwise on the surface
+ *     when spr1.y (the cull state's kept face), else the other way.
+ * The GPU's clipper then clips at w = 1e-3 and the near plane with the
+ * centre's distances: all four corners share them, so a quad is kept or
+ * dropped whole, as on the CPU path. */
+const char bw_vsh_sprite_gs_hlsl[] =
+    BW_RC_CBUFFER
+    "cbuffer S : register(b1) { float4 spr0; float4 spr1; };\n"
+    BW_VSH_OUT_P
+    "struct GSOut {" BW_VSH_OUT_BODY "\n"
+    "#ifdef BW_SPR_SO\n"
+    "  float4 chk : SPRCHK;\n"
+    "#endif\n"
+    "};\n"
+    "GSOut corner(VSOutP c, uint pid, int k, float hx, float hy) {\n"
+    "  GSOut q;\n"
+    "  q.d0 = c.d0; q.d1 = c.d1; q.fog = c.fog; q.fogp = c.fogp; q.clip = c.clip;\n"
+    "  q.tc0 = c.tc0; q.tc1 = c.tc1; q.tc2 = c.tc2; q.tc3 = c.tc3;\n"
+    "  float w = c.p.w;\n"
+    "  float px = c.sp.x + ((k & 1) ? hx : -hx);\n"
+    "  float py = c.sp.y + ((k & 2) ? hy : -hy);\n"
+    "  float x = px * surf.z * 2.0 - 1.0;\n"
+    BW_WS_REMAP_HLSL
+    "  float y = 1.0 - py * surf.w * 2.0;\n"
+    "  q.p = float4(x * w, y * w, c.p.z, w);\n"
+    "  if (spr1.x > 0.5)\n"
+    "    q.tc3 = float4((k & 1) ? 1.0 : 0.0, (k & 2) ? 1.0 : 0.0, 1.0, 1.0);\n"
+    "#ifdef BW_SPR_SO\n"
+    "  q.chk = float4((float)pid, (float)k, 0.0, 0.0);\n"
+    "#endif\n"
+    "  return q;\n"
+    "}\n"
+    "[maxvertexcount(6)]\n"
+    "void gs_main(point VSOutP v[1], uint pid : SV_PrimitiveID, inout TriangleStream<GSOut> s) {\n"
+    "  VSOutP c = v[0];\n"
+    "  if (!(c.p.w > 0.0)) return;\n"
+    "  if (any(!isfinite(c.p)) || any(!isfinite(c.clip))) return;\n"
+    "  float sz = spr0.z > 0.0 ? spr0.z : c.sp.w;\n"
+    "  if (!(sz >= 1.0) || isnan(sz)) sz = 1.0;\n"
+    "  if (sz > 63.875) sz = 63.875;\n"
+    "  float hx = sz * 0.5 * spr0.x, hy = sz * 0.5 * spr0.y;\n"
+    "  GSOut q0 = corner(c, pid, 0, hx, hy), q1 = corner(c, pid, 1, hx, hy);\n"
+    "  GSOut q2 = corner(c, pid, 2, hx, hy), q3 = corner(c, pid, 3, hx, hy);\n"
+    "  if (spr1.y > 0.5) {\n"
+    "    s.Append(q0); s.Append(q1); s.Append(q2); s.RestartStrip();\n"
+    "    s.Append(q1); s.Append(q3); s.Append(q2);\n"
+    "  } else {\n"
+    "    s.Append(q0); s.Append(q2); s.Append(q1); s.RestartStrip();\n"
+    "    s.Append(q1); s.Append(q2); s.Append(q3);\n"
+    "  }\n"
     "}\n";
 
 static const char s_head[] =
@@ -248,6 +322,12 @@ static const char s_conv_head[] =
 size_t bw_vsh_hlsl(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
                    const uint8_t *conv, char *out, size_t cap)
 {
+    return bw_vsh_hlsl_ex(prog, n, input_mask, conv, 0, out, cap);
+}
+
+size_t bw_vsh_hlsl_ex(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
+                      const uint8_t *conv, int points, char *out, size_t cap)
+{
     Buf b = { out, 0, cap, 0 };
     uint32_t s, nin = popcount(input_mask), any_conv = 0;
     char m1[6], tn[8];
@@ -280,14 +360,18 @@ size_t bw_vsh_hlsl(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
                                          : (c >> 4) == BW_XVS_CMP ? "uint" : "uint4", s, s);
     }
     put(&b, " };\n");
+    if (points)                                     /* gfx-sprites: the GS's input */
+        put(&b, "%s", BW_VSH_OUT_P);
     put(&b,
-        "VSOut vs_main(VSIn I) {\n"
+        "%s vs_main(VSIn I) {\n"
         "  float4 R0 = 0, R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0, R6 = 0, R7 = 0;\n"
         "  float4 R8 = 0, R9 = 0, R10 = 0, R11 = 0, OP = 0, O5 = 0;\n"
         "  float4 O3 = float4(0, 0, 0, 1), O4 = float4(0, 0, 0, 1);\n"
         "  float4 O9 = float4(0, 0, 0, 1), O10 = float4(0, 0, 0, 1);\n"
         "  float4 O11 = float4(0, 0, 0, 1), O12 = float4(0, 0, 0, 1);\n"
-        "  int a0 = 0;\n");
+        "  int a0 = 0;\n", points ? "VSOutP" : "VSOut");
+    if (points)                                     /* oPts, 0 as the interpreter's outregs */
+        put(&b, "  float4 O6 = 0;\n");
     /* P1: each converted input once, as fetch_attr returns it (components
      * past the size read 0, 0, 0, 1) */
     for (s = 0; s < nin; s++) {
@@ -378,7 +462,7 @@ size_t bw_vsh_hlsl(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
             if (oaddr == 0)
                 put(&b, "    OP%s = (%s)%s;\n", ms, src, ms);
             else if (oaddr == 3 || oaddr == 4 || oaddr == 5
-                     || (oaddr >= 9 && oaddr <= 12))
+                     || (oaddr >= 9 && oaddr <= 12) || (points && oaddr == 6))
                 put(&b, "    O%u%s = (%s)%s;\n", oaddr, ms, src, ms);
         }
         put(&b, "  }\n");
@@ -387,7 +471,7 @@ size_t bw_vsh_hlsl(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
     }
 
     put(&b,
-        "  VSOut o;\n"
+        "  %s o;\n"
         "  float4 P = OP;\n"
         "  if (asuint(P.w) == 0u) P.w = 1.0;\n"         /* +0 only; -0 stays behind */
         /* An infinite w (rcp of a 0 rhw: the intro movies' full-screen quad)
@@ -405,9 +489,228 @@ size_t bw_vsh_hlsl(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
         "  o.clip.y = vsinfo.z > 0.5 ? (P.z - K[59].z) * w : 1.0;\n"
         "  o.d0 = saturate(O3); o.d1 = saturate(O4);\n"
         "  o.fog = fogf(O5.x); o.fogp = fogr(O5.x);\n"
-        "  o.tc0 = O9; o.tc1 = O10; o.tc2 = O11; o.tc3 = O12;\n"
+        "  o.tc0 = O9; o.tc1 = O10; o.tc2 = O11; o.tc3 = O12;\n", points ? "VSOutP" : "VSOut");
+    if (points)                 /* the centre in surface pixels, and oPts.x */
+        put(&b, "  o.sp = float4(P.x, P.y, P.z, O6.x);\n");
+    put(&b,
         "  return o;\n"
         "}\n");
+    if (b.overflow)
+        return 0;
+    return b.n;
+}
+
+/* ---- gfx-ffp: the fixed function as a generated vertex shader -----------
+ *
+ * BW_GPU_FFP (every edition since GA-13; the D3D11 back end, get_ffp). The
+ * executor's fixed-function path (nv2a_pb_exec.c ffp_vertex, lit_color,
+ * ffp_fog_distance) as HLSL, rule for rule, in its own order of operations
+ * (the shaders compile with IEEE strictness, so nothing is reassociated):
+ *   - clip = composite x position (the position as fetch_attr gives it);
+ *     position = (clip.xy / w + c[59].xy) * aa, z = clip.z / w + c[59].z;
+ *     |w| <= 1e-6 has no image (see below);
+ *   - lighting (lit_color): eye-space position and normal by the model-view
+ *     matrix (the position's w taken as 1, the normal by the matrix itself),
+ *     the normal normalised when longer than 1e-8; scene ambient plus, for
+ *     each enabled light, att * (ambient + diffuse * max(0, N.L)), infinite
+ *     lights by their direction, local ones by their position with the range
+ *     test and 1 / (a0 + a1 d + a2 d d); colour material 1 multiplies the
+ *     light's ambient or diffuse by the vertex colour; alpha the vertex's
+ *     with diffuse colour material, else the material's; clamped to 0..1
+ *     (NaN kept, as the C comparisons keep it);
+ *   - unlit: the colour array, else white;
+ *   - the fog distance (ffp_fog_distance): 0 with fog off, else by the
+ *     generation mode: 0 v4.w clamped, 6 v5.x, 1 |eye|, 3 |plane|, any other
+ *     the plane dot(c[57].xyz, eye) + c[57].w, with eye = model-view x
+ *     position (w included here);
+ *   - texture coordinates as fetched, (0,0,0,1) without an array; d1 zero.
+ * Then the program shaders' epilogue (bw_vsh_hlsl above): the same surface
+ * mapping, widescreen remap, depth, clip distances and fog unit, with the
+ * one difference that belongs to ffp_vertex: its w = 0 and infinite-w rules
+ * are the program path's, not the fixed function's, so they are left out.
+ *
+ * The one rule a vertex shader can't keep: ffp_vertex fails at |w| <= 1e-6,
+ * which makes the CPU path drop the whole batch. Here that vertex's position
+ * is NaN, so the finite-vertex filter drops every triangle that uses it
+ * (BW_GPU_VSH_VERIFY counts such batches). */
+static const char s_ffp_cbuf[] =
+    "cbuffer F : register(b2) { float4 FM[4]; float4 FMV[4]; float4 Famb; float4 Fimm;"
+    " float4 FL[40]; };\n";
+
+/* role r's value as an HLSL float4, or `dflt` when there is no array */
+static const char *ffp_in(const BwFfpKey *k, int r, const char *dflt, char buf[16])
+{
+    int i = k->in[r];
+    if (i < 0)
+        return dflt;
+    snprintf(buf, 16, in_conv(k->conv, (uint32_t)i) ? "c%d" : "I.i%d", i);
+    return buf;
+}
+
+/* row `m` (FM or FMV) times p, left to right; `w` the fourth term */
+static void ffp_row(Buf *b, const char *dst, const char *m, int row, const char *p, const char *w)
+{
+    put(b, "  %s = %s[%d].x * %s.x + %s[%d].y * %s.y + %s[%d].z * %s.z + %s[%d].w%s;\n",
+        dst, m, row, p, m, row, p, m, row, p, m, row, w);
+}
+
+size_t bw_ffp_hlsl(const BwFfpKey *k, char *out, size_t cap)
+{
+    Buf b = { out, 0, cap, 0 };
+    uint32_t s, any_conv = 0;
+    char nb[16];
+    int i;
+
+    for (s = 0; s < k->nin; s++)
+        any_conv |= in_conv(k->conv, s);
+    put(&b, "%s", s_head);
+    if (any_conv)
+        put(&b, "%s", s_conv_head);
+    put(&b, "%s", s_ffp_cbuf);
+    /* the inputs, as the program shaders declare them */
+    put(&b, "struct VSIn { uint vid : SV_VertexID;");
+    for (s = 0; s < k->nin; s++) {
+        uint8_t c = in_conv(k->conv, s);
+        if (!c)
+            put(&b, " float4 i%u : ATTR%u;", s, s);
+        else
+            put(&b, " %s r%u : ATTR%u;", (c >> 4) == BW_XVS_SHORT ? "int4"
+                                         : (c >> 4) == BW_XVS_CMP ? "uint" : "uint4", s, s);
+    }
+    put(&b, " };\n");
+    put(&b, "VSOut vs_main(VSIn I) {\n");
+    for (s = 0; s < k->nin; s++) {           /* P1's conversions, as bw_vsh_hlsl */
+        static const char sw[] = "xyzw";
+        uint8_t c = in_conv(k->conv, s);
+        uint32_t j, sz = c & 15u;
+        if (!c)
+            continue;
+        if ((c >> 4) == BW_XVS_CMP) {
+            put(&b, "  float4 c%u = bwcmp(I.r%u);\n", s, s);
+            continue;
+        }
+        put(&b, "  float4 c%u = float4(", s);
+        for (j = 0; j < 4; j++) {
+            const char *sep = j < 3 ? ", " : ");\n";
+            if ((c >> 4) == BW_XVS_COLOR)
+                put(&b, "bwT.Load(int(I.r%u.%c) + 3072)%s", s, "zyxw"[j], sep);
+            else if (j >= sz)
+                put(&b, "%s%s", j == 3 ? "1.0" : "0.0", sep);
+            else if ((c >> 4) == BW_XVS_UBYTE)
+                put(&b, "bwT.Load(int(I.r%u.%c) + 3072)%s", s, sw[j], sep);
+            else
+                put(&b, "(float)I.r%u.%c%s", s, sw[j], sep);
+        }
+    }
+
+    /* ffp_vertex: the transform */
+    put(&b, "  float4 vp = %s;\n  float4 cl;\n", ffp_in(k, BW_FFP_POS, "float4(0, 0, 0, 1)", nb));
+    ffp_row(&b, "cl.x", "FM", 0, "vp", " * vp.w");
+    ffp_row(&b, "cl.y", "FM", 1, "vp", " * vp.w");
+    ffp_row(&b, "cl.z", "FM", 2, "vp", " * vp.w");
+    ffp_row(&b, "cl.w", "FM", 3, "vp", " * vp.w");
+    put(&b,
+        "  float w = cl.w;\n"
+        "  float4 P = float4((cl.x / w + K[59].x) * vsinfo.x, (cl.y / w + K[59].y) * vsinfo.y,\n"
+        "                    cl.z / w + K[59].z, w);\n");
+
+    /* the colour: lit_color, or the colour array, or white */
+    if (k->lit) {
+        put(&b, "  float4 nr = %s;\n", ffp_in(k, BW_FFP_NRM, "float4(0, 0, 0, 1)", nb));
+        put(&b, "  float4 vc = %s;\n", ffp_in(k, BW_FFP_COL, "float4(0, 0, 0, 1)", nb));
+        put(&b, "  float3 e, n;\n");
+        ffp_row(&b, "e.x", "FMV", 0, "vp", "");
+        ffp_row(&b, "e.y", "FMV", 1, "vp", "");
+        ffp_row(&b, "e.z", "FMV", 2, "vp", "");
+        put(&b,
+            "  n.x = FMV[0].x * nr.x + FMV[0].y * nr.y + FMV[0].z * nr.z;\n"
+            "  n.y = FMV[1].x * nr.x + FMV[1].y * nr.y + FMV[1].z * nr.z;\n"
+            "  n.z = FMV[2].x * nr.x + FMV[2].y * nr.y + FMV[2].z * nr.z;\n"
+            "  float len = sqrt(n.x * n.x + n.y * n.y + n.z * n.z);\n"
+            "  if (len > 1e-8) { n.x = n.x / len; n.y = n.y / len; n.z = n.z / len; }\n"
+            "  float4 col = float4(Famb.x, Famb.y, Famb.z, 0.0);\n");
+        for (i = 0; i < 8; i++) {
+            uint32_t kind = (k->light_mask >> (2 * i)) & 3;
+            int L = 5 * i;
+            if (!kind)
+                continue;
+            put(&b, "  { /* light %d */\n    float3 l; float att = 1.0; bool on = true;\n", i);
+            if (kind == 1)
+                put(&b, "    l = FL[%d].xyz;\n", L + 2);
+            else
+                put(&b,
+                    "    l.x = FL[%d].x - e.x; l.y = FL[%d].y - e.y; l.z = FL[%d].z - e.z;\n"
+                    "    float d = sqrt(l.x * l.x + l.y * l.y + l.z * l.z);\n"
+                    "    if (d > FL[%d].w && FL[%d].w > 0.0) on = false;\n"
+                    "    if (d > 1e-8) { l.x = l.x / d; l.y = l.y / d; l.z = l.z / d; }\n"
+                    "    att = FL[%d].x + FL[%d].y * d + FL[%d].z * d * d;\n"
+                    "    att = att > 1e-8 ? 1.0 / att : 1.0;\n",
+                    L + 3, L + 3, L + 3, L, L, L + 4, L + 4, L + 4);
+            put(&b,
+                "    if (on) {\n"
+                "      float ndl = n.x * l.x + n.y * l.y + n.z * l.z;\n"
+                "      if (ndl < 0.0) ndl = 0.0;\n"
+                "      float3 am = FL[%d].xyz, df = FL[%d].xyz;\n", L, L + 1);
+            if ((k->colmat & 1) && k->in[BW_FFP_COL] >= 0)
+                put(&b, "      am.x = am.x * vc.x; am.y = am.y * vc.y; am.z = am.z * vc.z;\n");
+            if ((k->colmat & 2) && k->in[BW_FFP_COL] >= 0)
+                put(&b, "      df.x = df.x * vc.x; df.y = df.y * vc.y; df.z = df.z * vc.z;\n");
+            put(&b,
+                "      col.x = col.x + att * (am.x + df.x * ndl);\n"
+                "      col.y = col.y + att * (am.y + df.y * ndl);\n"
+                "      col.z = col.z + att * (am.z + df.z * ndl);\n"
+                "    }\n  }\n");
+        }
+        put(&b, "  col.w = %s;\n",
+            (k->colmat & 2) && k->in[BW_FFP_COL] >= 0 ? "vc.w" : "Famb.w");
+    } else
+        put(&b, "  float4 col = %s;\n", ffp_in(k, BW_FFP_COL, "float4(1, 1, 1, 1)", nb));
+    put(&b,
+        "  col.x = col.x < 0.0 ? 0.0 : (col.x > 1.0 ? 1.0 : col.x);\n"
+        "  col.y = col.y < 0.0 ? 0.0 : (col.y > 1.0 ? 1.0 : col.y);\n"
+        "  col.z = col.z < 0.0 ? 0.0 : (col.z > 1.0 ? 1.0 : col.z);\n"
+        "  col.w = col.w < 0.0 ? 0.0 : (col.w > 1.0 ? 1.0 : col.w);\n");
+
+    /* ffp_fog_distance */
+    if (!k->fog_on)
+        put(&b, "  float fd = 0.0;\n");
+    else if (k->fog_gen == 0)
+        put(&b, "  float4 fv = %s;\n  float fd = fv.w < 0.0 ? 0.0 : (fv.w > 1.0 ? 1.0 : fv.w);\n",
+            ffp_in(k, BW_FFP_FOG, "Fimm", nb));
+    else if (k->fog_gen == 6)
+        put(&b, "  float fd = (%s).x;\n", ffp_in(k, BW_FFP_FOG, "Fimm", nb));
+    else {
+        put(&b, "  float3 fe;\n");
+        ffp_row(&b, "fe.x", "FMV", 0, "vp", " * vp.w");
+        ffp_row(&b, "fe.y", "FMV", 1, "vp", " * vp.w");
+        ffp_row(&b, "fe.z", "FMV", 2, "vp", " * vp.w");
+        if (k->fog_gen == 1)
+            put(&b, "  float fd = sqrt(fe.x * fe.x + fe.y * fe.y + fe.z * fe.z);\n");
+        else
+            put(&b, "  float fd = K[57].x * fe.x + K[57].y * fe.y + K[57].z * fe.z + K[57].w;\n%s",
+                k->fog_gen == 3 ? "  fd = abs(fd);\n" : "");
+    }
+
+    /* the program shaders' epilogue, from P on (bw_vsh_hlsl) */
+    put(&b,
+        "  VSOut o;\n"
+        "  float x = P.x * surf.z * 2.0 - 1.0;\n"
+        BW_WS_REMAP_HLSL
+        "  float y = 1.0 - P.y * surf.w * 2.0;\n"
+        "  float zr = (P.z - depth.x) * depth.y;\n"
+        "  float z = depth.z > 0.5 ? saturate(zr) : zr;\n"
+        "  o.p = float4(x * w, y * w, z * w, w);\n"
+        /* ffp_vertex: no image at |w| <= 1e-6 (NaN: the filter drops it) */
+        "  if (abs(w) <= 1e-6) o.p = asfloat(0x7fc00000).xxxx;\n"
+        "  o.clip.x = w - 1e-3;\n"
+        "  o.clip.y = vsinfo.z > 0.5 ? (P.z - K[59].z) * w : 1.0;\n"
+        "  o.d0 = col; o.d1 = float4(0, 0, 0, 0);\n"
+        "  o.fog = fogf(fd); o.fogp = fogr(fd);\n");
+    put(&b, "  o.tc0 = %s;\n", ffp_in(k, BW_FFP_TC0, "float4(0, 0, 0, 1)", nb));
+    put(&b, "  o.tc1 = %s;\n", ffp_in(k, BW_FFP_TC1, "float4(0, 0, 0, 1)", nb));
+    put(&b, "  o.tc2 = %s;\n", ffp_in(k, BW_FFP_TC2, "float4(0, 0, 0, 1)", nb));
+    put(&b, "  o.tc3 = %s;\n", ffp_in(k, BW_FFP_TC3, "float4(0, 0, 0, 1)", nb));
+    put(&b, "  return o;\n}\n");
     if (b.overflow)
         return 0;
     return b.n;

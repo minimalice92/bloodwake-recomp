@@ -455,6 +455,7 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
  * to the device by apu_core.c's monitor_frame. */
 int16_t g_bw_frame6[256][6];
 extern int xa2_output_channels(void);
+#include "bw_apu_gain.h"   /* Blood Wake (GAIN-1): BW_AUDIO_PEAKLOG's views, a test aid */
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
@@ -522,6 +523,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
     }
 
     bw_binstat_frame(d, mixbins);
+    if (g_bw_peak)
+        bw_peak_bins(&mixbins[0][0], NUM_MIXBINS, NUM_SAMPLES_PER_FRAME);
     if (bw_xdsp_frame(d, mixbins)) {
         bw_stems_frame(mixbins);
         return;                            /* D-012: the DSPs made the output */
@@ -587,6 +590,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
+            if (g_bw_peak)
+                bw_peak_fold2(left, right);
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
@@ -610,6 +615,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 ch6[3] = mixbins[3][i];
                 ch6[4] = mixbins[4][i] + mixbins[8][i];
                 ch6[5] = mixbins[5][i] + mixbins[9][i];
+                if (g_bw_peak)
+                    bw_peak_fold6(ch6);
                 for (k = 0; k < 6; k++) {
                     float v = ch6[k] > 1.0f ? 1.0f : ch6[k] < -1.0f ? -1.0f : ch6[k];
                     g_bw_frame6[off + i][k] = (int16_t)(v * 32767.0f);

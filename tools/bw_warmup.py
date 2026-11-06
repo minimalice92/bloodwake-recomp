@@ -387,14 +387,16 @@ def cache_dir(cache=None):
     return os.path.join(base, "xboxrecomp", "shadercache") if base else None
 
 
-def cache_files(folder):
-    """The shader files in `folder`, as a set of names; None if it can't be read."""
+def cache_files(folder, kind="ps"):
+    """The shader files of `kind` ("ps" the combiners' pixel shaders, "vs" the
+    vertex programs' and the fixed function's shaders) in `folder`, as a set of
+    names; None if it can't be read."""
     if not folder:
         return None
     if not os.path.exists(folder):
         return set()
     try:
-        return {n.lower() for n in os.listdir(folder) if re.match(r"(?i)ps_[0-9a-f]+\.bin$", n)}
+        return {n.lower() for n in os.listdir(folder) if re.match(r"(?i)%s_[0-9a-f]+\.bin$" % kind, n)}
     except OSError:
         return None
 
@@ -517,6 +519,7 @@ def warmup(exe, game_dir, work, parallel=2, only=None, cache=None, prog=None):
     if not settings:
         prog(0, "the settings couldn't be read; the scenes use the game's defaults")
     before = cache_files(folder)
+    vs_before = cache_files(folder, "vs")   # gfx-ffp: the vertex shaders too (D3D11's side of arch.md 3.5)
     workers = max(1, parallel)
     total = max(float(sum(s["seconds"] for s in scenes)) / workers,
                 sum(s["seconds"] for s in scenes if s["edition"] == "original"))
@@ -562,6 +565,9 @@ def warmup(exe, game_dir, work, parallel=2, only=None, cache=None, prog=None):
     after = cache_files(folder)
     if before is not None and after is not None:
         out["new"], out["total"] = len(after - before), len(after)
+    vs_after = cache_files(folder, "vs")
+    if vs_before is not None and vs_after is not None:
+        out["vs_new"], out["vs_total"] = len(vs_after - vs_before), len(vs_after)
     # Item 21: what this cache now holds shaders for, when every Remastered
     # scene ran without a problem (a scene stopped for time still counts: its
     # shaders so far are kept, and the scenes have room to spare).
@@ -624,6 +630,8 @@ def main(argv=None):
         say(1, "%s %s: %s compiled, %s loads from the cache (from its log), %d s%s" % (
             r["edition"], r["scene"], r["compiled"], r["cached"], r["seconds"],
             " (%s)" % r["error"] if r["error"] else ""))
+    if w.get("vs_new") is not None:
+        say(1, "vertex shaders: %d new, %d in the shader cache" % (w["vs_new"], w["vs_total"]))
     say(1, "graphics ready: %d new shaders prepared%s, in %d s%s" % (
         n, "" if total is None else " (%d in the shader cache)" % total, time.time() - t0,
         "; %d scene(s) had a problem (logs: %s)" % (len(bad), os.path.join(work, "logs")) if bad else ""))

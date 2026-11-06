@@ -115,6 +115,24 @@ static const BwSetting s_set[] = {
       "off", "remastered",
       { { "off", "Off", "" },
         { "on", "On", "env:BW_HIFPS_VSYNC=1" } } },
+    /* QOS-2 (the maintainer) and QOS-3 (the lead, 0.3.1, lane ui031): High
+     * Priority Mode, one checkbox, every edition, on by default, never in a
+     * preset (it is the PC's power, not the picture). It groups the
+     * process's opt-out of Windows' power throttling, the timer resolution
+     * kept when the window is hidden (both BW_PROC_QOS) and the sound
+     * threads' high QoS (BW_AUDIO_HIGHQOS), all in bw_apu_out.c, scheduling
+     * only. On sets nothing: the game's own defaults are on. Off turns those
+     * two off and so plays as 0.3.0 did. Outside it, always on: MMCSS for
+     * the sound threads (BW_AUDIO_MMCSS, 0.3.0's default) and the stall
+     * fixes (BW_VBL_ACK_HRT, BW_LOG_ASYNC, BW_APU_HANDOFF), so turning it off
+     * never brings a gap back. */
+    { "Display", "display", "high_priority", "High Priority Mode",
+      "Full speed and precise timing, even when the game's window is behind other "
+      "windows or minimized. Turn it off to save power on a laptop running on battery.",
+      "on", "all",
+      { { "on", "On", "" },
+        { "off", "Off", "env:BW_PROC_QOS=0;env:BW_AUDIO_HIGHQOS=0" } },
+      "check" },
 
     /* ---- Graphics -------------------------------------------------------- */
     { "Graphics", "graphics", "antialiasing", "Anti-aliasing",
@@ -221,10 +239,11 @@ static const BwSetting s_set[] = {
       "Cleaner sound when the game changes a sound's pitch, such as engines speeding "
       "up.",
       "on", "remastered", ON_OFF(AUDIO_SINC_RESAMPLE) },
-    { "Audio", "audio", "louder", "Louder output",
-      "Lifts the game's quiet mix a little without clipping; music, effects and voices "
-      "keep their balance.",
-      "on", "remastered", ON_OFF(AUDIO_MAKEUP_GAIN) },
+    /* "Louder output" (audio.louder, AUDIO_MAKEUP_GAIN) is retired in 0.3.1
+     * (GAIN-1..3, docs/audio/gain.md): every edition plays the mix at the
+     * clean level, so the row had nothing left to switch. A louder line in
+     * an older file is ignored without a word (this file reads only the
+     * table's keys) and the launcher drops it at its next save. */
     { "Audio", "audio", "surround", "Surround sound (5.1)",
       "With 5.1 or 7.1 speakers or a surround headset, the game's surround mix uses all "
       "of them. Stereo is unaffected.",
@@ -296,6 +315,14 @@ static const BwSetting s_set[] = {
       "In Battle Mode the boats made no splash, slap or spray sounds, because those "
       "recordings shipped only with the story missions. On, battles use them too.",
       "on", "remastered", ON_OFF(BATTLE_WATER_SOUNDS) },
+    /* 0.3.0's HEADPHONES_AT_BOOT (au-trace, docs/audio/trace.md), whose row
+     * was missing (ui031, 0.3.1): the Fixes tab lists every original-game
+     * fix in the registry. */
+    { "Fixes", "fixes", "headphones", "Headphones mode at start-up",
+      "A saved Headphones sound mode only reached the sound chip after you picked it "
+      "again in the game's options. On, it applies from the start. On stereo you won't "
+      "hear a difference.",
+      "on", "remastered", ON_OFF(HEADPHONES_AT_BOOT) },
     { "Fixes", "fixes", "m14_shield", "Mission 14 shield cutscene",
       "If you grabbed the shield before blowing up the ammo depots, its cutscene played "
       "much later and showed the empty spot where it had been. On, it plays when you "

@@ -28,4 +28,44 @@ extern const char bw_vsh_gs_hlsl[];
 size_t bw_vsh_hlsl(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
                    const uint8_t *conv, char *out, size_t cap);
 
+/* gfx-sprites (I6): the same shader for a point batch drawn on the GPU
+ * (points 1): it also writes oPts (o[6]) and hands the sprite geometry
+ * shader the point's centre in surface pixels and its size, as an extra
+ * output after VSOut's (SPRITE0 = x, y, z as transform_vertex leaves them,
+ * oPts.x). points 0 writes exactly bw_vsh_hlsl's text. */
+size_t bw_vsh_hlsl_ex(const uint32_t (*prog)[4], uint32_t n, uint32_t input_mask,
+                      const uint8_t *conv, int points, char *out, size_t cap);
+
+/* gfx-sprites (I6): the geometry shader (entry point gs_main) that makes
+ * each point's quad by bw_draw_points's rules (nv2a_pb_exec.c). It reads
+ * b0 (BW_RC_CBUFFER: surf and, with BW_WS, wsx) and its own b1 (the core's
+ * bwg_sprite_consts: BwgSpriteConsts). Defining BW_SPR_SO adds the stream
+ * output's check element (SPRCHK: point, corner) for BW_GPU_SPRITES_VERIFY. */
+extern const char bw_vsh_sprite_gs_hlsl[];
+
+/* gfx-ffp (BW_GPU_FFP): the fixed function as a generated vertex shader.
+ * Everything that shapes its text; the values it reads are constants: the
+ * program shaders' cbuffer V (b1; it reads K[57], K[59], vsinfo, foginfo)
+ * and BwFfpConsts (b2). */
+typedef struct {
+    int8_t in[8];               /* BW_FFP_* roles (bw_backend_ext.h): input k (ATTRk), -1 none */
+    uint8_t conv[16];           /* per input, as bw_vsh_hlsl's conv (P1); 0 = floats */
+    uint32_t nin;               /* inputs */
+    uint32_t light_mask;        /* lit: 2 bits a light (1 infinite, 2-3 local); 0 when unlit */
+    uint8_t lit, colmat, fog_on, fog_gen;
+} BwFfpKey;
+
+/* The fixed-function shader's own constants (register b2). */
+typedef struct {
+    float m[4][4];              /* composite rows: clip[i] = dot(m[i], position) */
+    float mv[4][4];             /* model-view rows */
+    float ambient[4];           /* scene ambient rgb, material alpha */
+    float imm_fog[4];           /* v4 / v5 without an array */
+    float light[8][5][4];       /* ambient rgb + range; diffuse rgb; direction; position; attenuation */
+} BwFfpConsts;
+
+/* Write the fixed-function vertex shader (entry point vs_main) for `k`.
+ * Returns the length, or 0 if it did not fit. */
+size_t bw_ffp_hlsl(const BwFfpKey *k, char *out, size_t cap);
+
 #endif

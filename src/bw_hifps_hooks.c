@@ -77,6 +77,12 @@
  *                        starts the pass that much before the hold's tick;
  *                        3: only while the frame cap is reached; 4: the head
  *                        start (a test switch; docs/latency/q.md 11-12)
+ *   BW_HIFPS_LATMODE=0|1|2 the latency mode (gfx-lat11; 2 by default, the
+ *                        maintainer's call; 0 = parity, as before): every
+ *                        wait at one gate before the pass, the GPU limit
+ *                        there instead of in the flip, the pass aimed at the
+ *                        GPU coming free (1), or the head start through the
+ *                        gate (2); docs/gfx/lanes/lat11.md
  *   BW_HIFPS_EXTRAP=1    camera extrapolated one step ahead, not interpolated
  *                        (= BW_HIFPS_PREDICT=1 BW_HIFPS_PREDICT_SCOPE=cam)
  *   BW_PREDLOG=<file>    test aid: per drawn frame and per step, what the
@@ -107,6 +113,10 @@
  *                        again (lane au-fx, T3)
  *   BW_HIFPS_PFXSCRIPT=0 effect group scripts (their waits, spawns and loops)
  *                        run on every drawn frame again (lane au-fx, B+)
+ *   BW_HIFPS_PFXDEATH=0  particles end on any drawn frame again, as their
+ *                        time-based life runs out, not at the game step's
+ *                        frame (lane fx-death); BW_HIFPS_PFXSTOPHOLD=1 (a
+ *                        test, off) also holds a stopped emitter to the step
  *   BW_PFXCHECK=<file>   every edition: the per-step particle checker (test
  *                        aid, lane au-fx, read-only): each drawn frame, every
  *                        particle's scale, trail points, bolt re-rolls, the
@@ -144,6 +154,7 @@
 
 #include "bw_edition.h"
 #include "gpu/bw_d3d11.h"
+#include "gpu/core/bwg_gate.h"   /* gfx-lat11: the latency mode's gate (BW_HIFPS_LATMODE) */
 #include "bw_framelog.h"   /* P2b: BW_FRAMELOG test aid */
 #include "bw_latlog.h"     /* lat-m: BW_LATLOG test aid (every edition, read-only) */
 #include "bw_monitor.h"    /* contract 6: the game's monitor (B1, item 34) */
@@ -219,6 +230,9 @@ static int s_pfxtrail = 1;       /* lane au-fx: BW_HIFPS_PFXTRAIL (trail points 
 static int s_hold_frame;         /* lane au-fx: this drawn frame has no new game step (T1, T3 hold) */
 static int s_boltphase = 1;      /* lane au-fx: BW_HIFPS_BOLTPHASE (the bolt's bend per game step, T3) */
 static int s_pfxscript = 1;      /* lane au-fx: BW_HIFPS_PFXSCRIPT (effect group scripts per game step) */
+static int s_pfxdeath = 1;       /* lane fx-death: BW_HIFPS_PFXDEATH (particles end on the step grid) */
+static int s_pfxstophold;        /* lane fx-death: BW_HIFPS_PFXSTOPHOLD=1 (stopped emitters held to the step); off:
+                                    no scene tried ever reached it (docs/audio/fxdeath.md 5) */
 static int s_pf_on;              /* lane au-fx (B+): this drawn frame is a running one, the per-step fixes apply */
 static uint32_t s_pf_m;          /* lane au-fx (B+): the game steps this drawn frame follows */
 static float s_pf_alpha;         /* lane au-fx (B+): this frame's step fraction (step_alpha) */
@@ -233,6 +247,11 @@ static unsigned s_jit;           /* lat-q: BW_HIFPS_JIT (0 off, 1, 2, 3 only at 
 static uint64_t s_jit_lead_ns;   /* lat-q: BW_HIFPS_JIT_LEAD, in ns */
 static int s_jit_pace = 1;      /* lat-q: BW_HIFPS_JIT_PACE (the pacing's slot) */
 static int s_jit_beat;          /* lat-q: BW_HIFPS_PACE_ADAPT=1, aim at the steady beat */
+static int s_latmode;           /* gfx-lat11: BW_HIFPS_LATMODE (0 parity, 1 the gate, 2 with the head start) */
+static int s_pred_ahead_auto;   /* gfx-lat11: BW_HIFPS_PREDICT_AHEAD=auto (the measured horizon) */
+static float s_pred_base;       /* ... the prediction without its horizon */
+static unsigned long s_st_gate_gpu, s_st_gate_aim;   /* the gate's GPU waits, passes aimed at the GPU */
+static double s_st_gate_gpu_ms;
 extern volatile uint32_t g_bw_ko_user, g_bw_ko_last_put;        /* recomp_manual.c (lat-q) */
 
 static Mat      s_prev[NODE_N], s_cur[NODE_N], s_wrote[NODE_N];
@@ -372,7 +391,15 @@ unsigned bw_hifps_boot(int gameplay)
         }
         s_pred_order = env_u("BW_HIFPS_PREDICT_ORDER", 1) == 2 ? 2 : 1;
         pe = getenv("BW_HIFPS_PREDICT_AHEAD");
-        if (pe && *pe && s_pred > 0.0f) {
+        if (pe && !_stricmp(pe, "auto") && s_pred > 0.0f) {
+            /* gfx-lat11 (arch.md 3.8 item 4): follow the measured horizon,
+             * 0.8 of the frame's draw -> screen (or -> GPU done off screen;
+             * lat-p's best fixed horizon was about 0.8 of that time), each
+             * frame from the latency mode's medians (pred_ahead_follow).
+             * Without BW_HIFPS_LATMODE nothing is measured: 0, as unset. */
+            s_pred_ahead_auto = 1;
+            s_pred_base = s_pred;
+        } else if (pe && *pe && s_pred > 0.0f) {
             /* D-027: predict past "now" by this many ms, towards the moment the
              * frame reaches the screen (its drawing, present, GPU and display:
              * docs/latency/p.md, "Predicting to the screen"). It simply adds to
@@ -425,6 +452,8 @@ unsigned bw_hifps_boot(int gameplay)
     s_pfxtrail = env_u("BW_HIFPS_PFXTRAIL", 1) != 0;
     s_boltphase = env_u("BW_HIFPS_BOLTPHASE", 1) != 0;
     s_pfxscript = env_u("BW_HIFPS_PFXSCRIPT", 1) != 0;
+    s_pfxdeath = env_u("BW_HIFPS_PFXDEATH", 1) != 0;
+    s_pfxstophold = env_u("BW_HIFPS_PFXSTOPHOLD", 0) == 1;
     /* lat-q (D-027): off by default for now; BW_HIFPS_JIT=1 turns it on.
      * On the maintainer's screen (with BW_GPU_LATENCY=1): every frame's picture
      * 18.8 -> 13.3 ms old at the screen and judder 5.9 -> 2.0 ms, but the
@@ -439,6 +468,40 @@ unsigned bw_hifps_boot(int gameplay)
     s_jit_lead_ns = (uint64_t)env_u("BW_HIFPS_JIT_LEAD", 0) * 1000u;
     if (s_jit_lead_ns > 20000000u)
         s_jit_lead_ns = 20000000u;
+    /* gfx-lat11 (docs/gfx/arch.md 3.3, 3.8, 4): the latency mode, 2 by
+     * default since the maintainer's call of 2026-11-04 ("I'll take a 10%
+     * drop in frames for 10ms lower latency and half the frame-to-frame
+     * variance"; docs/gfx/lanes/lat11.md). BW_HIFPS_LATMODE=0 is parity
+     * (every wait inside the flip, as before; Original is parity always: it
+     * never gets here). lat-q's own test switches (BW_HIFPS_JIT, and the
+     * flip's serial or measuring BW_GPU_LATENCY=s|m) keep their old meaning:
+     * set, they mean parity unless BW_HIFPS_LATMODE is set too.
+     *   1  the gate: just-in-time frames (as BW_HIFPS_JIT=1) with the GPU
+     *      limit held before the pass instead of in the flip (the walk never
+     *      waits for the GPU), each frame submitted at its flip, and the pass
+     *      aimed to hand its frame over as the GPU comes free (the GPU's own
+     *      measured time; BW_HIFPS_LATMODE_GPUAIM=0 leaves the aim at the
+     *      present slot only);
+     *   2  the gate with the head start (as BW_HIFPS_JIT=4: a steady beat, a
+     *      pass may start while one frame is still on the NV2A thread), the
+     *      beat never faster than the GPU's measured time per frame
+     *      (BW_HIFPS_LATMODE_GPUAIM=0 drops that floor).
+     * The GPU limit is BW_GPU_LATENCY when set (a number), else 1. */
+    {
+        const char *jt = getenv("BW_HIFPS_JIT"), *gl = getenv("BW_GPU_LATENCY");
+        unsigned dflt = 2;
+        if ((jt && *jt) || (gl && *gl && !(*gl >= '0' && *gl <= '9')))
+            dflt = 0;                   /* lat-q's switches, as they were */
+        s_latmode = (int)env_u("BW_HIFPS_LATMODE", dflt);
+    }
+    if (s_latmode > 2)
+        s_latmode = 1;
+    if (s_latmode) {
+        const char *gl = getenv("BW_GPU_LATENCY");
+        int lim = gl && *gl >= '0' && *gl <= '9' ? atoi(gl) : 1;
+        s_jit = s_latmode == 2 ? 4 : 1;
+        bwg_gate_config(s_latmode, lim, env_u("BW_HIFPS_LATMODE_GPUAIM", 1) != 0);
+    }
     {
         extern int g_bw_kickoff_async;                 /* recomp_manual.c */
         /* segments the game may run ahead of the walk; 0 = wait for each flush.
@@ -468,7 +531,8 @@ unsigned bw_hifps_boot(int gameplay)
      * 0 = no limit as before. lat-q: 1 adds nothing measurable without
      * just-in-time frames (lat-m, on screen), so it stays 2 while those are
      * off. */
-    bw_d3d11_latency_config(s_jit == 4 ? 1 : 2);
+    bw_d3d11_latency_config(s_latmode ? bwg_gate_limit() : s_jit == 4 ? 1 : 2);   /* gfx-lat11: the
+                                    latency mode's limit, kept in the flip only if its gate can't run */
     if (s_jit == 4)
         bw_d3d11_beat_auto(1);      /* lat-q: the head start's beat (a test switch) */
     if (s_jit == 3) {
@@ -495,6 +559,10 @@ unsigned bw_hifps_boot(int gameplay)
         fprintf(stderr, "[BW] high frame rate: the Stinger bolt's bend walks per drawn frame again (BW_HIFPS_BOLTPHASE=0)\n");
     if (!s_pfxscript)
         fprintf(stderr, "[BW] high frame rate: effect group scripts run per drawn frame again (BW_HIFPS_PFXSCRIPT=0)\n");
+    if (!s_pfxdeath)
+        fprintf(stderr, "[BW] high frame rate: particles end on any drawn frame again (BW_HIFPS_PFXDEATH=0)\n");
+    else if (s_pfxstophold)
+        fprintf(stderr, "[BW] high frame rate: stopped emitters held to the next step (BW_HIFPS_PFXSTOPHOLD=1, a test)\n");
     if (s_interp && s_pred > 0.0f)
         fprintf(stderr, "[BW] high frame rate: drawn frames predicted %.2f of a step ahead "
                 "(%s%s), corrections faded over %.1f ms, order %d, %.1f ms past now%s\n", s_pred,
@@ -519,6 +587,16 @@ unsigned bw_hifps_boot(int gameplay)
                                     " before its beat, at most one frame on the NV2A thread, 1 on the GPU (a test)"
                                   : "each pass waits only while its frame would queue",
                 (double)s_jit_lead_ns / 1e6);
+    if (s_latmode)
+        fprintf(stderr, "[BW] high frame rate: the latency mode (BW_HIFPS_LATMODE=%d): every wait at one gate before"
+                        " the pass, at most %d GPU frame%s unfinished there%s%s\n", s_latmode, bwg_gate_limit(),
+                bwg_gate_limit() == 1 ? "" : "s", s_latmode == 1 && bwg_gate_gpu_aim()
+                ? ", each pass aimed to hand its frame over as the GPU comes free" : "",
+                s_latmode == 2 ? (bwg_gate_gpu_aim() ? ", the head start's beat no faster than the GPU"
+                                                     : ", the head start's beat its own (no GPU floor)") : "");
+    if (s_pred_ahead_auto)
+        fprintf(stderr, "[BW] high frame rate: prediction follows the measured horizon (BW_HIFPS_PREDICT_AHEAD=auto%s)\n",
+                s_latmode ? "" : "; nothing is measured without BW_HIFPS_LATMODE, so 0");
     return hz;
 }
 
@@ -2919,7 +2997,7 @@ extern int bw_flip_hold_due(uint64_t *due_ns);                  /* carried nv2a_
 extern uint64_t xbox_HostNowNs(void);
 extern void xbox_IrqSafePoint(void);
 extern void bw_flush_wait(void);                                /* bw_wait.c */
-extern volatile LONG g_bw_present_waiting, g_bw_last_flip_waited;   /* bw_d3d11.c (lat-q) */
+extern volatile LONG g_bw_present_waiting, g_bw_last_flip_waited;   /* gpu/core/bwg_pace.c (lat-q) */
 extern volatile LONG g_bw_cap_reached;
 extern volatile double g_bw_flip_ready_ms;
 extern volatile long g_bw_nv2a_walking;                          /* carried xbox_memory_layout.c */
@@ -2928,6 +3006,7 @@ extern volatile long g_bw_ack_flip_held;
 extern int bw_d3d11_present_due(double *due_ms);
 extern double bw_d3d11_pace_period(void);
 extern volatile LONG g_bw_pace_waiting;
+extern volatile double g_bwg_beat_need_ms;                       /* gpu/core/bwg_pace.c (gfx-lat11) */
 static unsigned long s_st_jit_n, s_st_jit_guard, s_st_jit_long, s_st_jit_idle;
 static double s_st_jit_ms;
 /* The present pacing (BW_HIFPS_PACE) holds each present at least 1/target
@@ -2954,13 +3033,18 @@ static int s_jit_frame_stepped;          /* the last drawn frame ran a step */
 static float s_jit_cpu[2][32], s_jit_tail[32];
 static unsigned s_jit_cpun[2], s_jit_tailn;
 static double s_jit_fe_ms;               /* the last frame's end, qpc ms */
+/* gfx-lat11: the measured horizon's game side, from the frame's draw (its
+ * blend's clock) to its flip at the back end, the last 32 (latency mode) */
+static double s_draw_ms;
+static float s_draw_flip[32];
+static unsigned s_draw_flipn;
 static unsigned long long s_jit_kw0;     /* g_bw_ko_wait_us at the pass start */
 static unsigned long s_jit_drawn;        /* frames drawn (message 8 ends) */
 static long s_jit_flip_base;             /* g_bw_flips_done less s_jit_drawn, set when caught up */
 static long s_jit_paced_base;            /* g_bw_paced_n less s_jit_drawn, the same */
 extern volatile LONG g_bw_paced_n;                              /* bw_d3d11.c */
 extern unsigned long long g_bw_ko_wait_us;                      /* recomp_manual.c */
-extern volatile LONG g_bw_flips_done;                           /* bw_d3d11.c */
+extern volatile LONG g_bw_flips_done;                           /* gpu/core/bwg_pace.c */
 
 static void jit_sort(float *v, unsigned n)
 {
@@ -2982,6 +3066,30 @@ static double jit_qpc_ms(void)
     }
     QueryPerformanceCounter(&t);
     return (double)t.QuadPart * inv;
+}
+
+/* gfx-lat11: BW_HIFPS_PREDICT_AHEAD=auto (off by default; prediction itself
+ * is off by default): the prediction reaches 0.8 of the measured horizon
+ * past "now", the frame's draw -> its flip (here, the median of the last 32)
+ * plus the core's present -> screen (on screen) or -> GPU done (median of
+ * the last 32). 0 until both are known; at most a step. */
+static void pred_ahead_follow(void)
+{
+    float v[32];
+    unsigned n = s_draw_flipn < 32u ? s_draw_flipn : 32u;
+    double h, a = 0.0;
+    if (!s_pred_ahead_auto)
+        return;
+    h = bwg_gate_horizon_ms();
+    if (n >= 8 && h > 0.0) {
+        memcpy(v, s_draw_flip, n * sizeof v[0]);
+        jit_sort(v, n);
+        a = 0.8 * ((double)v[n / 2] + h);
+    }
+    if (a > 1000.0 / 30.0)
+        a = 1000.0 / 30.0;
+    s_pred_ahead = (float)a;
+    s_pred = s_pred_base + s_pred_ahead * (30.0f / 1000.0f);
 }
 
 /* How long a pass takes to get its frame to the back end's flip (stepped:
@@ -3071,8 +3179,9 @@ static void jit_wait(void)
     LARGE_INTEGER t0, t, f, tprog, tlast;
     unsigned what = 0, guard = 0;
     uint32_t get_seen = 0xFFFFFFFFu;
-    double ms, gap_max = 0.0;
+    double ms, gap_max = 0.0, gw_ms = 0.0;
     long inflight = 0, pending = 0;
+    int gw = 0;                         /* gfx-lat11: the last look waited at the gate for the GPU */
     if (s_jit == 3 && !g_bw_cap_reached) {
         /* BW_HIFPS_JIT=3 with the cap not reached: as shipped. The next
          * engaged pass learns nothing from this one (its frame queued). */
@@ -3105,7 +3214,9 @@ static void jit_wait(void)
          *  - 3 s in all (the GPU limit's own no-progress rule), counted too. */
         if (user) {
             uint32_t g = HU32(user + 0x44);
-            if (g != get_seen || g_bw_nv2a_walking || g_bw_present_waiting) {
+            /* gfx-lat11: a wait at the gate for the GPU is the GPU's own
+             * frame time, as the limit's wait in the flip is in parity mode */
+            if (g != get_seen || g_bw_nv2a_walking || g_bw_present_waiting || gw) {
                 get_seen = g;
                 tprog = t;
             }
@@ -3125,6 +3236,7 @@ static void jit_wait(void)
                         gap_max, what);
             break;
         }
+        gw = 0;
         held = bw_flip_hold_due(&due);
         if (held) {
             now = xbox_HostNowNs();
@@ -3221,19 +3333,47 @@ static void jit_wait(void)
             bw_flush_wait();            /* GET's event, or ~200 us */
             continue;
         }
+        if (s_latmode && !held) {
+            /* gfx-lat11: the gate's GPU limit (in parity mode the flip waits
+             * for it, holding the walk): at most the limit's flips unfinished
+             * on the GPU; with the head start, a frame still on the NV2A
+             * thread counts too, and the limit is one more */
+            uint32_t unf = bwg_gate_unfinished() + (uint32_t)(inflight > 0 ? inflight : 0);
+            if (unf > (uint32_t)bwg_gate_limit() + (s_jit == 4 ? 1u : 0u)) {
+                double w0 = jit_qpc_ms();
+                what |= 64u;
+                gw = 1;
+                xbox_IrqSafePoint();
+                bwg_gate_wait_progress(1);
+                gw_ms += jit_qpc_ms() - w0;
+                continue;
+            }
+        }
         if (s_jit_pace && (held || !behind || s_jit == 4)) {
             /* the present pacing's slot, less the pass's own work (above) */
             double slot, nowm = jit_qpc_ms(), aim = 0.0;
-            int have = bw_d3d11_present_due(&slot);
+            int have = bw_d3d11_present_due(&slot), by_gpu = 0;
             if (have && pending > 0)
                 slot += (double)pending * bw_d3d11_pace_period();   /* the head start: after theirs */
+            if (s_latmode == 1 && bwg_gate_gpu_aim()) {
+                /* gfx-lat11: hand the frame over as the GPU comes free (the
+                 * GPU's measured time), when that is later than the slot: a
+                 * frame that would wait behind the one before on the GPU
+                 * waits here instead, before its steps, pad read and draw */
+                double gf = bwg_gate_gpu_free_ms();
+                if (gf > 0.0 && (!have || gf > slot)) {
+                    slot = gf;
+                    have = 1;
+                    by_gpu = 1;
+                }
+            }
             if (have) {
                 aim = slot - jit_work_ms(0);
                 if (jit_step_due(aim))          /* that pass would step: it needs longer */
                     aim = slot - jit_work_ms(1);
             }
             if (have && aim > nowm + 0.05) {
-                what |= 8u;
+                what |= by_gpu ? 128u : 8u;     /* gfx-lat11: 128 = aimed at the GPU coming free */
                 xbox_IrqSafePoint();
                 jit_sleep_ns((uint64_t)((aim - nowm) * 1e6));
                 continue;
@@ -3250,6 +3390,8 @@ static void jit_wait(void)
                                && (HU32(user + 0x40) & 0x03FFFFFFu) == (g_bw_ack_last_put & 0x03FFFFFFu));
         if (caught && s_jit_prev_ms > 0.0 && r > s_jit_prev_ms && r - s_jit_prev_ms < 100.0 && !guard)
             s_jit_w[s_jit_frame_stepped][s_jit_wn[s_jit_frame_stepped]++ % 32u] = (float)(r - s_jit_prev_ms);
+        if (caught && s_draw_ms > 0.0 && r > s_draw_ms && r - s_draw_ms < 100.0 && !guard)
+            s_draw_flip[s_draw_flipn++ % 32u] = (float)(r - s_draw_ms);   /* gfx-lat11: the horizon */
         if (s_jit == 4 && caught && s_jit_fe_ms > 0.0 && r > s_jit_fe_ms && r - s_jit_fe_ms < 50.0 && !guard)
             s_jit_tail[s_jit_tailn++ % 32u] = (float)(r - s_jit_fe_ms);
         s_jit_prev_ms = nowm;
@@ -3260,6 +3402,14 @@ static void jit_wait(void)
     s_st_jit_n++;
     s_st_jit_ms += ms;
     s_st_jit_guard += guard;
+    if (what & 64u) {                   /* gfx-lat11 */
+        s_st_gate_gpu++;
+        s_st_gate_gpu_ms += gw_ms;
+    }
+    if (what & 128u)
+        s_st_gate_aim++;
+    if (s_latmode == 2)
+        g_bwg_beat_need_ms = jit_work_ms(1);   /* gfx-lat11: the beat's way back (bwg_pace.c) */
     if (!guard && ms > 100.0)
         s_st_jit_long++;
     bw_fl_event(BW_FL_G_JIT, (unsigned)(ms * 1000.0), what, guard);
@@ -3341,24 +3491,50 @@ static uint32_t pfx_dt(void)
  *     moves on only at a step, and its timed wait (op 5, target +0xA4)
  *     keeps the sum of the frame times since it began in +0xA8 (from 0;
  *     fld dt; fadd acc) and ends at the first step at which the sum reaches
- *     the target.
+ *     the target;
+ *   - (lane fx-death) a particle ends (PFX_Update's test at the top of its
+ *     loop, 0x1BD37: its age before the frame has reached its life) only on
+ *     a drawn frame that follows a step, and then by Original's age: one
+ *     born in the frames after step s's frame, up to and including step
+ *     s+1's, is Original's frame-(s+1) newborn, whose age at a later step's
+ *     frame is o + b (o the frame times before its birth frame since step
+ *     s's frame, summed as an age is; b its own age at that frame's end); a
+ *     frame that follows a step ends it iff o + b at the last step's frame
+ *     before it has reached its life (in double: each term a float). One
+ *     this can't place (first seen otherwise, or tracking started again
+ *     while the game wasn't running) ends iff its age before the frame has
+ *     reached its life, as the game's own test, also only at a step;
+ *   - (fx-death) an emitter (list 0x1A7848+0x1C, next +0x1D0) with particles
+ *     goes (PFX_Release 0x1B530) only on a frame that follows a step.
  * A particle is followed by its address from one drawn frame to the next
- * (its age must be the last one plus the frame time; a newborn's is the
- * frame time). One first seen otherwise ("unknown"), or alive while the game
- * isn't running or its emitter is frozen (+0x1F0 bit 0), isn't judged. A
- * frame of 2+ steps, and every particle that lived through one, is counted
- * apart ("multi"): Original runs one step per frame, so its own hitches
- * would show there. Output: a line a second, cumulative, to the file and to
- * stderr, and one at exit. */
+ * (its age must be the last one plus the frame time, or the same when its
+ * update didn't run: its emitter's pause window, its steps then unchanged;
+ * a newborn's is the frame time). One first seen otherwise ("unknown"), or
+ * alive while the game isn't running or its emitter is frozen (+0x1F0 bit
+ * 0), isn't judged. A frame of 2+ steps, and every particle that lived
+ * through one, is counted apart ("multi"): Original runs one step per frame,
+ * so its own hitches would show there. Output: a line a second, cumulative,
+ * to the file and to stderr, and one at exit. */
 #define PC_HN        131072u          /* the particle tables (a power of 2) */
 #define PC_KN        256u             /* growth factors */
 #define PC_NMAX      4096u            /* the longest chain */
 #define PC_GN        1024u            /* groups */
 #define PC_LN        64u              /* Lightning emitters */
-typedef struct { uint32_t p, e, age, n, fl, h; } pc_ent_t;   /* fl: 1 judged, 2 multi, 4 followed */
+#define PC_EN        1024u            /* the emitter tables (a power of 2) */
+/* fl: 1 judged, 2 multi (4 followed, this frame only); fx-death: 8 placed (o),
+ * 16 b, 32 followed from the last frame, 64 its emitter frozen, 128 newborn */
+typedef struct { uint32_t p, e, age, n, fl, h, o, b, life; } pc_ent_t;
 typedef struct { uint32_t g, cur, tg, acc, ref, fl; } pc_grp_t; /* fl: 1 in a timed wait */
-enum { PCS_SCALE, PCS_TRAIL, PCS_BOLT, PCS_BEND, PCS_SCRIPT, PCS_WAIT, PCS_N };
-static const char *const s_pc_kind[PCS_N] = { "scale", "trail", "bolt", "bend", "script", "wait" };
+typedef struct { uint32_t e, t, d, np; } pc_emt_t;             /* fx-death: time +0x294, desc +0x2AC */
+enum { PCS_SCALE, PCS_TRAIL, PCS_BOLT, PCS_BEND, PCS_SCRIPT, PCS_WAIT, PCS_DEATH, PCS_RELEASE, PCS_N };
+static const char *const s_pc_kind[PCS_N] = { "scale", "trail", "bolt", "bend", "script", "wait",
+                                              "death", "release" };
+static pc_emt_t s_pce[2][PC_EN];
+static uint32_t s_pce_used[2][PC_EN / 2u], s_pce_n[2];
+static uint32_t s_pc_pre;             /* fx-death: float bits, the frame times since the last step's frame */
+static int s_pc_pre_ok;
+static unsigned long long s_pc_unpl, s_pc_relempty, s_pc_held, s_pc_changed;
+static unsigned s_pc_dnotes;
 static FILE *s_pc;
 static int s_pc_init;
 static uint32_t s_pc_m;
@@ -3420,8 +3596,11 @@ static void pc_line(const char *tag)
         o += _snprintf(buf + o, sizeof buf - (size_t)o, " | %s %llu %llu %llu %llu %.3g", s_pc_kind[i],
                        s_pc_ok[i][0], s_pc_mis[i][0], s_pc_ok[i][1], s_pc_mis[i][1], s_pc_maxrel[i]);
     if (o > 0 && o < (int)sizeof buf)
-        _snprintf(buf + o, sizeof buf - (size_t)o, " | unknown %llu untracked %llu long %llu late %llu",
-                  s_pc_unk, s_pc_untracked, s_pc_long, s_pc_late);
+        o += _snprintf(buf + o, sizeof buf - (size_t)o, " | unknown %llu untracked %llu long %llu late %llu",
+                       s_pc_unk, s_pc_untracked, s_pc_long, s_pc_late);
+    if (o > 0 && o < (int)sizeof buf)          /* fx-death */
+        _snprintf(buf + o, sizeof buf - (size_t)o, " | unplaced %llu held %llu changed %llu empty_between %llu",
+                  s_pc_unpl, s_pc_held, s_pc_changed, s_pc_relempty);
     buf[sizeof buf - 1] = 0;
     fprintf(s_pc, "%s\n", buf);
     fflush(s_pc);
@@ -3454,9 +3633,10 @@ static void pc_open(void)
     s_pc = fopen(p, "a");
     if (!s_pc)
         return;
-    fprintf(s_pc, "# pfxcheck 1, boot %lu, %s: C|E host_ms f frames sf frames_after_steps mf"
+    fprintf(s_pc, "# pfxcheck 2, boot %lu, %s: C|E host_ms f frames sf frames_after_steps mf"
             " frames_after_2+_steps st steps | kind ok mismatch ok_multi mismatch_multi max_rel_diff"
-            " (scale trail bolt bend script wait) | unknown untracked long late\n",
+            " (scale trail bolt bend script wait death release) | unknown untracked long late"
+            " | unplaced held changed empty_between\n",
             (unsigned long)GetCurrentProcessId(), bw_edition_title(bw_edition()));
     fflush(s_pc);
     atexit(pc_atexit);
@@ -3580,6 +3760,76 @@ static int pc_shifter(uint32_t beh)          /* behaviours 1, 3, 4, 5, 7, 8, 9 (
         || beh == 0x00024B50u || beh == 0x00024D30u || beh == 0x00025240u;
 }
 
+/* fx-death: the emitters of a frame, by address */
+static uint32_t pce_slot(uint32_t e)
+{
+    return ((e * 2654435761u) >> 20) & (PC_EN - 1u);
+}
+
+static void pce_put(unsigned w, uint32_t e, uint32_t np)
+{
+    uint32_t i = pce_slot(e), j;
+    if (s_pce_n[w] >= PC_EN / 2u)
+        return;
+    for (j = 0; j < PC_EN; j++, i = (i + 1u) & (PC_EN - 1u))
+        if (!s_pce[w][i].e) {
+            s_pce[w][i].e = e;
+            s_pce[w][i].t = HU32(e + 0x294u);
+            s_pce[w][i].d = HU32(e + 0x2ACu);
+            s_pce[w][i].np = np;
+            s_pce_used[w][s_pce_n[w]++] = i;
+            return;
+        }
+}
+
+/* still the same emitter in table w: on the list, its descriptor, its time not gone back */
+static int pce_same(unsigned w, const pc_emt_t *o)
+{
+    uint32_t i = pce_slot(o->e), j;
+    for (j = 0; j < PC_EN; j++, i = (i + 1u) & (PC_EN - 1u)) {
+        const pc_emt_t *c = &s_pce[w][i];
+        union { float f; uint32_t u; } a, b;
+        if (!c->e)
+            return 0;
+        if (c->e != o->e)
+            continue;
+        a.u = c->t;
+        b.u = o->t;
+        return c->d == o->d && !(a.f < b.f);
+    }
+    return 0;
+}
+
+/* fx-death: the first death and release mismatches, in full ("M" lines) */
+static void pc_dnote(const char *what, const pc_ent_t *pe, uint32_t m)
+{
+    union { float f; uint32_t u; } a, l, o, b;
+    uint32_t desc;
+    char name[33];
+    int i;
+    if (s_pc_dnotes >= 60u)
+        return;
+    s_pc_dnotes++;
+    name[0] = 0;
+    desc = FX_VA_OK(pe->e) ? HU32(pe->e + 0x2ACu) : 0;
+    if (FX_VA_OK(desc) && FX_VA_OK(desc - 0x20u)) {
+        for (i = 0; i < 32; i++) {
+            char c = (char)HU8(desc - 0x20u + (uint32_t)i);
+            if (!c)
+                break;
+            name[i] = (c > ' ' && c < 127) ? c : '_';
+        }
+        name[i] = 0;
+    }
+    a.u = pe->age;
+    l.u = pe->life;
+    o.u = pe->o;
+    b.u = pe->b;
+    fprintf(s_pc, "M %s %s e=%08X p=%08X m=%u age=%.6g life=%.6g o=%.6g b=%.6g o+b=%.6g fl=%X frame=%llu\n",
+            what, name[0] ? name : "?", pe->e, pe->p, m, a.f, l.f, o.f, b.f, (double)o.f + (double)b.f,
+            pe->fl, s_pc_frames);
+}
+
 /* after each drawn frame, every edition */
 static void pfxcheck_frame(void)
 {
@@ -3607,6 +3857,9 @@ static void pfxcheck_frame(void)
     for (i = 0; i < s_pc_nused[w]; i++)
         s_pc_t[w][s_pc_used[w][i]].p = 0;
     s_pc_nused[w] = 0;
+    for (i = 0; i < s_pce_n[w]; i++)
+        s_pce[w][s_pce_used[w][i]].e = 0;
+    s_pce_n[w] = 0;
     for (e = HU32(FX_MGR_HEAD_VA); FX_VA_OK(e) && n < 4096u; e = HU32(e + FX_NEXT), n++) {
         uint32_t fl = HU32(e), beh = HU32(e + 0x220u), so = HU32(e + 0x280u), to = HU32(e + 0x258u);
         uint32_t bo = HU32(e + 0x26Cu), p, np = 0;
@@ -3635,31 +3888,58 @@ static void pfxcheck_frame(void)
             s_pcl_ph[w][ln] = live ? ph : 0xFFFFFFFFu;
             ln++;
         }
-        if (!grow && !trail && !bolt)
-            continue;
         if (grow)
             ki = pc_kidx(k.u);
+        /* fx-death: every emitter's particles are followed now, for their
+         * deaths; the other kinds are judged where they apply, as before */
         for (p = HU32(e + 0x1E0u); FX_VA_OK(p) && np < 4096u; p = HU32(p), np++) {
-            uint32_t age = HU32(p + 0x10u), nn, f, h = 2166136261u;
+            uint32_t age = HU32(p + 0x10u), nn, f, h = 2166136261u, dfl = 0, o = 0, b = 0;
             const pc_ent_t *pe = pc_find(prev, p);
             pc_ent_t *ce;
-            int multi;
+            int multi, kinds = grow || trail || bolt;
             if (pe && pe->e == e && age == pc_add(dtu.u, pe->age)) {
                 nn = pe->n + m;                        /* followed: its steps so far */
-                f = pe->fl | 4u;
+                f = (pe->fl & 3u) | 4u;
                 if (!run || frozen)
                     f &= ~1u;
+                dfl = (pe->fl & 24u) | 32u;
+                o = pe->o;
+                b = pe->b;
+            } else if (pe && pe->e == e && age == pe->age) {
+                nn = pe->n;                            /* its update didn't run (a pause window): */
+                f = pe->fl & 3u;                       /* nothing of it moved, no step counted */
+                if (!run || frozen)
+                    f &= ~1u;
+                dfl = (pe->fl & 24u) | 32u;
+                o = pe->o;
+                b = pe->b;
             } else if (age == dtu.u) {
                 nn = m ? 1u : 0u;                      /* born in this frame */
                 f = run && !frozen ? 1u : 0u;
+                dfl = 128u;
+                if (s_pc_pre_ok) {
+                    dfl |= 8u;                         /* placed: the frame times before it since the step's frame */
+                    o = s_pc_pre;
+                }
             } else {
                 nn = 0;
                 f = 0;
-                s_pc_unk++;
+                if (kinds)
+                    s_pc_unk++;
             }
+            if (!run)
+                dfl &= ~24u;                           /* placed again from the next running frame on */
+            else if (m && (dfl & 8u)) {
+                b = age;                               /* its age at this step's frame */
+                dfl |= 16u;
+            }
+            if (frozen)
+                dfl |= 64u;
             if (m >= 2u)
                 f |= 2u;
             multi = (f & 2u) != 0;
+            if (!kinds)
+                f &= ~1u;                              /* only the deaths judged */
             if (bolt) {
                 int j;
                 for (j = 0; j < tn * 3; j++)
@@ -3708,11 +3988,104 @@ static void pfxcheck_frame(void)
             ce->e = e;
             ce->age = age;
             ce->n = nn;
-            ce->fl = f & 3u;
+            ce->fl = (f & 3u) | dfl;
             ce->h = h;
+            ce->o = o;
+            ce->b = b;
+            ce->life = HU32(p + 0x14u);
         }
+        pce_put(w, e, np);
     }
     s_pcl_n[w] = ln;
+    if (run) {
+        /* fx-death: the particles of the last frame. One followed into this
+         * frame survived; one gone while its emitter stayed ended (in this
+         * frame's update); one gone with its emitter is the release's. It
+         * must end iff this frame follows a step and its model has reached
+         * its life (o + b placed, else its age), and only then. */
+        for (i = 0; i < s_pc_nused[pw]; i++) {
+            const pc_ent_t *pe = &s_pc_t[pw][s_pc_used[pw][i]], *ce;
+            union { float f; uint32_t u; } a, l, o, b;
+            int surv, due;
+            pc_emt_t oe;
+            if (!pe->p || (pe->fl & 64u))
+                continue;                              /* frozen: not judged */
+            ce = pc_find(s_pc_t[w], pe->p);
+            surv = ce && ce->e == pe->e && (ce->fl & 32u);
+            if (surv && (ce->fl & 64u))
+                continue;                              /* frozen now: the game's own */
+            if (!surv) {
+                oe.e = pe->e;
+                oe.t = 0;
+                oe.d = 0;
+                {
+                    uint32_t q = pce_slot(pe->e), j;
+                    for (j = 0; j < PC_EN; j++, q = (q + 1u) & (PC_EN - 1u)) {
+                        if (!s_pce[pw][q].e)
+                            break;
+                        if (s_pce[pw][q].e == pe->e) {
+                            oe = s_pce[pw][q];
+                            break;
+                        }
+                    }
+                }
+                if (!pce_same(w, &oe))
+                    continue;                          /* gone with its emitter */
+                if (HU8(pe->e + 0x1F0u) & 1u)
+                    continue;                          /* frozen now: the game's own */
+                if (ce && ce->e == pe->e && !(ce->fl & 128u)) {
+                    s_pc_changed++;                    /* its age set by the game's code: not judged */
+                    continue;
+                }
+            }
+            a.u = pe->age;
+            l.u = pe->life;
+            o.u = pe->o;
+            b.u = pe->b;
+            if (!(l.f > 0.0f) || !(l.f < 3.0e38f) || !(a.f >= 0.0f) || !(a.f < 3.0e38f))
+                continue;                              /* no life to judge by */
+            if (pe->fl & 8u)
+                due = (pe->fl & 16u) && (double)o.f + (double)b.f >= (double)l.f;
+            else {
+                due = !(a.f < l.f);
+                if (m && due)
+                    s_pc_unpl++;
+            }
+            if (!m) {
+                if (surv && !(a.f < l.f))
+                    s_pc_held++;                       /* past its life, kept to the step */
+                due = 0;
+            }
+            pc_count(PCS_DEATH, m >= 2u, surv != due, 1.0);
+            if (surv == due && m < 2u)
+                pc_dnote(surv ? "death-late" : m ? "death-early" : "death-between", pe, m);
+        }
+        /* the emitters of the last frame that had particles: gone only at a step */
+        for (i = 0; i < s_pce_n[pw]; i++) {
+            const pc_emt_t *oe = &s_pce[pw][s_pce_used[pw][i]];
+            if (pce_same(w, oe))
+                continue;
+            if (!oe->np) {
+                if (!m)
+                    s_pc_relempty++;                   /* nothing of it drawn: counted, not judged */
+                continue;
+            }
+            pc_count(PCS_RELEASE, m >= 2u, m != 0, 1.0);
+            if (!m && s_pc_dnotes < 60u) {
+                s_pc_dnotes++;
+                fprintf(s_pc, "M release-between e=%08X d=%08X particles %u frame=%llu\n", oe->e, oe->d, oe->np,
+                        s_pc_frames);
+            }
+        }
+    }
+    /* fx-death: the frame times since the last step's frame (fld dt; fadd) */
+    if (!run)
+        s_pc_pre_ok = 0;
+    else if (m) {
+        s_pc_pre = 0;
+        s_pc_pre_ok = 1;
+    } else if (s_pc_pre_ok)
+        s_pc_pre = pc_add(dtu.u, s_pc_pre);
     if (s_pc_kindname[0] && s_pc_klines < 40000u) {
         /* the kind's emitters: what drives their spawning, once a drawn frame */
         for (e = HU32(FX_MGR_HEAD_VA), n = 0; FX_VA_OK(e) && n < 4096u; e = HU32(e + FX_NEXT), n++) {
@@ -4028,6 +4401,7 @@ static unsigned s_pgb_ne, s_pgb_np;
 static int s_pgb_mode;                 /* 0 nothing, 1 per step, 2 the frame-time factor */
 static uint32_t s_pgd_k[PFE_N], s_pgd_s[PFE_N], s_pgd_stamp;   /* emitters put back this frame */
 static unsigned long s_st_pgb_old, s_st_pgb_new, s_st_pgb_fresh, s_st_pgb_odd, s_st_pgb_gone, s_st_pgb_over;
+static unsigned long s_st_pgb_still;   /* fx-death: put back with a frame time but no update run (counted) */
 
 static double pgb_round(double x)      /* RECOMP_FP_PC (recomp_types.h) */
 {
@@ -4200,9 +4574,14 @@ static void pfxgrow_post(void)
                 }
             }
             j = q + 1u;
-            if (!dt && ag == s_pgb_age[q])
-                HU32(p + off) = s_pgb_s0[q];   /* no frame time: the game didn't multiply */
-            else if (ag == pgb_add(dt, s_pgb_age[q])) {
+            if (ag == s_pgb_age[q] && (!dt || s_pfxstophold)) {
+                /* its update didn't run: no frame time (B+ as proven), or, only
+                 * with fx-death's stopped-emitter hold on (BW_HIFPS_PFXSTOPHOLD=1,
+                 * off: the T2 rule, never exercised), the emitter's pause window
+                 * (a natural one, or a stopped emitter the hold keeps): no x k */
+                HU32(p + off) = s_pgb_s0[q];
+                s_st_pgb_still += dt != 0u;
+            } else if (ag == pgb_add(dt, s_pgb_age[q])) {
                 HU32(p + off) = s_pgb_st[q];
                 s_st_pgb_old++;
             } else
@@ -4309,6 +4688,299 @@ static void pfxscript_post(void)
         }
     }
     s_gs_n = 0;
+}
+
+/* ---- particles end on the step grid (lane fx-death; call RC4-P3) -------- *
+ * A frame-rate trap in the particles' time-based lives (seen in code):
+ * PFX_Update 0x1B980 ends a particle at the top of its loop, before anything
+ * else is done with it, when its age (+0x10, the frame times added since its
+ * birth: fld dt; fadd age; fstp at 0x1C003) has reached its life (+0x14:
+ * fld age; fcomp life at 0x1BD37, i.e. !(age < life)); every behaviour skips
+ * it the same way (e.g. 0x24B61). At 30 fps a drawn frame is a game step,
+ * so a particle born for step s+1 lives through whole steps: it gets its
+ * last x k at step s+J (J = the steps whose frame finds it younger than its
+ * life: ceil(30 x life)), is drawn and sampled until step s+J+1's frame ends
+ * it. B+ (call A10) keeps the age live, and at the high frame rate it
+ * reaches the life between two steps, a few ms after it, so the particle
+ * was gone before step s+J+1 and, when born early in its step, before step
+ * s+J: Torp_spray2's oldest puffs at 1.05^11, Original's at 1.05^12 (rc4's
+ * parity, call RC4-P3). Remastered ends each particle where Original's
+ * 30 Hz step would:
+ *   - the model, by B+'s birth mapping: a particle born in the drawn frames
+ *     after step s's frame, up to and including step s+1's, is Original's
+ *     frame-(s+1) newborn. Its age as that newborn at a later step's frame
+ *     is the frame times from the end of step s's frame to the end of that
+ *     frame: o (the frame times before its birth frame since step s's frame,
+ *     summed as an age is) plus its own age then (b). A drawn frame that
+ *     follows m >= 1 steps ends it when o + b, at the last step's frame
+ *     before this one, has reached its life (the sum in double: each term a
+ *     float, so exact), as Original's frame ends one whose age before the
+ *     frame has; a drawn frame with no step ends none. Its age is the
+ *     game's, so a particle frozen by its emitter's pause window keeps b;
+ *   - the game's own test is made to agree, for the frame only: a particle
+ *     the model keeps but whose age has reached its life gets a life just
+ *     above its age (the next float), and one the model ends but the game
+ *     wouldn't gets its age for its life. After the frame the life is put
+ *     back where it still holds the value written (dead particles are off
+ *     the list). The age is never written, so it stays live and exact;
+ *   - a particle the model can't place (alive when tracking began, or its
+ *     age set by the game's code: PFX_ExpireParticles 0x1B3E0 writes 1.0)
+ *     ends by the game's own test, but only at a step's frame: between
+ *     steps it is kept;
+ *   - a stopped emitter (PFX_Stop 0x1B440 zeroes its live count +0x1EC and
+ *     its count to emit +0x2C0; a dying particle stops its sub-emitters at
+ *     0x1C0A8) is released at the start of its next update (0x1BD7B), one
+ *     drawn frame later: Original's next step, a few ms at the high frame
+ *     rate. On a drawn frame with no step it is held instead: its update
+ *     returns at the pause-window test (0x1B9B3-0x1B9D7: time inside
+ *     (+0x204, +0x208)), which reads (-FLT_MAX, FLT_MAX) for the frame, so
+ *     nothing of it moves, as at 30 fps, and it goes at the next step's
+ *     frame. Its window is put back after the frame where it still holds
+ *     the values written. This part is off (BW_HIFPS_PFXSTOPHOLD=1 turns it
+ *     on): in every scene tried the stops came from game steps, whose next
+ *     drawn frame is a step's anyway, and no emitter had sub-emitters (+0
+ *     bit 21), so it was never reached, and a hook that writes game memory
+ *     ships only after a scene has exercised it (au-fx's T2 lesson).
+ * So per step the particles alive (their count, the x k's their scale got,
+ * their trail) and the emitters released are Original's; BW_PFXCHECK checks
+ * the deaths and the releases against its own model. Between steps a
+ * particle past its life is drawn with its envelopes at their end (age over
+ * life just under 1; with a fade-out, about transparent), as Original's last
+ * frame shows its last look until the step. Frozen emitters (+0x1F0 bit 0,
+ * frame time 0) are left alone; while the game isn't running nothing is
+ * done and tracking starts again. Only while the high frame rate is on
+ * (never in Original); BW_HIFPS_PFXDEATH=0 is the undo. */
+#define PFX_FLAGS2         0x004u
+#define PFX_KEEP_FLAG      0x00002000u      /* +4: kept when done (0x1BD95) */
+#define PFX_LIVE           0x1ECu
+#define PFX_TOEMIT         0x2C0u
+#define PFX_WIN_START      0x204u
+#define PFX_WIN_END        0x208u
+#define PD_HN              16384u           /* tracking table slots (a power of 2), half used at most: the
+                                               particle pool (300 blocks of 0x3D8 bytes, PFX_BlockPoolInit
+                                               0x1AE40) holds ~6000 at the smallest; small to stay in cache */
+#define PD_RN              16384u           /* lives written in one frame */
+#define PD_EN              512u             /* stopped emitters held in one frame */
+typedef struct { uint32_t p, e, age, o, b, fl; } pd_ent_t;    /* fl: 1 placed (o), 2 b */
+static pd_ent_t *s_pd_t[2];
+static uint32_t *s_pd_used[2], s_pd_nused[2];
+static unsigned s_pd_cur;
+static int s_pd_alloc, s_pd_have, s_pd_pre_ok;
+static uint32_t s_pd_pre;                    /* float bits: frame times since the last step's frame */
+static uint32_t s_pdr_p[PD_RN], s_pdr_e[PD_RN], s_pdr_l[PD_RN], s_pdr_w[PD_RN];
+static unsigned s_pdr_n;
+static uint32_t s_pdh_e[PD_EN], s_pdh_s[PD_EN], s_pdh_t[PD_EN];
+static unsigned s_pdh_n;
+static unsigned long s_st_pd_keep, s_st_pd_end, s_st_pd_unpl, s_st_pd_hold, s_st_pd_over, s_st_pd_untr;
+
+static uint32_t pd_slot(uint32_t p)
+{
+    return ((p * 2654435761u) >> 18) & (PD_HN - 1u);
+}
+
+static const pd_ent_t *pd_find(const pd_ent_t *t, uint32_t p)
+{
+    uint32_t i = pd_slot(p), j;
+    for (j = 0; j < 64u; j++, i = (i + 1u) & (PD_HN - 1u)) {
+        if (t[i].p == p)
+            return &t[i];
+        if (!t[i].p)
+            return NULL;
+    }
+    return NULL;
+}
+
+static pd_ent_t *pd_put(unsigned w, uint32_t p)
+{
+    pd_ent_t *t = s_pd_t[w];
+    uint32_t i = pd_slot(p), j;
+    if (s_pd_nused[w] >= PD_HN / 2u)
+        return NULL;
+    for (j = 0; j < 64u; j++, i = (i + 1u) & (PD_HN - 1u)) {
+        if (!t[i].p) {
+            t[i].p = p;
+            s_pd_used[w][s_pd_nused[w]++] = i;
+            return &t[i];
+        }
+        if (t[i].p == p)
+            return &t[i];
+    }
+    return NULL;
+}
+
+/* before the frame, after pfxgrow_pre (which reads the lives as they are) */
+static void pfxdeath_pre(void)
+{
+    uint32_t e, n = 0, m = s_pf_m;
+    const pd_ent_t *tb = s_pd_have ? s_pd_t[s_pd_cur] : NULL;
+    s_pdr_n = 0;
+    s_pdh_n = 0;
+    if (!s_pfxdeath || !s_pf_on)
+        return;
+    for (e = HU32(PFX_HEAD_VA); FX_VA_OK(e) && n < 4096u; e = HU32(e + FX_NEXT), n++) {
+        uint32_t p, np = 0;
+        if (HU8(e + PFX_FROZEN) & 1u)
+            continue;
+        if (s_pfxstophold && !m && !HU32(e + PFX_TOEMIT) && !HU32(e + PFX_LIVE)
+                && !(HU32(e + PFX_FLAGS2) & PFX_KEEP_FLAG)) {
+            /* stopped: its update would release it at once; held to the step */
+            if (s_pdh_n == PD_EN) {
+                s_st_pd_over++;
+                continue;
+            }
+            s_pdh_e[s_pdh_n] = e;
+            s_pdh_s[s_pdh_n] = HU32(e + PFX_WIN_START);
+            s_pdh_t[s_pdh_n] = HU32(e + PFX_WIN_END);
+            s_pdh_n++;
+            HU32(e + PFX_WIN_START) = 0xFF7FFFFFu;
+            HU32(e + PFX_WIN_END) = 0x7F7FFFFFu;
+            s_st_pd_hold++;
+            continue;
+        }
+        for (p = HU32(e + PFX_PARTS); FX_VA_OK(p) && np < 4096u; p = HU32(p), np++) {
+            union { float f; uint32_t u; } a, l;
+            int kill, want;
+            a.u = HU32(p + PFX_AGE);
+            l.u = HU32(p + PFX_LIFE);
+            if (!(l.f > 0.0f) || !(l.f < 3.0e38f) || !(a.f >= 0.0f) || !(a.f < 3.0e38f))
+                continue;                      /* the game's own (no life to align) */
+            kill = !(a.f < l.f);
+            if (!m)
+                want = 0;                      /* no step: none ends */
+            else {
+                const pd_ent_t *pe = tb ? pd_find(tb, p) : NULL;
+                if (pe && pe->e == e && pe->age == a.u && (pe->fl & 1u)) {
+                    union { float f; uint32_t u; } o, b;
+                    o.u = pe->o;
+                    b.u = pe->b;
+                    want = (pe->fl & 2u) && (double)o.f + (double)b.f >= (double)l.f;
+                } else {
+                    want = kill;               /* not placed: the game's own test, at the step */
+                    if (kill)
+                        s_st_pd_unpl++;
+                }
+            }
+            if (want == kill)
+                continue;
+            if (s_pdr_n == PD_RN) {
+                s_st_pd_over++;
+                continue;
+            }
+            s_pdr_p[s_pdr_n] = p;
+            s_pdr_e[s_pdr_n] = e;
+            s_pdr_l[s_pdr_n] = l.u;
+            s_pdr_w[s_pdr_n] = want ? a.u : a.u + 1u;   /* its age, or the next float above it */
+            HU32(p + PFX_LIFE) = s_pdr_w[s_pdr_n];
+            s_pdr_n++;
+            if (want)
+                s_st_pd_end++;
+            else
+                s_st_pd_keep++;
+        }
+    }
+}
+
+/* after the frame, with pfe_build's list, before B+'s own puts-back */
+static void pfxdeath_post(void)
+{
+    union { float f; uint32_t u; } dt;
+    uint32_t e, n = 0, m = s_pf_m, w, k;
+    const pd_ent_t *prev;
+    unsigned i = 0;
+    /* the lives written, back into the particles still on their lists (in
+     * list order per emitter, as written; newborns come first, unmatched) */
+    while (i < s_pdr_n) {
+        uint32_t p, np = 0;
+        unsigned j = i, end = i;
+        e = s_pdr_e[i];
+        while (end < s_pdr_n && s_pdr_e[end] == e)
+            end++;
+        if (pfe_live(e))
+            for (p = HU32(e + PFX_PARTS); FX_VA_OK(p) && np < 4096u && j < end; p = HU32(p), np++) {
+                unsigned q;
+                for (q = j; q < end && s_pdr_p[q] != p; q++)
+                    ;
+                if (q == end)
+                    continue;
+                if (HU32(p + PFX_LIFE) == s_pdr_w[q])
+                    HU32(p + PFX_LIFE) = s_pdr_l[q];
+                j = q + 1u;
+            }
+        i = end;
+    }
+    s_pdr_n = 0;
+    for (i = 0; i < s_pdh_n; i++) {
+        e = s_pdh_e[i];
+        if (pfe_live(e) && HU32(e + PFX_WIN_START) == 0xFF7FFFFFu && HU32(e + PFX_WIN_END) == 0x7F7FFFFFu) {
+            HU32(e + PFX_WIN_START) = s_pdh_s[i];
+            HU32(e + PFX_WIN_END) = s_pdh_t[i];
+        }
+    }
+    s_pdh_n = 0;
+    /* follow every particle to the next frame (its age is the last one plus
+     * the frame time, or the same when its update didn't run); a newborn's
+     * age is the frame time, and it is placed by the frame times before it
+     * since the last step's frame. At a step's frame each placed particle's
+     * age is its b. */
+    dt.u = pfx_dt();
+    if (!s_pfxdeath || !s_pf_on || !(dt.f > 0.0f)) {
+        s_pd_have = 0;                         /* tracking starts again at the next running frame */
+        s_pd_pre_ok = 0;
+        return;
+    }
+    if (!s_pd_alloc) {
+        s_pd_t[0] = (pd_ent_t *)calloc(PD_HN, sizeof(pd_ent_t));
+        s_pd_t[1] = (pd_ent_t *)calloc(PD_HN, sizeof(pd_ent_t));
+        s_pd_used[0] = (uint32_t *)malloc(PD_HN / 2u * sizeof(uint32_t));
+        s_pd_used[1] = (uint32_t *)malloc(PD_HN / 2u * sizeof(uint32_t));
+        s_pd_alloc = s_pd_t[0] && s_pd_t[1] && s_pd_used[0] && s_pd_used[1] ? 1 : -1;
+        if (s_pd_alloc < 0)
+            fprintf(stderr, "[BW] hifps: particle death tracking: no memory, the game's own deaths\n");
+    }
+    if (s_pd_alloc < 0)
+        return;
+    prev = s_pd_have ? s_pd_t[s_pd_cur] : NULL;
+    w = s_pd_cur ^ 1u;
+    for (k = 0; k < s_pd_nused[w]; k++)
+        s_pd_t[w][s_pd_used[w][k]].p = 0;
+    s_pd_nused[w] = 0;
+    for (e = HU32(PFX_HEAD_VA); FX_VA_OK(e) && n < 4096u; e = HU32(e + FX_NEXT), n++) {
+        uint32_t p, np = 0;
+        for (p = HU32(e + PFX_PARTS); FX_VA_OK(p) && np < 4096u; p = HU32(p), np++) {
+            uint32_t age = HU32(p + PFX_AGE), fl = 0, o = 0, b = 0;
+            const pd_ent_t *pe = prev ? pd_find(prev, p) : NULL;
+            pd_ent_t *ce;
+            if (pe && pe->e == e && (age == pe->age || age == pgb_add(dt.u, pe->age))) {
+                fl = pe->fl;
+                o = pe->o;
+                b = pe->b;
+            } else if (dt.u && age == dt.u && s_pd_pre_ok) {
+                fl = 1u;                       /* born in this frame */
+                o = s_pd_pre;
+            }
+            if (m && (fl & 1u)) {
+                b = age;
+                fl |= 2u;
+            }
+            ce = pd_put(w, p);
+            if (!ce) {
+                s_st_pd_untr++;
+                continue;
+            }
+            ce->e = e;
+            ce->age = age;
+            ce->o = o;
+            ce->b = b;
+            ce->fl = fl;
+        }
+    }
+    s_pd_cur = w;
+    s_pd_have = 1;
+    if (m) {
+        s_pd_pre = 0;                          /* 0.0: the next step's frames start here */
+        s_pd_pre_ok = 1;
+    } else if (s_pd_pre_ok && dt.u)
+        s_pd_pre = pgb_add(dt.u, s_pd_pre);
 }
 
 /* ---- bolt jitter per game step (lane au-fx, the wake audit's T2) --------- *
@@ -4785,10 +5457,12 @@ static void hifps_frame(void)
     audit = interp && s_steps_since_draw == 0 && s_audit != 0;
     if (audit)
         audit_pre();
+    s_draw_ms = s_latmode && interp ? jit_qpc_ms() : 0.0;   /* gfx-lat11: the horizon's draw */
     if (interp) {
         float a = step_alpha();
         s_st_alpha += a;
         s_aim_a = a;                               /* BW_AIMLOG */
+        pred_ahead_follow();                       /* gfx-lat11: BW_HIFPS_PREDICT_AHEAD=auto */
         apply_interp(a);
         /* lat-p: with every node predicted, the water goes the same way, so
          * the hulls sit in the swell they float on */
@@ -4845,6 +5519,7 @@ static void hifps_frame(void)
     pfxgrow_pre(HU32(msg + 4));            /* lane wake, au-fx: the growth per step */
     pfxjit_apply(HU32(msg + 4));           /* lane au-fx: bolt jitter per game step (T2) */
     pfxscript_pre();                       /* lane au-fx: group scripts per game step */
+    pfxdeath_pre();                        /* lane fx-death: deaths on the step grid (after the growth's reads) */
     if (s_log) {
         LARGE_INTEGER t;
         QueryPerformanceCounter(&t);
@@ -4854,6 +5529,7 @@ static void hifps_frame(void)
     if (s_log)
         QueryPerformanceCounter(&s_bp_t0);
     pfe_build();
+    pfxdeath_post();                       /* lives and windows back first, then the follow */
     pfxscript_post();
     trail_restore();
     pfxjit_restore();
@@ -4966,6 +5642,14 @@ static void hifps_frame(void)
                         " body, %lu frames)\n", (double)s_st_bp_ticks * 1e6 / (double)f.QuadPart
                         / (double)s_st_bp_frames, s_st_bp_frames);
             }
+            if (s_st_pd_keep || s_st_pd_end || s_st_pd_hold || s_st_pd_over || s_st_pd_untr || s_st_pgb_still)
+                fprintf(stderr, "[BW] hifps: particle deaths on the step grid: %lu kept to the step, %lu ended"
+                        " at it, %lu not placed (the game's own test, at the step), %lu stopped emitters held%s;"
+                        " %lu over a cap, %lu untracked; growth put back with no update run %lu\n", s_st_pd_keep,
+                        s_st_pd_end, s_st_pd_unpl, s_st_pd_hold, s_pfxstophold ? "" : " (off)", s_st_pd_over,
+                        s_st_pd_untr, s_st_pgb_still);
+            s_st_pd_keep = s_st_pd_end = s_st_pd_unpl = s_st_pd_hold = s_st_pd_over = s_st_pd_untr = 0;
+            s_st_pgb_still = 0;
             s_st_bp_ticks = 0;
             s_st_bp_frames = 0;
             s_st_pgb_old = s_st_pgb_new = s_st_pgb_fresh = s_st_pgb_odd = s_st_pgb_gone = s_st_pgb_over = 0;
@@ -4986,6 +5670,16 @@ static void hifps_frame(void)
                 if (s_st_jit_long)
                     fprintf(stderr, "[BW] hifps: just-in-time waits over 100 ms through a busy walk or GPU: %lu\n",
                             s_st_jit_long);
+                if (s_latmode)                  /* gfx-lat11 */
+                    fprintf(stderr, "[BW] hifps: the latency gate waited for the GPU before %lu passes (%.1f ms),"
+                                    " aimed %lu at the GPU coming free; GPU %.2f ms a frame, horizon %.2f ms\n",
+                            s_st_gate_gpu, s_st_gate_gpu_ms, s_st_gate_aim, bwg_gate_gpu_period(),
+                            bwg_gate_horizon_ms());
+                if (s_pred_ahead_auto)
+                    fprintf(stderr, "[BW] hifps: prediction %.2f ms past now (the measured horizon)\n",
+                            (double)s_pred_ahead);
+                s_st_gate_gpu = s_st_gate_aim = 0;
+                s_st_gate_gpu_ms = 0.0;
                 s_st_jit_n = s_st_jit_guard = s_st_jit_long = s_st_jit_idle = 0;
                 s_st_jit_ms = 0.0;
             }

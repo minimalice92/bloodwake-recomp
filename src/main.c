@@ -157,6 +157,7 @@ static BOOL load_xbe(const wchar_t *path, void **out_data, size_t *out_size);
 #include "bw_profile.h"                            /* BW_PROFILE sampler */
 #include "bw_host.h"                               /* BW_HOST: play launcher window */
 #include "gpu/bw_d3d11.h"                          /* BW_GPU=d3d11 back end */
+#include "gpu/bw_gfxcap.h"                         /* BW_GFXCAP: frame capture and replay (test aid) */
 #include "bw_edition.h"                            /* BW_EDITION: D-007/D-015 */
 #include "bw_widescreen.h"                         /* Remastered widescreen */
 #include "bw_settings.h"                           /* the launcher's settings file */
@@ -942,6 +943,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         if (si)
             return bw_hdr_screen_info(si[13] == '=' ? si + 14 : NULL);
     }
+    if (getenv("BW_GFXCAP_DRAWS")) {    /* test aid: a capture's draws, decoded (bw_gfxcap_draws.c) */
+        extern int bw_gfxcap_draws_main(void);
+        return bw_gfxcap_draws_main();
+    }
     if (bw_keys_schema_main())    /* --keys-schema: the default key table (bw_keys.c) */
         return 0;
     /* The launcher asks for the settings table (tools/launcher.pyw). The exe
@@ -1004,6 +1009,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         bw_lat_init();
         bw_padwatch_init();
     }
+    bw_gfxcap_init();         /* BW_GFXCAP / BW_GFXCAP_REPLAY: test aid, inert when unset */
     bw_d3d11_register();      /* BW_GPU=d3d11: GPU back end (D-003 B prototype) */
     printf("Loading XBE...\n");
 
@@ -1328,6 +1334,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             fflush(stderr);
             *(volatile uint32_t *)(uintptr_t)8 = 0;
         }
+    }
+
+    /* BW_GFXCAP_REPLAY=<file> (lane gfx-cap, docs/gfx/capture.md): the
+     * runtime is set up as for a run, and the capture is fed to the GPU side
+     * instead of starting the game. No game code runs. Test aid. */
+    if (g_bw_gfxcap == 2) {
+        int rc = bw_gfxcap_replay_main();
+        fflush(stdout);
+        fflush(stderr);
+        ExitProcess((UINT)rc);
     }
 
     /* Step 7: Call the recompiled entry point */

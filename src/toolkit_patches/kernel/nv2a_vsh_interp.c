@@ -112,6 +112,38 @@ void nv2a_vsh_constant_word(uint32_t word)
     }
 }
 
+/* Blood Wake carried patch (BW_GFXCAP step B, lane gfx-capab): the
+ * interpreter's whole state as one block, for a capture opened mid-scene
+ * (docs/gfx/capture.md section 5), and its parts for the method preamble. */
+typedef struct {
+    uint32_t program[NV2A_VSH_SLOTS][4];
+    float    cst[NV2A_VSH_CONSTANTS][4];
+    uint32_t load_slot, load_word, start_slot, const_load, const_word, cxt_write, const_gen;
+} BwVshBlock;
+
+size_t nv2a_vsh_bw_state(void *out)
+{
+    BwVshBlock *b = (BwVshBlock *)out;
+    if (b) {
+        memcpy(b->program, s_program, sizeof s_program);
+        memcpy(b->cst, s_const, sizeof s_const);
+        b->load_slot = s_load_slot; b->load_word = s_load_word; b->start_slot = s_start_slot;
+        b->const_load = s_const_load; b->const_word = s_const_word;
+        b->cxt_write = s_cxt_write; b->const_gen = s_const_gen;
+    }
+    return sizeof(BwVshBlock);
+}
+
+void nv2a_vsh_bw_state_load(const void *in)
+{
+    const BwVshBlock *b = (const BwVshBlock *)in;
+    memcpy(s_program, b->program, sizeof s_program);
+    memcpy(s_const, b->cst, sizeof s_const);
+    s_load_slot = b->load_slot; s_load_word = b->load_word; s_start_slot = b->start_slot;
+    s_const_load = b->const_load; s_const_word = b->const_word;
+    s_cxt_write = b->cxt_write; s_const_gen = b->const_gen;
+}
+
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
     s_const_gen++;

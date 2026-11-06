@@ -33,10 +33,11 @@
  * BW_TEXRESTORE_FRAME_MS (0.3 ms) per frame, and the next draws use them.
  */
 #define BW_VFX_INTERNAL
-#include "bw_texrestore.h"
+#include "bw_texrestore_d3d11.h"   /* GC-3: bw_texrestore.h and its D3D11 side */
 #include "bw_vfx.h"
 #include "bw_vfx_int.h"
 #include "bw_gpu_failtest.h"   /* 0.2.5 item 25: BW_GPU_FAILTEST (test aid) */
+#include "bw_gfxcap.h"         /* BW_GFXCAP (test aid): the read, and the deterministic mode */
 
 #include <math.h>
 #include <stdio.h>
@@ -841,8 +842,8 @@ void bw_tr_release(BwTrSlot *s)
         if (a >= s_alt_pool && a < s_alt_pool + TR_ALT_N)
             s_alt_busy[a - s_alt_pool] = 0;
     }
-    if (s->srv) { ID3D11ShaderResourceView_Release(s->srv); s->srv = NULL; }
-    if (s->tex) { ID3D11Texture2D_Release(s->tex); s->tex = NULL; }
+    if (BW_TR_SRV(s)) { ID3D11ShaderResourceView_Release(BW_TR_SRV(s)); s->api[1] = NULL; }
+    if (BW_TR_TEX(s)) { ID3D11Texture2D_Release(BW_TR_TEX(s)); s->api[0] = NULL; }
     if (s->state == 1) {
         s_total_mb -= s->bytes / 1048576.0;
         if (s_n_ok) s_n_ok--;
@@ -924,6 +925,8 @@ void bw_tr_request(BwTrSlot *s, uint32_t color, const uint8_t *src, uint32_t w, 
         left(s, BW_TR_WHY_FAIL, addr, color, w, h);
         return;
     }
+    if (BW_GFXCAP_REC())                    /* BW_GFXCAP: the request copies guest memory */
+        bw_gfxcap_read(addr, (uint32_t)n);
     memcpy(j->dxt, src, n);
     j->slot = s;
     if (!++s_ticket) ++s_ticket;
@@ -933,6 +936,19 @@ void bw_tr_request(BwTrSlot *s, uint32_t color, const uint8_t *src, uint32_t w, 
     s->state = 3;
     s_inflight++;
     s_changed = 1;
+    if (BW_GFXCAP_PINNED()) {
+        /* BW_GFXCAP (lane gfx-capab, capture.md 4.2): the worker's part here,
+         * now, and the job straight to the done queue, which the pump empties
+         * at this frame's flip (no time budget). So a restored chain is first
+         * drawn in the frame after the one that asked for it, on both sides of
+         * a capture, whatever the worker's timing. */
+        static TrScratch sc = { NULL, 0 };
+        tr_cpu(j, &sc);
+        EnterCriticalSection(&s_cs);
+        q_push(&s_done, &s_done_tail, j);
+        LeaveCriticalSection(&s_cs);
+        return;
+    }
     EnterCriticalSection(&s_cs);
     q_push(&s_todo, &s_todo_tail, j);
     LeaveCriticalSection(&s_cs);
@@ -1046,8 +1062,8 @@ static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx, int 
     ok = 1;
     t1 = now_ms();
 
-    s->tex = tex; tex = NULL;
-    s->srv = srv; srv = NULL;
+    s->api[0] = tex; tex = NULL;
+    s->api[1] = srv; srv = NULL;
     s->state = 1;
     s->ticket = 0;
     s->lk = (uint8_t)lk;
@@ -1083,9 +1099,9 @@ static int tr_finish(TrJob *j, ID3D11Device *dev, ID3D11DeviceContext *ctx, int 
                   mode_name(j->au), mode_name(j->av),
                   j->ac != 1 ? "soft" : v->tr_cutout_threshold ? "hard" : "cut");
         p[sizeof p - 1] = 0;
-        dump_level(dev, ctx, s->tex, 0, W, H, p);
+        dump_level(dev, ctx, BW_TR_TEX(s), 0, W, H, p);
         _snprintf(p, sizeof p, "%str_%08X_%ux%u_chain%u.bmp", dump, j->addr, w, h, lk); p[sizeof p - 1] = 0;
-        dump_level(dev, ctx, s->tex, lk, w, h, p);      /* the chain's copy of the game's level 0 */
+        dump_level(dev, ctx, BW_TR_TEX(s), lk, w, h, p);      /* the chain's copy of the game's level 0 */
         fprintf(stderr, "[TEXRESTORE] dumped %08X (%s...)\n", j->addr, dump);
     }
 fail:
@@ -1111,8 +1127,8 @@ int bw_tr_pump(ID3D11Device *dev, ID3D11DeviceContext *ctx)
     t0 = now_ms();
     for (;;) {
         TrJob *j;
-        if (n && now_ms() - t0 >= budget)
-            break;                          /* the rest next frame */
+        if (n && now_ms() - t0 >= budget && !BW_GFXCAP_PINNED())
+            break;                          /* the rest next frame (BW_GFXCAP: all of them now) */
         EnterCriticalSection(&s_cs);
         j = q_pop(&s_done, &s_done_tail);
         LeaveCriticalSection(&s_cs);

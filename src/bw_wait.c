@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "bw_wait.h"
+#include "gpu/core/bwg_latch.h"   /* I1 (lane gfx-regen): the idle point's front-buffer rule */
+
+extern void (*bwg_latch_wake_fn)(void);
 
 extern volatile LONG g_bw_kickoffs;   /* KickOffs, for BW_KICKOFF_STATS */
 
@@ -52,6 +55,15 @@ void bw_ack_kick(void)
         SetEvent(s_ack_wake);
 }
 
+/* I1 (lane gfx-regen): a lock on a game thread wakes a napping graphics
+ * thread (the loading screen's progress bar; the forced read), without
+ * counting as a KickOff. */
+static void bw_ack_wake(void)
+{
+    if (s_ack_wake)
+        SetEvent(s_ack_wake);
+}
+
 void bw_ack_idle(int worked)
 {
     static int mode = -1;
@@ -59,6 +71,10 @@ void bw_ack_idle(int worked)
     static LONGLONG idle_ticks, nap_100ns, last_work;
     LARGE_INTEGER now, due;
     HANDLE h[2];
+
+    /* I1: the front-buffer rule and the forced reads, on this thread (it runs
+     * the executor and the back end); a test of two counters when idle */
+    bwg_latch_idle();
 
     if (mode < 0) {
         const char *e = getenv("BW_ACK_NAP");
@@ -76,6 +92,8 @@ void bw_ack_idle(int worked)
                                            TIMER_ALL_ACCESS);
             if (!s_ack_wake || !timer)
                 mode = 0;
+            else
+                bwg_latch_wake_fn = bw_ack_wake;
         }
     }
     if (!mode) {

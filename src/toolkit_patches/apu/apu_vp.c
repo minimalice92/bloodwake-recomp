@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "bw_vp_fast.h"   /* Blood Wake (au-vp): the HRTF and the sinc resampler, faster, the same bits */
 #include "apu.h"
 #include "fpconv.h"
 #include <process.h>
@@ -2451,17 +2452,7 @@ done:
 #define M_PI 3.14159265358979323846
 #endif
 
-#define BW_SINC_ZC 8                   /* zero crossings a side at full band */
-#define BW_SINC_RES 512                 /* table points per zero crossing */
-#define BW_SINC_MAXHALF 32              /* taps a side at the narrowest */
-#define BW_SINC_HIST 256
-
-typedef struct {
-    int have;
-    int n;                              /* samples in hist */
-    double pos;                         /* next output, in source samples from hist[0] */
-    float hist[BW_SINC_HIST][2];
-} BwSinc;
+/* BW_SINC_*, BwSinc, the table and the output loop: bw_vp_fast.h (au-vp) */
 static BwSinc *s_bw_sinc;               /* one per voice, allocated on first use */
 static float s_bw_sinc_tab[BW_SINC_ZC * BW_SINC_RES + 2];
 
@@ -2475,26 +2466,7 @@ static int bw_sinc_on(void)
         else
             on = bw_fix_enabled(BW_FIX_AUDIO_SINC_RESAMPLE);
         if (on) {
-            int i, k;
-            double beta = 8.0, i0b = 1.0, t = 1.0;
-            for (k = 1; k < 50; k++) {           /* I0(beta) by its series */
-                t *= (beta / 2.0 / k) * (beta / 2.0 / k);
-                i0b += t;
-            }
-            for (i = 0; i <= BW_SINC_ZC * BW_SINC_RES + 1; i++) {
-                double x = (double)i / BW_SINC_RES, r = x / BW_SINC_ZC, a, w, s, term;
-                if (r >= 1.0) {
-                    s_bw_sinc_tab[i] = 0.0f;
-                    continue;
-                }
-                a = beta * sqrt(1.0 - r * r);
-                for (k = 1, w = 1.0, term = 1.0; k < 50; k++) {
-                    term *= (a / 2.0 / k) * (a / 2.0 / k);
-                    w += term;
-                }
-                s = x == 0.0 ? 1.0 : sin(M_PI * x) / (M_PI * x);
-                s_bw_sinc_tab[i] = (float)(s * w / i0b);
-            }
+            bw_sinc_build_table(s_bw_sinc_tab);   /* bw_vp_fast.h (moved there unchanged) */
             s_bw_sinc = (BwSinc *)calloc(MCPX_HW_MAX_VOICES, sizeof(BwSinc));
             if (!s_bw_sinc)
                 on = 0;
@@ -2511,22 +2483,27 @@ static void bw_sinc_reset(uint16_t v)
         s_bw_sinc[v].have = 0;
 }
 
-static inline float bw_sinc_k(double x)  /* x >= 0, in zero crossings */
-{
-    double fi = x * BW_SINC_RES;
-    int i = (int)fi;
-    float f = (float)(fi - i);
-    if (i >= BW_SINC_ZC * BW_SINC_RES)
-        return 0.0f;
-    return s_bw_sinc_tab[i] + f * (s_bw_sinc_tab[i + 1] - s_bw_sinc_tab[i]);
-}
+/* au-vp (docs/audio/vp.md): the switches, read once with au-hot's (bw_hrtf_ftz)
+ *   BW_APU_VP_FAST=0     both fast paths off (the scalar ones, as before)
+ *   BW_APU_HRTF_FAST=0   the toolkit's HRTF filter (hrtf_filter_process)
+ *   BW_APU_SINC_SIMD=0   the sinc resampler's scalar loop
+ *   BW_APU_VP_PROOF=1    test aid: the scalar paths beside the fast ones on the
+ *                        same state, outputs and state compared bit for bit,
+ *                        and the bins against the shadow bins mixed from the
+ *                        scalar HRTF's output, as floats and as the DSP's
+ *                        24-bit words ([APU-VP-PROOF] every 5 s) */
+static int s_hf_fast = 1, s_sinc_simd = 1, s_vp_proof;
+static struct {
+    unsigned long long hcalls, hdiff_out, hdiff_state, hfixed, hgather, scalls, sout, sdiff, frames;
+    int shown;
+} s_vpp;
 
 static int voice_resample_sinc(MCPXAPUState *d, uint16_t v, float samples[][2],
                                int requested_num, float rate)
 {
     BwSinc *s = &s_bw_sinc[v];
     double step, fc, half, last;
-    int need, got = 0, out, lo, hi, j, keep;
+    int need, got = 0, out, keep;
 
     if (!(rate > 0.0f)) rate = 1.0f;
     step = 1.0 / rate;
@@ -2558,29 +2535,34 @@ static int voice_resample_sinc(MCPXAPUState *d, uint16_t v, float samples[][2],
         s->n += got;
     }
 
-    for (out = 0; out < requested_num; out++) {
-        double p = s->pos;
-        float acc0 = 0.0f, acc1 = 0.0f, wsum = 0.0f;
-        lo = (int)ceil(p - half);
-        hi = (int)floor(p + half);
-        if (hi >= s->n)
-            break;                       /* the source isn't there yet */
-        if (lo < 0) lo = 0;
-        if (g_bw_hot)
-            s_hot_taps += hi - lo + 1;   /* au-hot */
-        for (j = lo; j <= hi; j++) {
-            float w = bw_sinc_k(fabs(p - j) * fc);
-            acc0 += w * s->hist[j][0];
-            acc1 += w * s->hist[j][1];
-            wsum += w;
-        }
-        if (wsum != 0.0f) {
-            samples[out][0] = acc0 / wsum;
-            samples[out][1] = acc1 / wsum;
+    {
+        /* the outputs (bw_vp_fast.h): the scalar loop as it always was, or 4
+         * outputs at a time in SSE lanes, the same bits (au-vp) */
+        int *taps = g_bw_hot ? &s_hot_taps : NULL;   /* au-hot */
+        if (s_vp_proof > 0) {
+            float ref[32][2];
+            double p0 = s->pos, pref;
+            int tr = 0, tf = 0, nr;
+            nr = bw_sinc_out_scalar(s, ref, requested_num, step, fc, half, s_bw_sinc_tab, &tr);
+            pref = s->pos;
+            s->pos = p0;
+            out = s_sinc_simd ? bw_sinc_out_simd(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, &tf)
+                              : bw_sinc_out_scalar(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, &tf);
+            if (taps)
+                *taps += tf;
+            s_vpp.scalls++;
+            s_vpp.sout += (unsigned long long)nr;
+            if (nr != out || tr != tf || memcmp(&pref, &s->pos, sizeof pref) ||
+                memcmp(ref, samples, sizeof(float) * 2 * (size_t)nr)) {
+                s_vpp.sdiff++;
+                if (s_vpp.shown++ < 20)
+                    fprintf(stderr, "[APU-VP-PROOF] DIFFERS: the sinc, voice %u: %d / %d outputs, taps %d / %d,"
+                                    " pos %.17g / %.17g\n", (unsigned)v, nr, out, tr, tf, pref, s->pos);
+            }
         } else {
-            samples[out][0] = samples[out][1] = 0.0f;
+            out = s_sinc_simd ? bw_sinc_out_simd(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, taps)
+                              : bw_sinc_out_scalar(s, samples, requested_num, step, fc, half, s_bw_sinc_tab, taps);
         }
-        s->pos += step;
     }
 
     /* drop what no later output can reach */
@@ -2650,6 +2632,24 @@ static int bw_hrtf_ftz(void)
         const char *pr = getenv("BW_APU_HRTF_PROOF");
         s_hrtf_ftz = !(e && e[0] == '0');
         s_hrtf_proof = pr && (pr[0] == '1' || pr[0] == '2') ? pr[0] - '0' : 0;
+        {
+            /* au-vp: the fast paths, on in every edition (bit-identical);
+             * the proof aid takes au-hot's shadow bins (one proof at a time) */
+            const char *fa = getenv("BW_APU_VP_FAST"), *fh = getenv("BW_APU_HRTF_FAST");
+            const char *fs = getenv("BW_APU_SINC_SIMD"), *fp = getenv("BW_APU_VP_PROOF");
+            int all = !(fa && fa[0] == '0');
+            s_hf_fast = all && !(fh && fh[0] == '0');
+            s_sinc_simd = all && !(fs && fs[0] == '0');
+            s_vp_proof = fp && fp[0] == '1';
+            if (s_vp_proof)
+                s_hrtf_proof = 0;
+            fprintf(stderr, "[APU] BW voice processor (au-vp): the HRTF filter %s; the sinc resampler's outputs %s%s\n",
+                    s_hf_fast ? "4 samples at a time with a straight history (BW_APU_HRTF_FAST=0: the toolkit's)"
+                              : "the toolkit's (BW_APU_HRTF_FAST=0)",
+                    s_sinc_simd ? "4 at a time (BW_APU_SINC_SIMD=0: one at a time)" : "one at a time",
+                    s_vp_proof ? "; BW_APU_VP_PROOF: the scalar paths beside them, compared bit for bit, and the"
+                                 " bins against the scalar HRTF's" : "");
+        }
         fprintf(stderr, "[APU] BW HRTF filter: %s (BW_APU_HRTF_FTZ)%s\n",
                 s_hrtf_ftz ? "flush-to-zero around it, so no denormal stalls (au-hot; the bins unchanged)"
                            : "the exact float path, denormal stalls and all",
@@ -2671,6 +2671,66 @@ static int bw_f32_bits_eq(const float *a, const float *b, size_t n)
  * code: stmxcsr, ldmxcsr, the filter's call, ldmxcsr; no x87 anywhere in
  * the VP, seen with dumpbin). */
 #pragma fenv_access (on)
+/* au-vp: the filter that runs (the fast one unless BW_APU_HRTF_FAST=0) */
+static void bw_hrtf_call(HrtfFilter *f, float samples[][2])
+{
+    if (s_hf_fast)
+        bw_hrtf_fast(f, samples, samples, NULL);
+    else
+        hrtf_filter_process(f, samples, samples);
+}
+
+/* au-vp's proof (BW_APU_VP_PROOF=1): one snapshot of the voice's filter (its
+ * targets frozen, call AH-5), the toolkit's filter on a copy of it and of the
+ * input, the filter that runs on the snapshot, both in the frame's mode
+ * (au-hot's flush-to-zero unless BW_APU_HRTF_FTZ=0); outputs and the whole
+ * state compared bit for bit; the snapshot's moving parts back into the
+ * voice; the toolkit's output to the shadow bins. */
+static __declspec(noinline) void bw_hrtf_vp_proof(HrtfFilter *f, int v, float samples[][2])
+{
+    static HrtfFilter snap, ref;
+    float refio[NUM_SAMPLES_PER_FRAME][2];
+    BwHfInfo info = { 0, 0 };
+    unsigned m = _mm_getcsr();
+    snap = *f;
+    ref = snap;
+    memcpy(refio, samples, sizeof refio);
+    if (s_hrtf_ftz)
+        _mm_setcsr(m | 0x8040);
+    hrtf_filter_process(&ref, refio, refio);
+    if (s_hf_fast)
+        bw_hrtf_fast(&snap, samples, samples, &info);
+    else
+        hrtf_filter_process(&snap, samples, samples);   /* the control: the toolkit's against itself */
+    _mm_setcsr(m);
+    s_vpp.hcalls++;
+    s_vpp.hfixed += info.fixed;
+    s_vpp.hgather += (unsigned long long)info.gather_blocks;
+    if (memcmp(refio, samples, sizeof refio)) {
+        s_vpp.hdiff_out++;
+        if (s_vpp.shown++ < 20)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                for (int c = 0; c < 2; c++)
+                    if (memcmp(&refio[i][c], &samples[i][c], 4)) {
+                        fprintf(stderr, "[APU-VP-PROOF] DIFFERS: the HRTF, voice %d sample %d ear %d: %.9g against"
+                                        " the toolkit's %.9g (fixed %d)\n", v, i, c, (double)samples[i][c],
+                                (double)refio[i][c], info.fixed);
+                        i = NUM_SAMPLES_PER_FRAME;
+                        break;
+                    }
+    }
+    if (memcmp(&ref, &snap, sizeof ref))
+        s_vpp.hdiff_state++;
+    f->buf_pos = snap.buf_pos;
+    f->itd_cur = snap.itd_cur;
+    for (int c = 0; c < 2; c++) {
+        memcpy(f->ch[c].buf, snap.ch[c].buf, sizeof f->ch[c].buf);
+        memcpy(f->ch[c].hrir_coeff_cur, snap.ch[c].hrir_coeff_cur, sizeof f->ch[c].hrir_coeff_cur);
+    }
+    memcpy(s_hp_out, refio, sizeof s_hp_out);
+    s_hp_cur = 1;
+}
+
 static __declspec(noinline) void bw_hrtf_run(HrtfFilter *f, int v, float samples[][2])
 {
     float in[NUM_SAMPLES_PER_FRAME][2];
@@ -2697,13 +2757,17 @@ static __declspec(noinline) void bw_hrtf_run(HrtfFilter *f, int v, float samples
             memcpy(s->ch[c].hrir_coeff_tar, run->ch[c].hrir_coeff_tar, sizeof s->ch[c].hrir_coeff_tar);
         }
     }
+    if (s_vp_proof > 0) {
+        bw_hrtf_vp_proof(f, v, samples);   /* au-vp: the fast filter against the toolkit's */
+        return;
+    }
     if (s_hrtf_ftz) {
         unsigned m = _mm_getcsr();
         _mm_setcsr(m | 0x8040);          /* FTZ (bit 15) and DAZ (bit 6) */
-        hrtf_filter_process(run, samples, samples);
+        bw_hrtf_call(run, samples);
         _mm_setcsr(m);
     } else {
-        hrtf_filter_process(run, samples, samples);
+        bw_hrtf_call(run, samples);
     }
     if (run != f) {
         /* the snapshot's moving parts back into the voice's filter (its
@@ -2718,7 +2782,7 @@ static __declspec(noinline) void bw_hrtf_run(HrtfFilter *f, int v, float samples
     }
     if (s_hrtf_proof > 0) {
         int nd = 0;
-        hrtf_filter_process(&s_hp_f[v], in, s_hp_out);   /* the exact path, the default mode */
+        hrtf_filter_process(&s_hp_f[v], in, s_hp_out);   /* the exact path, the default mode (the toolkit's) */
         double mx = 0.0;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
             for (int c = 0; c < 2; c++)
@@ -2784,7 +2848,14 @@ static void bw_hrtf_proof_end(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SA
                 }
             }
         }
-    if (++s_hp.frames % 7500 == 0)
+    if (s_vp_proof > 0 && (s_hp.frames + 1) % 7500 == 0)
+        fprintf(stderr, "[APU-VP-PROOF] %llu frames: the HRTF %llu runs (%llu at the fixed point, %llu blocks"
+                        " gathered), %llu with an output not bit-identical, %llu with a state not; the sinc %llu calls,"
+                        " %llu outputs, %llu not bit-identical; the bins %llu samples, %llu differ as the DSP's 24-bit"
+                        " words, %llu as floats%s\n", s_hp.frames + 1, s_vpp.hcalls, s_vpp.hfixed, s_vpp.hgather,
+                s_vpp.hdiff_out, s_vpp.hdiff_state, s_vpp.scalls, s_vpp.sout, s_vpp.sdiff, s_hp.bins, s_hp.bins24,
+                s_hp.binsf, s_hf_fast || s_sinc_simd ? "" : " (both fast paths off: the control)");
+    if (++s_hp.frames % 7500 == 0 && s_hrtf_proof > 0)
         fprintf(stderr, "[APU-HRTF-PROOF] %llu frames: %llu bin samples compared, %llu differ as the DSP's 24-bit"
                         " words, %llu as floats (the largest %.3g); %llu filter runs, %llu with an output not"
                         " bit-identical (%llu samples); multipass reads %llu (%llu of a shadow bin that differed)%s\n",
@@ -2883,7 +2954,7 @@ static void voice_process(MCPXAPUState *d,
             if (pk > s_bw_mp_peak) s_bw_mp_peak = pk;
             s_bw_mp_lpf[v] = 1;
         }
-        if (s_hrtf_proof > 0) {
+        if (s_hrtf_proof > 0 || s_vp_proof > 0) {
             /* au-hot's proof: a multipass voice reads a bin; the shadow's would
              * have to be the same for the proof to cover what follows */
             s_hp.mp_reads++;
@@ -2892,7 +2963,7 @@ static void voice_process(MCPXAPUState *d,
         }
         if (clear_mix) {
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
-            if (s_hrtf_proof > 0)
+            if (s_hrtf_proof > 0 || s_vp_proof > 0)
                 memset(&s_hp_bins[mp_bin][0], 0, sizeof(s_hp_bins[0]));
         }
     } else {
@@ -3199,7 +3270,7 @@ static void voice_process(MCPXAPUState *d,
              * (room-filtered) signal, not an ear */
             float x = (bw_room_ok && b >= 4) ? bw_room[i] : samples[i][ch];
             mixbins[bin[b]][i] += (g0 + step * (i + 1)) * x;
-            if (s_hrtf_proof > 0) {
+            if (s_hrtf_proof > 0 || s_vp_proof > 0) {
                 /* au-hot's proof: the same mix from the exact path's output */
                 float xe = (bw_room_ok && b >= 4) ? bw_room[i] : s_hp_cur ? s_hp_out[i][ch] : samples[i][ch];
                 s_hp_bins[bin[b]][i] += (g0 + step * (i + 1)) * xe;
@@ -3302,7 +3373,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     bw_audit_frame();                    /* Blood Wake: BW_APU_AUDIT */
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
     bw_hrtf_ftz();                       /* au-hot: the switches, read once */
-    if (s_hrtf_proof > 0)
+    if (s_hrtf_proof > 0 || s_vp_proof > 0)
         bw_hrtf_proof_begin(mixbins);
 
     for (int list = 0; list < 3; list++) {
@@ -3353,8 +3424,8 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
     bwd3_orphan_check(d, bwd3_reached);
-    if (s_hrtf_proof > 0)
-        bw_hrtf_proof_end(d, mixbins);   /* au-hot: the bins against the exact path's */
+    if (s_hrtf_proof > 0 || s_vp_proof > 0)
+        bw_hrtf_proof_end(d, mixbins);   /* au-hot: the bins against the exact path's (au-vp: the scalar's) */
     bw_audit_bins(mixbins);              /* Blood Wake: BW_APU_AUDIT */
     if (g_bw_hot) {
         int n = 0;                       /* au-hot: denormals in the bins */

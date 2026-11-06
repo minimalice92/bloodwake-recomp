@@ -10,12 +10,12 @@
 *Full speed into the sunset. Remastered at 4K with every setting maxed: the original art, nothing redrawn or replaced.*
 
 > [!TIP]
-> **New in 0.3.0, the sound release:** the Xbox sound chip's effects programs now run as native code, word for word the same output, and the sound reaches Windows through a new low-latency path: a shot reaches your ears 46 ms sooner in Original and 36 ms sooner in Remastered, with no gaps, and Discord keeps working. A rare crackle in busy battles is fixed at its cause. In Remastered, particles, trails and the HUD now behave exactly as on the Xbox at any frame rate. Original still plays step for step as it shipped. [Read the release notes](https://github.com/minimalice92/bloodwake-recomp/releases/latest).
+> **New in 0.3.1, native graphics:** all of the Xbox graphics chip's drawing now runs on your graphics card in both editions, within about 25 pixels in a million of 0.3.0's pictures, each a shade or a few lighter or darker, and the loading screen shows its picture and moving bar again. In Remastered, each frame is about 11 ms fresher when the graphics card finishes it, and the sound plays at the game's own level, with nothing squashed (about 4 dB quieter than 0.3.0: turn it up a notch). A new High Priority Mode asks Windows not to slow the game down to save power. Original still plays step for step as it shipped. [Read the release notes](https://github.com/minimalice92/bloodwake-recomp/releases/latest).
 
 > [!NOTE]
 > Unofficial, free and non-commercial. You need your own Blood Wake disc, and nothing from the game is in this repository. See [Staying safe](#staying-safe).
 
-<img src="docs/images/stats.svg" width="600" alt="100%: recompiled, 0 functions failed, the whole game plays. 8,110 functions named. About 3 days from the first plan to the first release. 80+ AI agents. 0 crashes in 948 mission runs of soak tests. 17 bugs from 2001 fixed in Remastered.">
+<img src="docs/images/stats.svg" width="600" alt="100%: recompiled, 0 functions failed, the whole game plays. 8,110 functions named. About 3 days from the first plan to the first release. 80+ AI agents. 0 crashes in 948 mission runs of soak tests. 18 bugs from 2001 fixed in Remastered.">
 
 ## Features and Showcase
 One program, two editions, picked in the launcher.
@@ -24,6 +24,7 @@ One program, two editions, picked in the launcher.
 - **Every mission and mode:** Story Mode's 28 missions, Battle Mode, and couch split screen for 2 to 4 players.
 - **Exactly as shipped in 2001:** the 4:3 picture, 30 frames a second, its quirks and its bugs. Only problems the port itself would cause are fixed.
 - **The console's own pace and sound:** the game runs on the console's 59.94 Hz clock, and the Xbox sound chip's own echo and 3D-sound programs run as on the console, now translated to native code as the game starts: the same output word for word, checked over 15.4 million frames side by side with the emulator.
+- **Drawn by your graphics card:** every piece of the graphics chip's drawing runs natively, within about 25 pixels in a million of the processor's path (nearly all of them sky, by one shade of 256), and the loading screen shows its picture and moving bar, as on the console.
 - **Its own saves**, kept apart from Remastered's.
 - **Proven unchanged:** every merge is replayed against the previous build with the same random seed and compared step by step, for example 2,990 of 2,990 steps identical.
 
@@ -49,6 +50,7 @@ The original art and sound, never replaced. Every change has its own switch.
 - Up to 290 fps at 3440×1440 and 229 at 4K, with the game still ticking 30 times a second: the same speed, far smoother.
 - Four-player split screen at full detail: 113 fps.
 - Every frame shown: 281 a second in Battle Mode on a 360 Hz variable-refresh screen, none dropped.
+- Fresher frames: each frame is started just in time for the graphics card instead of waiting in a queue, so a press reaches the frame presented in 42 ms (47 in 0.3.0) and the graphics card finishes each frame about 11 ms sooner. It costs some frame rate, depending on the scene: in mission 1 on our test PC, about 5% fewer frames firing from a standstill (193 against 203 a second) and about 20% fewer steering through the course (172 against 220). The cost comes from the mode leaving the graphics card idle between frames: with it off, 0.3.1 draws as fast as 0.3.0. For the most frames instead of the freshest, set `BW_HIFPS_LATMODE=0` on the launcher's Advanced tab. The frame rates above were measured before this mode.
 
 <img src="docs/images/fps.svg" width="600" alt="Frames per second, Remastered defaults at 3440×1440: Battle Mode 290, story mission 27 262, story mission 1 at 4K 229, 2-player split screen 214, story mission 1 205, story mission 3 175, 4-player split screen 113. The original runs at 30.">
 
@@ -56,15 +58,15 @@ The original art and sound, never replaced. Every change has its own switch.
 *Rockets over the Tombstones: Battle Mode in widescreen.*
 
 **Sounds**
-- Cleaner pitch changes, a louder mix with a limiter, the game's own surround mix on 5.1 and 7.1.
-- Low latency: a shot reaches your ears 89 ms after you press fire (126 in 0.2.5), through Windows' own audio engine, so Discord and other apps keep their sound.
+- Cleaner pitch changes and the game's own surround mix on 5.1 and 7.1, at the game's own level: no boost, nothing squashed or ducked.
+- Low latency: a shot reaches your ears 91 ms after you press fire (126 in 0.2.5), through Windows' own audio engine, so Discord and other apps keep their sound.
 - Sound that survives: unplug the headphones, switch the output or let the monitor's HDMI audio drop out, and the sound comes back by itself.
 
 **Moves like the Xbox at any frame rate**
 - Spray, trails, bolts and effect scripts advance once per game step, bit for bit as the original does, and the reticle and markers glide between steps.
 
 **Fixes**
-- 17 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, a dark line on the distant night sea, and more.
+- 18 bugs from 2001 fixed, each switchable: a mission that could never be won, sounds and radio calls that never played, AI rules that never matched, two textures that never shipped, a dark line on the distant night sea, and more.
 
 ![The final storm: lightning, rain, green energy arcs and an enemy ship lit by an explosion, with a radio subtitle](docs/images/shot-lightning.jpg)
 *The final storm: lightning, rain and the green arcs of the legendary shield.*
@@ -148,18 +150,20 @@ The engineering was done by Claude, Anthropic's AI model: a lead session plus **
 - **Early 28 Oct:** the installer, this repository and release v0.1.0.
 - **3 Nov:** 0.2.5, the stable base: a one-day run of ten lanes and more than 100 items, each checked by a release gate. Eight release candidates were tested and the bugs found on the way were fixed, every judgement call logged with a one-line undo.
 - **5 Nov:** 0.3.0, the sound release: the sound chip's programs as native code, a new sound output, and the high frame rate made exact, through six release candidates and the same gate.
+- **6 Nov:** 0.3.1, native graphics: the last of the graphics chip's work moved to the graphics card in both editions, the loading screen back, fresher frames in Remastered and the sound at the game's own level, through the same gate.
 
 ### Proof, not promises
 - **Original stays exactly as shipped.** Every merge is replayed against the previous build with the same random seed and compared step by step. A build made the public way, from the disc and without the private names file, matches the workshop build for 3,867 of 3,867 steps in each edition.
 - **The translation is deterministic.** Six runs gave six identical sets of generated C, and every player's build is checked against the published fingerprints of it.
 - **The sound chip, translated word for word.** Its effects programs run as native code made as the game starts. 40 recordings of real play (835,360 runs) replay identically through both, and three hours of Original ran the old and the new side by side: 15.4 million frames, 0 differences.
+- **The graphics, native and measured.** 26 recorded scenes replay pixel for pixel through the processor's old path, and with the native pieces on they differ from it on 22-25 pixels in a million, almost all by one shade of 256, each counted per scene and region.
 - **The water, rewritten bit for bit.** The functions that build the sea's surface each frame are re-translated at build time into plain native code doing the same operations in the same order. 2,627,309 batches compared with the game's own code: 0 differences. Four-player split screen went from 66 to 113 fps.
-- **Stable.** 0 crashes in 948 mission runs of soak tests; a later soak of every mission, both battles and Blood Ball: 0 crashes, 0 freezes. For 0.2.5: 3 hours of play per edition, both story campaigns to the end, 219 starts in a row, and sound kept through 68 forced audio-device failures, with no crash or freeze. For 0.3.0: 3 hours of play per edition at once, both story campaigns to the end, battles and split screen, 403 starts: 0 crashes, 0 freezes, 0 sound gaps.
+- **Stable.** 0 crashes in 948 mission runs of soak tests; a later soak of every mission, both battles and Blood Ball: 0 crashes, 0 freezes. For 0.2.5: 3 hours of play per edition, both story campaigns to the end, 219 starts in a row, and sound kept through 68 forced audio-device failures, with no crash or freeze. For 0.3.0: 3 hours of play per edition at once, both story campaigns to the end, battles and split screen, 403 starts: 0 crashes, 0 freezes, 0 sound gaps. For 0.3.1, the same 3 hours: 412 starts, 0 crashes, 0 freezes, 0 sound gaps.
 - **Played through.** An autopilot won 24 of the 28 story missions, the final one included, with no port problem in about 37 attempts. The other four need skills the autopilot doesn't have yet.
 - **69 toolkit issues found and fixed here.** From 8- and 16-bit multiplies translated as 32-bit ones, to point sprites, fog and polygon offset never drawn, to a 60.00 Hz vertical blank where NTSC runs at 59.94. The fixes are carried in this project (`src/toolkit_patches/`, `tools/xbr_patches.py`), with the toolkit itself untouched at its pinned version. They will be offered to xboxrecomp with neutral repros containing nothing from any game; none has been submitted yet.
 - **Every function named: 8,110.** Each name proposed with evidence from the code, and 6,149 re-checked independently (6,109 confirmed as they stood). Ten functions that deal with the console's security were left alone on purpose.
 - **The file formats, decoded.** Models, boats and weapons, missions, effects, fonts, menus, sound and textures: specced, checked against every archive on the disc, then verified blind.
-- **Bugs explained before they're fixed.** Each of the 17 fixes was traced in the code first. The hardest and strangest: a faint dark line on the distant sea at night, where folded waves got the sky reflection blended twice. Remastered now draws it once; Original keeps it, as the console very likely showed it.
+- **Bugs explained before they're fixed.** Each of the 18 fixes was traced in the code first. The hardest and strangest: a faint dark line on the distant sea at night, where folded waves got the sky reflection blended twice. Remastered now draws it once; Original keeps it, as the console very likely showed it.
 - **Data, not guesswork.** The project works from captured data (logs, traces, frame dumps, step-by-step comparisons), never from memory or feel, and labels every finding seen, inferred or unknown.
 
 ## The Roadmap

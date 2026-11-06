@@ -49,20 +49,36 @@ extern int bw_ab_off(const char *fix);      /* BW_GPU_AB (bw_ab.c) */
 extern void bw_ab_frame(uint32_t n);
 #include "d3d/d3d8_swizzle.h"   /* xbox_unswizzle_rect */
 #include "toolkit_patches/kernel/bw_backend_ext.h"
-#include "bw_vfx.h"              /* VFX (D9): Remastered visual suite; inert in Original */
-#include "bw_texrestore.h"       /* T1 (VFX_TEX_RESTORE): texture restoration; inert in Original */
+#include "bw_vfx_d3d11.h"        /* VFX (D9): Remastered visual suite; inert in Original */
+#include "bw_texrestore_d3d11.h" /* T1 (VFX_TEX_RESTORE): texture restoration; inert in Original */
 #include "bw_pscache.h"          /* T1: persistent pixel-shader cache (every edition) */
 #include "bw_gpu_failtest.h"     /* 0.2.5 item 25: BW_GPU_FAILTEST, BW_GPU_DEBUG (test aids) */
 #include "bw_hdr.h"              /* 0.2.5 item 97: a screen in HDR mode, every edition */
 #include "../bw_widescreen.h"       /* Remastered widescreen (D-015/D-016) */
 #include "../bw_edition.h"          /* bw_edition_add_summary */
+#include "bw_gfxcap.h"             /* BW_GFXCAP: frame capture and replay (test aid, lane gfx-cap) */
+#include "core/bwg_core.h"         /* the API-neutral core (docs/gfx/arch.md 3.2, lane gfx-core) */
+#include "core/bwg_pace.h"
+#include "core/bwg_gate.h"         /* the latency mode's shared parts (lane gfx-lat11) */
+#include "core/bwg_state.h"
+#include "core/bwg_surf.h"
+#include "core/bwg_tex.h"
+#include "core/bwg_draw.h"
+#include "bw_gfxcls.h"             /* BW_GFXCAP_CLASSES: the replay's region masks (test aid, lane gfx-capef) */
+#include "core/bwg_ideas.h"        /* the adopted ideas I2, I3, I5 (arch.md 3.14, lane gfx-ideas) */
+#include "bw_edgeprobe.h"          /* BW_GPU_EDGEPROBE: the edge-pixel residual's probe (test aid, lane gfx-ideas) */
+#include "core/bwg_latch.h"        /* I1, the CPU-write latch (lane gfx-regen) */
+#include "bw_vshpre.h"             /* the game's vertex programs compiled at load time (lane gfx-regen) */
+extern unsigned g_bw_ctx_epoch;    /* I3 (BW_GPU_DELTA): defined with its shadow, below */
 
 extern ptrdiff_t g_xbox_mem_offset;
 extern void xbox_FramebufferWindowSet(uint32_t va, uint32_t pitch);
 extern void xbox_FramebufferWindowPresent(uint32_t va, uint32_t pitch);
 extern uint32_t xbox_ContiguousBlockSize(uint32_t va);
 
-#define GUEST(va) ((uint8_t *)((uintptr_t)(va) + g_xbox_mem_offset))
+#define GUEST(va) BWG_GUEST(va)
+
+/* (The guest block at va: bwg_block_size, the core's.) */
 
 /* ---- device and pipeline ------------------------------------------------ */
 
@@ -74,15 +90,8 @@ static ID3D11InputLayout *s_layout;
 static ID3D11Buffer *s_cb, *s_vb;
 static UINT s_vb_bytes;
 static int s_failed;
-static float s_ws_k = 1.0f;     /* bw_ws_k() for this boot, read once (bw_d3d11_ws_start) */
 
-typedef struct {
-    float surf[4];      /* W, H, 1/W, 1/H */
-    float tex[4];       /* 1/tw, 1/th, textured, - */
-    float alpha[4];     /* func (0..7), ref 0..1, enabled, - */
-    float depth[4];     /* zmin, 1/(zmax - zmin), - , - */
-    float wsx[4];       /* widescreen x remap (BW_WS shaders only): a, b, -, - */
-} BwConsts;
+/* (BwConsts, the screen-space path's constants: bwg_draw.h.) */
 
 static const char s_hlsl[] =
 "cbuffer C : register(b0) { float4 surf; float4 texinfo; float4 alpha; float4 depth;\n"
@@ -122,58 +131,14 @@ BW_WS_REMAP_HLSL
 
 /* ---- surfaces ----------------------------------------------------------- */
 
-#define BW_MAX_SURF 32
-typedef struct {
-    uint32_t va, pitch, bpp, w, h;
-    uint32_t cur_pitch;         /* the pitch of the latest binding */
-    int clamped;                /* readback hit the end of the guest block (logged once) */
-    ID3D11Texture2D *tex;
-    ID3D11RenderTargetView *rtv;
-    ID3D11ShaderResourceView *srv;
-    int dirty;
-    /* VFX (D9): the physical size (w, h above stay the guest's logical size,
-     * which every shader constant and vertex keeps using), the render-scale
-     * epoch it was made for, and the multisampled target drawn into when
-     * MSAA is on (tex/srv are then its resolved copy). Original: pw = w,
-     * ph = h, no mtex. */
-    uint32_t pw, ph, aa_x, aa_y;
-    unsigned epoch;
-    /* Widescreen (D5): pw is this many times wider than the render scale
-     * alone makes it (the device's full-screen targets in a widescreen boot;
-     * surf_physical_size). 1 otherwise, and always in Original. */
-    float wsk;
-    ID3D11Texture2D *mtex;
-    ID3D11RenderTargetView *mrtv;
-    int mdirty;                 /* drawn since the last resolve */
-    uint8_t aa_sx;              /* the latest binding's horizontal AA factor (gpu_present) */
-    /* 0.2.5 item 36: the frame of the last failed (re)create, so a target
-     * the device can't make is tried once a frame, not once a draw; and the
-     * render-scale epoch (+1) at which its MSAA target couldn't be made (it
-     * and its depth buffer are then single-sample; 0: no such failure). */
-    uint32_t fail_gen;
-    unsigned noaa_epoch;
-    uint32_t used_gen;          /* item 37: the frame it was last drawn into or sampled (a full table reuses the oldest) */
-} BwSurf;
-
-typedef struct {
-    uint32_t va, w, h;          /* physical size (VFX: the render-scaled size) */
-    ID3D11Texture2D *tex;
-    ID3D11DepthStencilView *dsv;
-    unsigned epoch;             /* VFX (D9) */
-    ID3D11ShaderResourceView *srv;   /* VFX (D9): the depth as a texture (AO only); NULL otherwise */
-    UINT samples;               /* 0.2.5 item 36: its sample count (the colour target's; 1 in Original) */
-    uint32_t used_gen;          /* item 37: the frame it was last drawn with */
-} BwDepth;
-
-/* VFX (D9): a draw into a surface; the MSAA copy then needs a resolve. */
-#define SURF_DRAWN(sf) ((sf)->dirty = 1, (sf)->mdirty = 1)
-
-static BwSurf s_surf[BW_MAX_SURF];
-static int s_nsurf;
-static BwDepth s_depth[BW_MAX_SURF];
-static int s_ndepth;
-static BwSurf *s_cur;           /* bound colour surface */
-static BwDepth *s_cur_depth;
+/* The guest surfaces and depth buffers are the core's (bwg_surf.c); their
+ * D3D11 objects are these back end's (BwgSurf's and BwgDepth's tex, rtv,
+ * srv, mtex, mrtv and tex, dsv, srv). */
+typedef BwgSurf BwSurf;
+static void latch_init(void);           /* I1 (lane gfx-regen), below the flip */
+static void vshpre_known_ffp(void);     /* the load-time compile's fixed-function shapes, below get_ffp */
+static int s_rb_force_sync;             /* I1's forced read: a waiting readback whatever the mode */
+typedef BwgDepth BwDepth;
 static ID3D11Texture2D *s_staging;
 static uint32_t s_staging_w, s_staging_h, s_staging_bpp;
 
@@ -187,7 +152,6 @@ enum { RF_SURFACE, RF_SURF_VIEW, RF_MSAA, RF_SEED, RF_DEPTH, RF_DEPTH_VIEW, RF_D
        RF_TEXTURE, RF_TEX_VIEW, RF_SCENE, RF_N };
 static unsigned s_rfail[RF_N];
 static unsigned s_rfail_any;
-static unsigned s_surf_reused, s_depth_reused;     /* item 37: slots reused (surf_slot, depth_slot) */
 
 static void res_failed(int kind, uint32_t va, uint32_t w, uint32_t h, HRESULT hr)
 {
@@ -219,49 +183,20 @@ static void res_failed(int kind, uint32_t va, uint32_t w, uint32_t h, HRESULT hr
 
 /* ---- textures ----------------------------------------------------------- */
 
-#define BW_MAX_TEX 1024
-typedef struct {
-    uint32_t offset, w, h, pitch, color;
-    uint64_t hash, sparse;
-    uint32_t gen, stable;       /* frames the full hash has not changed */
-    ID3D11Texture2D *tex;
-    ID3D11ShaderResourceView *srv;
-    uint32_t last_use;
-    uint8_t cube;               /* six faces (TextureCube view) */
-    uint8_t glyph;              /* VFX (D9): a glyph sheet (bw_vfx_is_glyph_sheet); 0 in Original */
-    uint8_t alpha1;             /* VFX (D9): 1-bit alpha in use (A1R5G5B5, DXT1 with transparency) */
-    uint8_t hard;               /* VFX (V1): hard-edged alpha (tex_hard_alpha); 0 in Original */
-    uint8_t jpeg;               /* T1: a menu/title photo screen texture, deblocked at upload; 0 in Original */
-    uint8_t movie;              /* T1: a Bink frame, deblocked at upload (item 11); 0 in Original */
-    uint8_t tr_churn;           /* T1: restorations soon after the last one (contents changing) */
-    uint32_t tr_gen;            /* T1: frame of the last restoration of this texture */
-    uint8_t tr_bound;           /* T1 test aid: the restored chain has been drawn with */
-    BwTrSlot tr;                /* T1 (VFX_TEX_RESTORE): the restored chain; zero in Original */
-} BwTex;
-
-static BwTex s_tex[BW_MAX_TEX];
-static int s_ntex;
-static uint32_t s_gen = 1;      /* frame number */
-static uint32_t *s_decode;
-static size_t s_decode_cap;
+/* The texture cache is the core's (bwg_tex.c); its D3D11 objects are this
+ * back end's (BwgTex's tex and srv). */
+typedef BwgTex BwTex;
 
 /* ---- state caches ------------------------------------------------------- */
 
-#define BW_MAX_STATE 128
-typedef struct { uint32_t key[6]; ID3D11BlendState *bs; } BwBlend;
-typedef struct { uint32_t key[10]; ID3D11DepthStencilState *ds; } BwDS;
-typedef struct { uint32_t key[3]; ID3D11SamplerState *ss; } BwSamp;
-static BwBlend s_blend[BW_MAX_STATE];
-static int s_nblend;
-static BwDS s_ds[BW_MAX_STATE];
-static int s_nds;
-static BwSamp s_samp[BW_MAX_STATE];
-static int s_nsamp;
+/* The API objects of the core's state tables (bwg_state.c), by its slots. */
+static ID3D11BlendState *s_blend[BWG_MAX_STATE];
+static ID3D11DepthStencilState *s_ds[BWG_MAX_STATE];
+static ID3D11SamplerState *s_samp[BWG_MAX_STATE];
 static ID3D11RasterizerState *s_rs;
 static ID3D11RasterizerState *s_rs_cull[2][2];   /* [cull back][front is CCW] */
 static ID3D11RasterizerState *s_rs_z[2][3][2];    /* [depth clip][none/front/back][ccw] */
-static int s_zmode = -1;                         /* BW_GPU_ZMODE: 0 vertex 1 pixel 2 clip 3 auto */
-static int s_cull = -1;                          /* BW_GPU_CULL: 0 off, 1 on, 2 flipped */
+static ID3D11RasterizerState *s_rs_bias[BWG_MAX_RS_BIAS];
 
 /* ---- stats -------------------------------------------------------------- */
 
@@ -271,20 +206,20 @@ static unsigned s_ps_failures;   /* item 41: combiner pixel shaders that failed 
 /* GPU vertex programs, below: draws, batches left to the CPU while their
  * shader compiles, constant uploads, shaders compiled and failed. */
 static unsigned s_st_vdraws, s_st_vfall, s_st_kup, s_st_vraw, s_st_kskip;   /* vraw: P1 raw streams */
+static unsigned s_st_spr_draws, s_st_spr_pts, s_st_spr_fall;   /* gfx-sprites: point batches on the GPU */
 static volatile LONG s_nvsh, s_vsh_compiles, s_vsh_failures;
 static double s_vsh_compile_ms;
 static int s_stats = -1;
-static unsigned s_st_draws, s_st_tris, s_st_uploads, s_st_rtt, s_st_flips, s_st_clears;
+static unsigned s_st_draws, s_st_tris, s_st_flips, s_st_clears;   /* uploads, rtt: the core's (bwg_st_*) */
 static unsigned s_st_presented, s_st_dropped;    /* gpu_present: shown, dropped (DO_NOT_WAIT) */
 static unsigned s_st_rb_async_late;     /* VFX (D9): async readback frames dropped (ring full) */
+static unsigned s_rb_dropped;           /* I2: the same, never zeroed (its [GPU-RBRING] line) */
 /* Frame timing on the NV2A thread, per stats second (ms): the present and the
  * readback (sum and worst), and flip to flip (best, sum, worst). */
 static double s_st_pres_ms, s_st_pres_max, s_st_rb_ms, s_st_rb_max;
 static double s_st_ft_min, s_st_ft_sum, s_st_ft_max;
 static unsigned s_st_ft_n;
 static ULONGLONG s_st_t0;
-
-static double qpc_ms(void);
 
 /* T1 test aid, BW_TEXRESTORE_TRACE=<ms>: for every frame longer than that,
  * where the device thread's time went (Remastered only; inert unset). */
@@ -301,19 +236,6 @@ static int trc_on(void)
     return s_trc_on > 0.0;
 }
 
-static double qpc_ms(void)
-{
-    static double inv;
-    LARGE_INTEGER t;
-    if (!inv) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        inv = 1000.0 / (double)f.QuadPart;
-    }
-    QueryPerformanceCounter(&t);
-    return (double)t.QuadPart * inv;
-}
-
 /* 0.2.5 item 43: the back end's own CPU time on the NV2A thread, per flip
  * (BW_GPU_STATS's "draw cpu"): the thread's cycles inside clear and the
  * three draw entry points (QueryThreadCycleTime, so time the thread spends
@@ -324,20 +246,7 @@ static unsigned __int64 s_st_tsc0;
 static double s_st_q0;
 static unsigned s_st_xcbup;     /* item 43: combiner constant uploads (the rest were unchanged) */
 
-/* Item 43's per-draw shortcuts (memos of the last lookup, the constant
- * shadow, the index of texture entries): BW_GPU_MEMO=0 turns them all off,
- * as before 0.2.5, to compare or to rule them out. */
-static int memo_on(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("BW_GPU_MEMO");
-        v = !(e && e[0] == '0');
-        if (!v)
-            fprintf(stderr, "[GPU-D3D11] per-draw lookup shortcuts off (BW_GPU_MEMO=0)\n");
-    }
-    return v;
-}
+/* (Item 43's per-draw shortcuts, BW_GPU_MEMO: bwg_memo_on, the core's.) */
 
 static ULONG64 thread_cycles(void)
 {
@@ -363,7 +272,7 @@ static void draw_cpu_end(ULONG64 c0)
 static double draw_cpu_ms_per_flip(void)
 {
     unsigned __int64 t = __rdtsc();
-    double q = qpc_ms(), ms = 0.0;
+    double q = bwg_qpc_ms(), ms = 0.0;
     if (s_st_q0 > 0.0 && q > s_st_q0 && s_st_flips) {
         double per_ms = (double)(t - s_st_tsc0) / (q - s_st_q0);
         if (per_ms > 0.0)
@@ -376,9 +285,10 @@ static double draw_cpu_ms_per_flip(void)
 }
 
 static void lat_stats_line(void);     /* P2b: BW_GPU_LATENCY, below */
-static void pace_stats_line(void);    /* P2b: present pacing, below */
 static void pstat_line(void);          /* P2b: presentation statistics, below */
+static void gate_screen(uint32_t flip); /* gfx-lat11: the latency mode's horizon, below */
 static void ors_stats_line(void);      /* 0.2.5 item 49: the sea's single reflection, below */
+static void native_stats_line(void);   /* gfx-ffp: GPU_FFP, GPU_VSH_SYNC, below */
 
 static void stats_tick(void)
 {
@@ -399,8 +309,8 @@ static void stats_tick(void)
                         " | presented %u dropped %u | present %.2f/%.1f ms readback %.2f/%.1f ms"
                         " | draw cpu %.2f ms/flip"
                         " | ft %.1f/%.2f/%.1f ms\n",
-                s_st_flips, s_st_draws, s_st_tris, s_st_clears, s_st_uploads, s_st_rtt,
-                s_nsurf, s_ntex, s_st_xdraws, s_nps, s_ps_failures, s_st_xcbup, s_st_vdraws, s_st_vraw, s_st_vfall, s_st_kup, s_st_kskip,
+                s_st_flips, s_st_draws, s_st_tris, s_st_clears, bwg_st_uploads, bwg_st_rtt,
+                bwg_surf_count(), bwg_tex_count(), s_st_xdraws, s_nps, s_ps_failures, s_st_xcbup, s_st_vdraws, s_st_vraw, s_st_vfall, s_st_kup, s_st_kskip,
                 (long)s_nvsh, (long)s_vsh_failures, s_vsh_compile_ms,
                 s_st_presented, s_st_dropped,
                 s_st_flips ? s_st_pres_ms / s_st_flips : 0.0, s_st_pres_max,
@@ -414,10 +324,10 @@ static void stats_tick(void)
                     bw_vfx_scale(), bw_vfx_msaa(), bw_vfx_post_ms(), s_st_rb_async_late);
         {
             static unsigned told, told_reuse;   /* items 36-37: when there are new ones */
-            if (s_surf_reused + s_depth_reused != told_reuse) {
-                told_reuse = s_surf_reused + s_depth_reused;
+            if (bwg_surf_reused + bwg_depth_reused != told_reuse) {
+                told_reuse = bwg_surf_reused + bwg_depth_reused;
                 fprintf(stderr, "[GPU-D3D11] slots reused so far (tables full): colour surfaces %u,"
-                                " depth buffers %u\n", s_surf_reused, s_depth_reused);
+                                " depth buffers %u\n", bwg_surf_reused, bwg_depth_reused);
             }
             if (s_rfail_any != told) {
                 told = s_rfail_any;
@@ -432,6 +342,13 @@ static void stats_tick(void)
         lat_stats_line();                /* P2b */
         pstat_line();
         ors_stats_line();                /* item 49 (Remastered only: no-op otherwise) */
+        if (s_st_spr_draws || s_st_spr_fall) {   /* gfx-sprites: only once a point batch went the GPU way */
+            fprintf(stderr, "[GPU-SPRITES] point batches on the GPU %u (%u points), handed back to the CPU"
+                            " %u (their shader still compiling)\n", s_st_spr_draws, s_st_spr_pts,
+                    s_st_spr_fall);
+            s_st_spr_draws = s_st_spr_pts = s_st_spr_fall = 0;
+        }
+        native_stats_line();             /* gfx-ffp (only with a switch on) */
         s_st_rb_async_late = 0;
         s_st_presented = s_st_dropped = 0;
         s_st_pres_ms = s_st_pres_max = s_st_rb_ms = s_st_rb_max = 0.0;
@@ -439,7 +356,7 @@ static void stats_tick(void)
         s_st_ft_n = 0;
         s_st_xcbup = 0;
         s_st_xdraws = s_st_vdraws = s_st_vfall = s_st_kup = s_st_vraw = s_st_kskip = 0;
-        s_st_flips = s_st_draws = s_st_tris = s_st_uploads = s_st_rtt = s_st_clears = 0;
+        s_st_flips = s_st_draws = s_st_tris = bwg_st_uploads = bwg_st_rtt = s_st_clears = 0;
         s_st_t0 = now;
     }
 }
@@ -449,7 +366,7 @@ static void stats_tick(void)
 /* The vertex shaders' defines: BW_WS (the widescreen x remap) only when this
  * boot is widescreen, so Original compiles exactly the text it always did. */
 static const D3D_SHADER_MACRO s_ws_defines[] = { { "BW_WS", "1" }, { NULL, NULL } };
-#define WS_DEFINES (s_ws_k > 1.0f ? s_ws_defines : NULL)
+#define WS_DEFINES (bwg_ws_k > 1.0f ? s_ws_defines : NULL)
 
 static int compile(const char *entry, const char *target, ID3DBlob **out)
 {
@@ -680,6 +597,69 @@ static void adapter_line(D3D_FEATURE_LEVEL got)
     IDXGIDevice_Release(xd);
 }
 
+/* BW_TEST_GPUPRIO=<-7..7>[:priv] (a test aid, inert unless set; gfx4 lane
+ * gfx-proofs, asked for by the maintainer): DXGI's GPU thread priority for this
+ * device (IDXGIDevice::SetGPUThreadPriority), the GPU's counterpart of the
+ * process power-mode opt-out: how the GPU scheduler weighs this device's work
+ * against other processes' work. Set right after the device is made, read back
+ * with GetGPUThreadPriority, every step logged ([GPU-PRIO]). ":priv" first
+ * enables SeIncreaseBasePriorityPrivilege in this process's own token, if the
+ * token holds it (nothing is granted; nothing outside the process changes). */
+static void gpu_prio_priv(void)
+{
+    HANDLE tok = NULL;
+    TOKEN_PRIVILEGES tp;
+    DWORD err;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+        fprintf(stderr, "[GPU-PRIO] the process token can't be opened (error %lu)\n", GetLastError());
+        return;
+    }
+    memset(&tp, 0, sizeof tp);
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!LookupPrivilegeValueA(NULL, "SeIncreaseBasePriorityPrivilege", &tp.Privileges[0].Luid)) {
+        fprintf(stderr, "[GPU-PRIO] SeIncreaseBasePriorityPrivilege: no such privilege (error %lu)\n",
+                GetLastError());
+    } else {
+        AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
+        err = GetLastError();
+        fprintf(stderr, "[GPU-PRIO] SeIncreaseBasePriorityPrivilege: %s (error %lu)\n",
+                err == ERROR_SUCCESS ? "enabled in this process's token"
+                : err == ERROR_NOT_ALL_ASSIGNED ? "this process's token doesn't hold it" : "not enabled", err);
+    }
+    CloseHandle(tok);
+}
+
+static void gpu_prio_test(void)
+{
+    const char *e = getenv("BW_TEST_GPUPRIO");
+    IDXGIDevice *xd = NULL;
+    INT want, before = 99, after = 99;
+    HRESULT hb, hs, ha;
+    char *end;
+    if (!e || !*e)
+        return;
+    want = (INT)strtol(e, &end, 10);
+    if (end == e || want < -7 || want > 7 || (*end && _stricmp(end, ":priv"))) {
+        fprintf(stderr, "[GPU-PRIO] BW_TEST_GPUPRIO=%s: want -7..7, optionally with :priv (ignored)\n", e);
+        return;
+    }
+    if (*end)
+        gpu_prio_priv();
+    if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&xd))) {
+        fprintf(stderr, "[GPU-PRIO] no IDXGIDevice on this device: nothing set\n");
+        return;
+    }
+    hb = IDXGIDevice_GetGPUThreadPriority(xd, &before);
+    hs = IDXGIDevice_SetGPUThreadPriority(xd, want);
+    ha = IDXGIDevice_GetGPUThreadPriority(xd, &after);
+    fprintf(stderr, "[GPU-PRIO] test aid BW_TEST_GPUPRIO=%s: priority before %d (0x%08lX); "
+                    "SetGPUThreadPriority(%d) 0x%08lX; read back %d (0x%08lX)%s\n",
+            e, before, (unsigned long)hb, want, (unsigned long)hs, after, (unsigned long)ha,
+            SUCCEEDED(hs) && SUCCEEDED(ha) && after == want ? ": in effect" : ": NOT in effect");
+    IDXGIDevice_Release(xd);
+}
+
 static int ensure_device(void)
 {
     D3D_FEATURE_LEVEL got;
@@ -725,6 +705,7 @@ static int ensure_device(void)
             adapter_line(got);                  /* item 27, contract 8 */
             if (flags & D3D11_CREATE_DEVICE_DEBUG)
                 bw_gpu_debug_attach(s_dev);
+            gpu_prio_test();                    /* BW_TEST_GPUPRIO (test aid; inert unless set) */
         }
     }
     if (FAILED(hr)) {
@@ -770,6 +751,9 @@ static int ensure_device(void)
     ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
     fprintf(stderr, "[GPU-D3D11] device ready (feature level 0x%x)\n", (unsigned)got);
     bw_pscache_init();                  /* T1: compiled pixel shaders from earlier runs (every edition) */
+    latch_init();                       /* I1, the CPU-write latch (lane gfx-regen) */
+    bw_vshpre_start(bwg_sprites_on());  /* the game's vertex programs into the cache now (lane gfx-regen) */
+    vshpre_known_ffp();                 /* and, with GPU_FFP, the fixed function's shapes */
     /* VFX (D9): the visual suite's settings and helpers; nothing in Original. */
     bw_vfx_init();
     bw_vfx_gpu_init(s_dev, s_ctx);
@@ -781,183 +765,80 @@ static int ensure_device(void)
 
 /* ---- surfaces ----------------------------------------------------------- */
 
-/* Back-face culling as the title set it. NV2A takes GL's values:
- * SET_CULL_FACE GL_FRONT 0x404 / GL_BACK 0x405 / GL_FRONT_AND_BACK 0x408,
- * SET_FRONT_FACE GL_CW 0x900 / GL_CCW 0x901. The executor hands over surface
- * pixels with y down, the same space D3D11's rasteriser judges winding in;
- * which way NV2A counts in that space was checked against frames
- * (BW_GPU_CULL=flip draws the other convention, ANALYSIS). Returns NULL
- * when the title culls both faces: nothing to draw. */
-static int zmode(void)
+/* The rasteriser states, made from the core's descriptions (bwg_state.c:
+ * the depth range, back-face culling and the polygon offset). */
+static void d11_raster_desc(const BwgRaster *r, D3D11_RASTERIZER_DESC *rd)
 {
-    if (s_zmode < 0) {
-        const char *e = getenv("BW_GPU_ZMODE");
-        s_zmode = !e || !*e || e[0] == 'p' ? 1 : e[0] == 'v' ? 0 : e[0] == 'c' ? 2 : 3;   /* default pixel */
-        if (s_zmode)
-            fprintf(stderr, "[GPU-D3D11] depth range: %s\n",
-                    s_zmode == 1 ? "clamped per pixel" : s_zmode == 2 ? "culled per pixel"
-                    : "as the title sets SET_ZMIN_MAX_CONTROL");
-    }
-    return s_zmode;
-}
-
-/* The title's SET_ZMIN_MAX_CONTROL (0x1D78), logged when it changes. Its
- * ZCLAMP_EN field (bits 4-7) is 0 for cull, 1 for clamp (xemu's names). */
-static uint32_t zminmax_control(void)
-{
-    static uint32_t last = 0xFFFFFFFFu;
-    static int logged;
-    uint32_t v = bw_backend_reg(0x1D78);
-    if (v != last && logged < 8) {
-        logged++;
-        fprintf(stderr, "[GPU-D3D11] SET_ZMIN_MAX_CONTROL = 0x%08X (cull near/far %u, zclamp %u,"
-                        " ignore w %u)\n", v, v & 0xF, (v >> 4) & 0xF, (v >> 8) & 0xF);
-    }
-    last = v;
-    return v;
-}
-
-/* Clamp z per vertex in the shader (the old way), or leave it to the
- * rasteriser per pixel. */
-static int zmode_vertex_clamp(void)
-{
-    zminmax_control();
-    return zmode() == 0;
-}
-
-/* Depth clip in the rasteriser: on for "clip", or for "auto" when the
- * title selects cull. */
-static int zmode_depth_clip(void)
-{
-    int m = zmode();
-    return m == 2 || (m == 3 && ((zminmax_control() >> 4) & 0xF) == 0);
+    BwgRasterDesc g;
+    bwg_raster_desc(r, &g);
+    memset(rd, 0, sizeof(*rd));
+    rd->FillMode = D3D11_FILL_SOLID;
+    rd->CullMode = (D3D11_CULL_MODE)g.cull_mode;
+    rd->FrontCounterClockwise = g.front_ccw ? TRUE : FALSE;
+    rd->DepthClipEnable = g.depth_clip ? TRUE : FALSE;
+    rd->ScissorEnable = TRUE;
+    rd->DepthBias = (INT)g.depth_bias;
+    rd->SlopeScaledDepthBias = g.slope_bias;
+    rd->DepthBiasClamp = g.bias_clamp;
 }
 
 static ID3D11RasterizerState *get_rs_z(int clip, int cull, int ccw)
 {
     if (!s_rs_z[clip][cull][ccw]) {
         D3D11_RASTERIZER_DESC rd;
-        memset(&rd, 0, sizeof(rd));
-        rd.FillMode = D3D11_FILL_SOLID;
-        rd.CullMode = cull == 0 ? D3D11_CULL_NONE : cull == 1 ? D3D11_CULL_FRONT : D3D11_CULL_BACK;
-        rd.FrontCounterClockwise = ccw ? TRUE : FALSE;
-        rd.DepthClipEnable = clip ? TRUE : FALSE;
-        rd.ScissorEnable = TRUE;
+        BwgRaster r;
+        memset(&r, 0, sizeof(r));
+        r.kind = BWG_RS_Z;
+        r.clip = clip; r.cull = cull; r.ccw = ccw;
+        d11_raster_desc(&r, &rd);
         ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_z[clip][cull][ccw]);
     }
     return s_rs_z[clip][cull][ccw];
 }
 
-/* Polygon offset (SET_POLY_OFFSET_FILL_ENABLE 0x0338, SET_POLYGON_OFFSET_
- * SCALE_FACTOR 0x0384, _BIAS 0x0388), a port bug fixed in every edition:
- * neither renderer applied it, and Blood Wake enables it for about 44% of
- * mission draws (factor -0.25, units -1; BW_GPU_AUDIT, 2026-10-27). xemu adds
- * units + factor * max |dz/dx|, |dz/dy| to the 24-bit depth per pixel
- * (psh.c); D3D11's rasteriser bias is the same rule (DepthBias in 2^-24
- * steps of the D24 buffer, SlopeScaledDepthBias times the max slope), except
- * that its x slope is per pixel of the 2x-wide anti-aliased surface rather
- * than per logical pixel (with factor -0.25, a fraction of one depth step).
- * BW_GPU_POLYOFFSET=0 restores the old state (no offset). */
-static int use_polyoffset(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("BW_GPU_POLYOFFSET");
-        v = !(e && e[0] == '0');
-    }
-    return v && !bw_ab_off("polyoffset");
-}
-
-static int poly_offset(float *factor, float *units)
-{
-    uint32_t f = bw_backend_reg(0x0384), u = bw_backend_reg(0x0388);
-    if (!use_polyoffset() || !bw_backend_reg(0x0338))
-        return 0;
-    memcpy(factor, &f, 4);
-    memcpy(units, &u, 4);
-    return (*factor != 0.0f || *units != 0.0f) && *factor == *factor && *units == *units;
-}
-
-#define BW_MAX_RS_BIAS 32
-static struct { int clip, cull, ccw; float factor, units; ID3D11RasterizerState *rs; } s_rs_bias[BW_MAX_RS_BIAS];
-static int s_nrs_bias;
-
-static ID3D11RasterizerState *get_rs_bias(int clip, int cull, int ccw, float factor, float units)
+static ID3D11RasterizerState *get_rs_bias(const BwgRaster *r)
 {
     D3D11_RASTERIZER_DESC rd;
-    int i;
-    for (i = 0; i < s_nrs_bias; i++)
-        if (s_rs_bias[i].clip == clip && s_rs_bias[i].cull == cull && s_rs_bias[i].ccw == ccw
-                && s_rs_bias[i].factor == factor && s_rs_bias[i].units == units)
-            return s_rs_bias[i].rs;
-    if (s_nrs_bias == BW_MAX_RS_BIAS)
-        return get_rs_z(clip, cull, ccw);
-    memset(&rd, 0, sizeof(rd));
-    rd.FillMode = D3D11_FILL_SOLID;
-    rd.CullMode = cull == 0 ? D3D11_CULL_NONE : cull == 1 ? D3D11_CULL_FRONT : D3D11_CULL_BACK;
-    rd.FrontCounterClockwise = ccw ? TRUE : FALSE;
-    rd.DepthClipEnable = clip ? TRUE : FALSE;
-    rd.ScissorEnable = TRUE;
-    rd.DepthBias = (INT)(units < 0.0f ? units - 0.5f : units + 0.5f);
-    rd.SlopeScaledDepthBias = factor;
-    rd.DepthBiasClamp = 0.0f;
-    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_bias[s_nrs_bias].rs)))
-        return get_rs_z(clip, cull, ccw);
-    s_rs_bias[s_nrs_bias].clip = clip; s_rs_bias[s_nrs_bias].cull = cull;
-    s_rs_bias[s_nrs_bias].ccw = ccw; s_rs_bias[s_nrs_bias].factor = factor;
-    s_rs_bias[s_nrs_bias].units = units;
-    return s_rs_bias[s_nrs_bias++].rs;
+    ID3D11RasterizerState *o = NULL;
+    int i = bwg_rs_bias_find(r);
+    if (i >= 0)
+        return s_rs_bias[i];
+    if (i == -2)                        /* the table is full */
+        return get_rs_z(r->clip, r->cull, r->ccw);
+    d11_raster_desc(r, &rd);
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &o)))
+        return get_rs_z(r->clip, r->cull, r->ccw);
+    s_rs_bias[bwg_rs_bias_add(r)] = o;
+    return o;
 }
 
+/* Returns NULL when the title culls both faces: nothing to draw. */
 static ID3D11RasterizerState *get_rs(const Nv2aRenderState *rs)
 {
-    int back, ccw;
-    if (zmode() != 0) {
-        /* the depth experiment: one cache for clip x cull x winding */
-        int clip = zmode_depth_clip(), cull = 0;
-        ccw = 0;
-        if (s_cull < 0) {
-            const char *e = getenv("BW_GPU_CULL");
-            s_cull = !e ? 1 : e[0] == '0' ? 0 : (e[0] == 'f' || e[0] == '2') ? 2 : 1;
-        }
-        if (s_cull && rs && rs->cull_enable) {
-            if (rs->cull_face == 0x408)
-                return NULL;
-            cull = rs->cull_face != 0x404 ? 2 : 1;
-            ccw = (rs->front_face == 0x901) ^ (s_cull == 2);
-        }
-        {
-            float factor, units;
-            if (poly_offset(&factor, &units))
-                return get_rs_bias(clip, cull, ccw, factor, units);
-        }
-        return get_rs_z(clip, cull, ccw);
-    }
-    if (s_cull < 0) {
-        const char *e = getenv("BW_GPU_CULL");
-        s_cull = !e ? 1 : e[0] == '0' ? 0 : (e[0] == 'f' || e[0] == '2') ? 2 : 1;
-    }
-    if (!s_cull || !rs || !rs->cull_enable)
-        return s_rs;
-    if (rs->cull_face == 0x408)
+    BwgRaster r;
+    if (!bwg_raster(rs, &r))
         return NULL;
-    back = rs->cull_face != 0x404;
-    ccw = (rs->front_face == 0x901) ^ (s_cull == 2);
-    if (!s_rs_cull[back][ccw]) {
-        D3D11_RASTERIZER_DESC rd;
-        memset(&rd, 0, sizeof(rd));
-        rd.FillMode = D3D11_FILL_SOLID;
-        rd.CullMode = back ? D3D11_CULL_BACK : D3D11_CULL_FRONT;
-        rd.FrontCounterClockwise = ccw ? TRUE : FALSE;
-        rd.DepthClipEnable = FALSE;
-        rd.ScissorEnable = TRUE;
-        ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_cull[back][ccw]);
+    switch (r.kind) {
+    case BWG_RS_BIAS:
+        return get_rs_bias(&r);
+    case BWG_RS_Z:
+        return get_rs_z(r.clip, r.cull, r.ccw);
+    case BWG_RS_PLAIN:
+        return s_rs;
+    default:
+        break;
     }
-    return s_rs_cull[back][ccw] ? s_rs_cull[back][ccw] : s_rs;
+    if (!s_rs_cull[r.cull][r.ccw]) {
+        D3D11_RASTERIZER_DESC rd;
+        d11_raster_desc(&r, &rd);
+        ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_cull[r.cull][r.ccw]);
+    }
+    return s_rs_cull[r.cull][r.ccw] ? s_rs_cull[r.cull][r.ccw] : s_rs;
 }
 
 static void release_surf(BwSurf *s)
 {
+    bwg_latch_forget(s);                /* I1: its next seed reads guest memory, CPU writes and all */
     if (s->srv) ID3D11ShaderResourceView_Release(s->srv);
     if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
     if (s->tex) ID3D11Texture2D_Release(s->tex);
@@ -970,36 +851,6 @@ static void release_surf(BwSurf *s)
 static DXGI_FORMAT surf_format(uint32_t bpp)
 {
     return bpp == 2 ? DXGI_FORMAT_B5G6R5_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
-}
-
-/* 0.2.5 item 38: the guest memory a new surface is seeded from. The seed
- * reads h rows at the surface's pitch from va; where that would run past
- * the end of the guest block at va (the front buffer, 1200 KB, bound at the
- * AA surface's 5120-byte pitch asks for 2.4 MB), the rows that fit are
- * copied and the rest left black, as readback clamps its writes. *tmp is
- * the copy to free (NULL when guest memory is used as it is). NULL: no
- * seed (no memory for the copy). */
-static const void *seed_src(const BwSurf *s, void **tmp)
-{
-    uint32_t room = xbox_ContiguousBlockSize(s->va);
-    uint64_t need = (uint64_t)(s->h ? s->h - 1 : 0) * s->pitch + (uint64_t)s->w * s->bpp;
-    uint8_t *c;
-    *tmp = NULL;
-    if (!room || need <= room)
-        return GUEST(s->va);
-    c = (uint8_t *)calloc((size_t)s->pitch, s->h);     /* pitch x h >= need > room */
-    if (!c)
-        return NULL;
-    memcpy(c, GUEST(s->va), room);
-    {
-        static unsigned n;
-        if (n++ < 4)
-            fprintf(stderr, "[GPU-D3D11] seed of surface %08X clamped: %u rows at pitch %u would read"
-                            " past the end of its %u-byte guest block; the rest starts black\n",
-                    s->va, s->h, s->pitch, room);
-    }
-    *tmp = c;
-    return c;
 }
 
 /* VFX (D9): a surface at its physical (render-scaled) size, in the suite's
@@ -1069,7 +920,7 @@ static int create_surf_vfx(BwSurf *s)
         ID3D11Texture2D *t = NULL;
         ID3D11ShaderResourceView *v = NULL;
         void *tmp;
-        const void *src = seed_src(s, &tmp);                    /* item 38: never past the block */
+        const void *src = bwg_seed_src(s, &tmp);                    /* item 38: never past the block */
         td.Width = s->w;
         td.Height = s->h;
         td.Format = surf_format(s->bpp);
@@ -1094,8 +945,8 @@ static int create_surf_vfx(BwSurf *s)
     }
     s->mdirty = s->mrtv != NULL;
     s->epoch = bw_vfx_epoch();
-    if (s_cur == s)
-        s_cur = NULL;           /* rebind: the blit changed the targets, and these are new */
+    if (bwg_cur == s)
+        bwg_cur = NULL;           /* rebind: the blit changed the targets, and these are new */
     return 1;
 }
 
@@ -1123,7 +974,7 @@ static int create_surf(BwSurf *s)
     /* Seed from guest memory: whatever the title (or the boot) left there,
      * never read past the end of its guest block (item 38). */
     if (s->pitch >= s->w * s->bpp && s->pw == s->w && s->ph == s->h
-            && (init.pSysMem = seed_src(s, &tmp)) != NULL) {
+            && (init.pSysMem = bwg_seed_src(s, &tmp)) != NULL) {
         init.SysMemPitch = s->pitch;
         init.SysMemSlicePitch = 0;
         pinit = &init;
@@ -1148,183 +999,7 @@ static int create_surf(BwSurf *s)
     return 1;
 }
 
-static BwSurf *find_surf(uint32_t va)
-{
-    for (int i = 0; i < s_nsurf; i++)
-        if (s_surf[i].va == va && s_surf[i].tex)
-            return &s_surf[i];
-    return NULL;
-}
-
-/* ---- the output size: one place -----------------------------------------
- * D9's bw_vfx_surface_size gives a guest surface's physical size at the
- * render scale (the guest's own size in Original). In a widescreen boot
- * (Remastered, bw_widescreen.h) the device's full-screen targets, the
- * 640x480 front buffer and the 2x-wide anti-aliased back buffer (1280x480),
- * are then made k times wider; their depth buffers follow (get_depth takes
- * pw, ph). Shadow maps, reflections and every other target keep their size.
- * Positions stay in guest units (the shaders' surf constant is w, h) and the
- * D3D11 viewport covers pw, ph, so 3D stretches over the wider surface; 2D is
- * pillarboxed by the wsx remap (ws_remap). The scissor scales by pw/w. */
-static int ws_is_device_target(uint32_t w, uint32_t h)
-{
-    return h == 480 && (w == 640 || w == 1280);
-}
-
-static void surf_physical_size(BwSurf *s, const Nv2aSurface *in)
-{
-    bw_vfx_surface_size(s->w, s->h, in->aa_sx, in->aa_sy, &s->pw, &s->ph);   /* VFX (D9) */
-    s->wsk = 1.0f;
-    if (s_ws_k > 1.0f && ws_is_device_target(s->w, s->h)) {
-        uint32_t base = s->pw;
-        s->pw = ((uint32_t)((float)base * s_ws_k + 1.0f)) & ~1u;
-        if (s->pw > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)      /* item 36: D3D11's limit, 16384 */
-            s->pw = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
-        s->wsk = (float)s->pw / (float)base;
-    }
-}
-
-/* 0.2.5 item 37: the slot tables (BW_MAX_SURF colour surfaces and as many
- * depth buffers) used to fill for good, and every draw into a new target
- * was dropped from then on, silently. Now a new target takes a free slot,
- * else the one used longest ago (never the bound one), released; the first
- * time is logged, later ones are counted in the BW_GPU_STATS line. A
- * reused colour surface's guest address seeds it again if the game comes
- * back to it, as at its first use. */
 static void vfx_surf_forget(BwSurf *s);        /* the scene copy's pointers, below */
-
-/* Test aid, BW_GPU_SLOTS=<n> (2..32): both tables hold only n, so a short
- * run exercises the reuse. Unset: BW_MAX_SURF, as always. */
-static int slot_cap(void)
-{
-    static int cap;
-    if (!cap) {
-        const char *e = getenv("BW_GPU_SLOTS");
-        int n = e ? atoi(e) : 0;
-        cap = (n >= 2 && n < BW_MAX_SURF) ? n : BW_MAX_SURF;
-        if (cap != BW_MAX_SURF)
-            fprintf(stderr, "[GPU-D3D11] test aid: %d colour surface and depth buffer slots"
-                            " (BW_GPU_SLOTS)\n", cap);
-    }
-    return cap;
-}
-
-static BwSurf *surf_slot(uint32_t want_va)
-{
-    BwSurf *old = NULL;
-    if (s_nsurf < slot_cap())
-        return &s_surf[s_nsurf++];
-    for (int i = 0; i < s_nsurf; i++)
-        if (!s_surf[i].tex && &s_surf[i] != s_cur)
-            return &s_surf[i];              /* empty: one item 36 left to retry */
-    for (int i = 0; i < s_nsurf; i++) {
-        BwSurf *c = &s_surf[i];
-        if (c == s_cur)
-            continue;
-        if (!old || c->used_gen < old->used_gen)
-            old = c;
-    }
-    if (!old)
-        return NULL;
-    if (!s_surf_reused++)
-        fprintf(stderr, "[GPU-D3D11] all %d colour surface slots are in use: %08X (%ux%u, last used"
-                        " frame %u, now %u) makes room for %08X. Later reuses are counted\n",
-                slot_cap(), old->va, old->w, old->h, old->used_gen, s_gen, want_va);
-    release_surf(old);
-    vfx_surf_forget(old);
-    return old;
-}
-
-static BwDepth *depth_slot(uint32_t want_va)
-{
-    BwDepth *old = NULL;
-    for (int i = 0; i < s_ndepth; i++)
-        if (!s_depth[i].va)
-            return &s_depth[i];             /* item 36: a slot a failure left empty */
-    if (s_ndepth < slot_cap())
-        return &s_depth[s_ndepth++];
-    for (int i = 0; i < s_ndepth; i++) {
-        BwDepth *c = &s_depth[i];
-        if (c == s_cur_depth)
-            continue;
-        if (!old || c->used_gen < old->used_gen)
-            old = c;
-    }
-    if (!old)
-        return NULL;
-    if (!s_depth_reused++)
-        fprintf(stderr, "[GPU-D3D11] all %d depth buffer slots are in use: %08X (%ux%u, last used"
-                        " frame %u, now %u) makes room for %08X. Later reuses are counted\n",
-                slot_cap(), old->va, old->w, old->h, old->used_gen, s_gen, want_va);
-    if (old->dsv) ID3D11DepthStencilView_Release(old->dsv);
-    if (old->srv) ID3D11ShaderResourceView_Release(old->srv);
-    if (old->tex) ID3D11Texture2D_Release(old->tex);
-    memset(old, 0, sizeof(*old));
-    return old;
-}
-
-static BwSurf *get_surf(const Nv2aSurface *in)
-{
-    uint32_t bpp = in->bytes_per_pixel ? in->bytes_per_pixel : 4;
-    uint32_t w = in->pitch && in->pitch / bpp >= in->width ? in->pitch / bpp : in->width;
-    uint32_t h = in->height;
-    BwSurf *s = NULL;
-    for (int i = 0; i < s_nsurf; i++)
-        if (s_surf[i].va == in->color_va) { s = &s_surf[i]; break; }
-    if (s && (s->bpp != bpp || s->w < w || s->h < h || !s->tex
-              || (bw_vfx_active() && s->epoch != bw_vfx_epoch()))) {   /* VFX (D9): rescaled */
-        uint32_t ow = s->w, oh = s->h, obpp = s->bpp, opitch = s->pitch;
-        if (!s->tex && s->fail_gen == s_gen)
-            return NULL;                    /* item 36: it couldn't be made this frame; next frame */
-        release_surf(s);
-        /* 0.2.5 item 38 (a port bug, every edition): the bound surface,
-         * re-made, must be bound again. begin only binds when the surface
-         * changes, so the context kept the released target and the draws
-         * after a re-make (the front buffer grows when the game binds it at
-         * the AA surface's pitch) went into the old texture, never shown. */
-        if (s_cur == s)
-            s_cur = NULL;
-        s->bpp = bpp;
-        s->w = w > s->w ? w : s->w;
-        s->h = h > s->h ? h : s->h;
-        s->pitch = in->pitch;
-        surf_physical_size(s, in);
-        if (!create_surf(s)) {
-            s->fail_gen = s_gen;            /* item 36: released; kept by address to retry */
-            return NULL;
-        }
-        if (s->w != ow || s->h != oh || s->bpp != obpp) {
-            static unsigned n;              /* item 38: a fact for bug reports (a few, then quiet) */
-            if (n++ < 8)
-                fprintf(stderr, "[GPU-D3D11] surface %08X re-made at frame %u: %ux%u %u-byte"
-                                " (pitch %u) -> %ux%u %u-byte (pitch %u), bound again\n",
-                        s->va, s_gen, ow, oh, obpp, opitch, s->w, s->h, s->bpp, s->pitch);
-        }
-    }
-    if (!s) {
-        if (!(s = surf_slot(in->color_va)))  /* item 37: a free slot, or the oldest one's */
-            return NULL;
-        memset(s, 0, sizeof(*s));
-        s->va = in->color_va;
-        s->pitch = in->pitch;
-        s->bpp = bpp;
-        s->w = w;
-        s->h = h;
-        surf_physical_size(s, in);          /* VFX (D9) render scale, widescreen k */
-        if (!create_surf(s)) {
-            /* item 36: kept (empty, never drawn with: find_surf wants a
-             * texture) so it is tried once a frame, not once a draw */
-            s->fail_gen = s_gen;
-            return NULL;
-        }
-        if (s->wsk > 1.0f)
-            fprintf(stderr, "[WS] surface %08X %ux%u -> %ux%u on the GPU (widescreen x%.4f)\n",
-                    s->va, s->w, s->h, s->pw, s->ph, s->wsk);
-    }
-    s->cur_pitch = in->pitch;
-    s->aa_sx = (uint8_t)(in->aa_sx ? in->aa_sx : 1);
-    return s;
-}
 
 static void release_depth(BwDepth *d)
 {
@@ -1334,78 +1009,23 @@ static void release_depth(BwDepth *d)
     d->dsv = NULL; d->srv = NULL; d->tex = NULL;
 }
 
-/* The depth buffer at guest address va for a colour target of w x h with
- * `samples` samples per pixel (1 in Original; the MSAA count in Remastered,
- * or 1 for a surface whose MSAA target couldn't be made, item 36). */
-static BwDepth *get_depth(uint32_t va, uint32_t w, uint32_t h, UINT samples)
+/* The depth buffer's objects, w x h with its samples (1 in Original; the
+ * MSAA count in Remastered, or 1 for a surface whose MSAA target couldn't
+ * be made, item 36); the core (bwg_get_depth) decides when. 0: couldn't
+ * (logged here; the core empties the slot). */
+static int create_depth(BwDepth *d)
 {
     D3D11_TEXTURE2D_DESC td;
-    BwDepth *d = NULL;
     HRESULT hr;
     int kind = RF_DEPTH;
-    static uint32_t fail_va, fail_gen;     /* item 36: the last one that couldn't be made, and when */
-    if (!va)
-        return NULL;
-    for (int i = 0; i < s_ndepth; i++) {
-        BwDepth *c = &s_depth[i];
-        if (c->va != va)
-            continue;
-        if (!bw_vfx_active()) {
-            d = c;                          /* Original: one per address, grown to the largest */
-            break;
-        }
-        /* 0.2.5 item 39, Remastered: one per address, size and sample
-         * count, so a depth address used with two sizes of target keeps one
-         * of each instead of being re-made at every switch. One made for an
-         * earlier render scale is released here. */
-        if (c->epoch != bw_vfx_epoch()) {
-            if (c == s_cur_depth) {
-                s_cur_depth = NULL;
-                s_cur = NULL;
-            }
-            release_depth(c);
-            memset(c, 0, sizeof(*c));
-            continue;
-        }
-        if (c->w == w && c->h == h && c->samples == samples) {
-            d = c;
-            break;
-        }
-    }
-    if (d && d->samples == samples && d->w >= w && d->h >= h
-            && (!bw_vfx_active() || (d->epoch == bw_vfx_epoch() && d->w == w && d->h == h)))
-        return d;
-    if (va == fail_va && s_gen == fail_gen)
-        return NULL;                        /* item 36: tried this frame already; next frame */
-    if (d) {
-        release_depth(d);
-        if (d == s_cur_depth) {
-            /* item 38: the bound depth buffer, re-made, is bound again (begin
-             * binds when the pair changes; clearing s_cur makes it) */
-            s_cur_depth = NULL;
-            s_cur = NULL;
-        }
-        if (!bw_vfx_active()) {
-            w = w > d->w ? w : d->w;
-            h = h > d->h ? h : d->h;
-        }
-        {
-            static unsigned n;              /* item 39: a fact for bug reports (a few, then quiet) */
-            if (n++ < 8)
-                fprintf(stderr, "[GPU-D3D11] depth buffer %08X re-made at frame %u: %ux%u x%u -> %ux%u x%u"
-                                " samples\n", va, s_gen, d->w, d->h, d->samples, w, h, samples);
-        }
-    } else if (!(d = depth_slot(va)))       /* items 36-37: a free slot, or the oldest one's */
-        return NULL;
-    memset(d, 0, sizeof(*d));
-    d->va = va; d->w = w; d->h = h; d->samples = samples;
+    uint32_t va = d->va, w = d->w, h = d->h;
+    UINT samples = d->samples;
     memset(&td, 0, sizeof(td));
     td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     td.SampleDesc.Count = samples;              /* VFX (D9): matches the colour target; 1 in Original */
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    d->epoch = bw_vfx_epoch();
     if (bw_vfx_active() && bw_vfx()->ao > 0.0f) {
         /* VFX (D9): ambient occlusion samples the depth: a typeless texture
          * with a D24S8 depth view and an R24 shader view. */
@@ -1433,7 +1053,7 @@ static BwDepth *get_depth(uint32_t va, uint32_t w, uint32_t h, UINT samples)
             d->srv = NULL;
             res_failed(RF_DEPTH_SRV, va, w, h, hr);
         }
-        return d;
+        return 1;
     }
     if (FAILED(hr = BW_GPU_FT("depth", E_OUTOFMEMORY,          /* item 25 test aid */
                               ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->tex))))
@@ -1442,18 +1062,10 @@ static BwDepth *get_depth(uint32_t va, uint32_t w, uint32_t h, UINT samples)
     if (FAILED(hr = BW_GPU_FT("resource", E_OUTOFMEMORY,       /* item 36 */
                               ID3D11Device_CreateDepthStencilView(s_dev, (ID3D11Resource *)d->tex, NULL, &d->dsv))))
         goto fail;
-    return d;
+    return 1;
 fail:
-    /* item 36: nothing half-made stays in a live slot (a NULL view used to
-     * be released and cleared later); the slot is left empty for reuse */
     res_failed(kind, va, w, h, hr);
-    release_depth(d);
-    memset(d, 0, sizeof(*d));
-    if (d == &s_depth[s_ndepth - 1])
-        s_ndepth--;
-    fail_va = va;
-    fail_gen = s_gen;
-    return NULL;
+    return 0;
 }
 
 /* BW_GPU_FLIPTRACE=<n>: for the first n flips, what happened since the last
@@ -1512,7 +1124,7 @@ static void ft_flip(const BwSurf *shown)
     s_ft_left--;
     ft_note('|', 0);
     crtc = xbox_Nv2aRegPtr(0x600800);
-    fprintf(stderr, "[FLIP] %u shown %08X (%ux%u) crtc %08X:%s\n", s_gen,
+    fprintf(stderr, "[FLIP] %u shown %08X (%ux%u) crtc %08X:%s\n", bwg_gen,
             shown ? shown->va : 0, shown ? shown->w : 0, shown ? shown->h : 0,
             crtc ? *crtc : 0, s_ft);
     s_ft_len = 0;
@@ -1523,6 +1135,7 @@ static void bind_targets(BwSurf *s, BwDepth *d)
 {
     D3D11_VIEWPORT vp;
     ID3D11ShaderResourceView *none = NULL;
+    g_bw_ctx_epoch++;                   /* I3: targets change what the runtime keeps bound */
     /* A surface about to be drawn into must not stay bound as a texture. */
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, s->mrtv ? &s->mrtv : &s->rtv, d ? d->dsv : NULL);
@@ -1530,10 +1143,10 @@ static void bind_targets(BwSurf *s, BwDepth *d)
     vp.Width = (float)s->pw; vp.Height = (float)s->ph;      /* VFX (D9): physical; = w, h in Original */
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
-    if (s != s_cur)
+    if (s != bwg_cur)
         ft_note('B', s->va);
-    s_cur = s;
-    s_cur_depth = d;
+    bwg_cur = s;
+    bwg_cur_depth = d;
 }
 
 /* VFX (D9): the MSAA target's samples into the surface's texture, if it was
@@ -1632,8 +1245,8 @@ static ID3D11Texture2D *readback_source(BwSurf *s)
         bw_vfx_blit(c, cw, s->ph, s_rb_rtv, s->w, s->h, 1);
     } else
         bw_vfx_blit(s->srv, s->pw, s->ph, s_rb_rtv, s->w, s->h, 1);
-    if (s_cur)
-        bind_targets(s_cur, s_cur_depth);
+    if (bwg_cur)
+        bind_targets(bwg_cur, bwg_cur_depth);
     return s_rb_tex;
 }
 
@@ -1656,16 +1269,105 @@ typedef struct {
     uint32_t tw, th, tbpp;          /* the staging texture's size and format */
     uint32_t va, w, h, bpp, pitch;  /* the frame it holds, and where it goes */
     int pending;
+    uint32_t gen;                   /* I2: the flip it was copied at (bwg_gen) */
 } VfxRb;
 static VfxRb s_vfx_rb[VFX_RB_RING];
 static unsigned s_vfx_rb_next;
+
+/* I2 (BW_GPU_RBRING, lane gfx-ideas; arch.md 3.14, gate IG2): the flip's
+ * readback without the wait (Remastered and later; its check in any edition).
+ *   unset/0  as before: Original (and Remastered without its suite) copies
+ *            the flipped frame into guest memory at the flip and waits for
+ *            the GPU to finish it; Remastered's suite uses the ring above
+ *   1        Remastered and later (GA-13): the ring above wherever the
+ *            waiting readback ran: the frame is written into guest memory
+ *            when the GPU has it, normally one or two flips later, and the
+ *            flip never waits. Not with the plain window (BW_GPU_PRESENT=0
+ *            shows guest memory), a dumped flip or a capture (both stay
+ *            waiting). Original keeps the waiting readback: delaying it
+ *            changes what guest memory holds when the game reads it, and
+ *            those reads can't be seen until I1's lock wrapper exists
+ *   check    a test aid: the waiting readback as before, plus each flip's copy
+ *            through a second ring that writes nothing: when its copy lands,
+ *            its bytes are hashed and compared with what the waiting readback
+ *            wrote for that flip ([GPU-RBRING] lines). It works in a
+ *            capture's replay, so the corpus proves the ring hands guest
+ *            memory the same bytes, only later.
+ * Where a ring writes, the flips between copy and write are counted (the
+ * lag, [GPU-RBRING] every 300 flips). The lock-forced waiting read that keeps
+ * the game's own reads current needs I1's lock wrapper (design only). */
+static int s_present_mode;          /* below: -1 unset, 0 off/failed, 1 on */
+static int rb_ring_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("BW_GPU_RBRING");
+        v = !e || !*e ? 0 : !strcmp(e, "check") ? 2 : e[0] == '1' ? 1 : 0;
+        if (v == 1 && !bw_edition_at_least(BW_ED_REMASTERED)) {
+            fprintf(stderr, "[GPU-RBRING] Original keeps the waiting readback (GA-13): BW_GPU_RBRING=1 ignored\n");
+            v = 0;
+        }
+        if (v)
+            fprintf(stderr, "[GPU-RBRING] %s (BW_GPU_RBRING)\n",
+                    v == 1 ? "the flip's readback through a ring of 3 copies, without waiting"
+                           : "check: the waiting readback, and a ring of 3 copies hashed against it");
+    }
+    return v;
+}
+static unsigned s_rb_lag[5];        /* frames written by a ring, by flips late: 0, 1, 2, 3, 4+ */
+static unsigned s_rb_ck_same, s_rb_ck_diff, s_rb_ck_lost;      /* check mode */
+static uint64_t s_rb_ck_hash[64];   /* check mode: the waiting readback's hash, by flip % 64 */
+static uint32_t s_rb_ck_gen[64];
+
+/* The rows a readback writes (the latest binding's pitch, never past the end
+ * of the guest block): *prow bytes in each of *prows rows at *ppitch. */
+static void rb_rows(uint32_t va, uint32_t w, uint32_t h, uint32_t bpp, uint32_t pitch_in,
+                    uint32_t *prow, uint32_t *prows, uint32_t *ppitch)
+{
+    uint32_t row = w * bpp, rows = h, pitch = pitch_in ? pitch_in : row;
+    uint32_t room = bwg_block_size(va);
+    if (row > pitch) row = pitch;
+    if (room) {
+        if (row > room) { row = room; rows = 1; }
+        else if ((uint64_t)(rows - 1) * pitch + row > room) rows = (room - row) / pitch + 1;
+    }
+    *prow = row; *prows = rows; *ppitch = pitch;
+}
+
+static uint64_t rb_hash(const uint8_t *p, uint32_t rowpitch, uint32_t row, uint32_t rows)
+{
+    uint64_t h = 1469598103934665603ull;
+    uint32_t y, x;
+    for (y = 0; y < rows; y++) {
+        const uint8_t *q = p + (size_t)y * rowpitch;
+        for (x = 0; x < row; x++)
+            h = (h ^ q[x]) * 0x100000001B3ull;
+    }
+    return h;
+}
+
+static void rb_lag_note(uint32_t gen)
+{
+    uint32_t k = bwg_gen - gen;
+    s_rb_lag[k < 4 ? k : 4]++;
+}
+
+static void rb_ring_line(void)
+{
+    if (!rb_ring_mode() || (bwg_gen % 300) != 0)
+        return;
+    fprintf(stderr, "[GPU-RBRING] flip %u: written by a ring, by flips late: 0 %u, 1 %u, 2 %u, 3 %u, 4+ %u;"
+                    " dropped (ring full) %u; check: same %u, different %u, never landed %u\n",
+            bwg_gen, s_rb_lag[0], s_rb_lag[1], s_rb_lag[2], s_rb_lag[3], s_rb_lag[4],
+            s_rb_dropped, s_rb_ck_same, s_rb_ck_diff, s_rb_ck_lost);
+}
 
 static void vfx_rb_write(VfxRb *r, const D3D11_MAPPED_SUBRESOURCE *m)
 {
     /* As readback() below: the latest binding's pitch, never past the end
      * of the guest block (the mission crash of 2026-10-26). */
     uint32_t row = r->w * r->bpp, rows = r->h, pitch = r->pitch ? r->pitch : row, y;
-    uint32_t room = xbox_ContiguousBlockSize(r->va);
+    uint32_t room = bwg_block_size(r->va);
     if (row > pitch) row = pitch;
     if (room) {
         if (row > room) { row = room; rows = 1; }
@@ -1673,6 +1375,8 @@ static void vfx_rb_write(VfxRb *r, const D3D11_MAPPED_SUBRESOURCE *m)
     }
     for (y = 0; y < rows; y++)
         memcpy(GUEST(r->va) + (size_t)y * pitch, (uint8_t *)m->pData + (size_t)y * m->RowPitch, row);
+    if (rb_ring_mode())
+        rb_lag_note(r->gen);                /* I2: how late it landed */
 }
 
 extern int nv2a_pb_exec_flip_dumping(void);   /* carried nv2a_pb_exec.c (TK-39) */
@@ -1685,7 +1389,10 @@ static int vfx_rb_async(void)
         v = !(e && e[0] == '1');
     }
     /* a flip being dumped is read back at once, so the dump is that frame */
-    return v && bw_vfx_active() && !nv2a_pb_exec_flip_dumping();
+    return ((v && bw_vfx_active())
+            || (rb_ring_mode() == 1 && s_present_mode != 0))   /* I2: any edition, not the plain window */
+        && !nv2a_pb_exec_flip_dumping()
+        && !BW_GFXCAP_PINNED();             /* BW_GFXCAP: every flip's hash, at its flip */
 }
 
 static void vfx_readback_async(BwSurf *s, ID3D11Texture2D *src)
@@ -1716,6 +1423,7 @@ static void vfx_readback_async(BwSurf *s, ID3D11Texture2D *src)
     r = &s_vfx_rb[s_vfx_rb_next];
     if (r->pending) {
         s_st_rb_async_late++;           /* the ring is full: this slot's old frame is dropped */
+        s_rb_dropped++;                 /* I2's count (the stats line zeroes the other each second) */
         r->pending = 0;
     }
     if (!r->t || r->tw != s->w || r->th != s->h || r->tbpp != s->bpp) {
@@ -1739,10 +1447,84 @@ static void vfx_readback_async(BwSurf *s, ID3D11Texture2D *src)
     r->va = s->va; r->w = s->w; r->h = s->h; r->bpp = s->bpp;
     r->pitch = s->cur_pitch ? s->cur_pitch : (s->pitch ? s->pitch : s->w * s->bpp);
     r->pending = 1;
+    r->gen = bwg_gen;
     s_vfx_rb_next = (s_vfx_rb_next + 1) % VFX_RB_RING;
 }
 
+/* I2 check mode (BW_GPU_RBRING=check): a second ring of 3 staging copies
+ * that writes nothing. Each landed copy is hashed (the rows the readback
+ * writes) and compared with the hash the waiting readback took of the same
+ * flip; a copy whose flip is no longer in the 64-flip table, or that is
+ * overwritten before it lands, counts as never landed. */
+static VfxRb s_rb_ck[VFX_RB_RING];
+static unsigned s_rb_ck_next;
+
+static void rb_check_poll(void)
+{
+    unsigned k;
+    for (k = 0; k < VFX_RB_RING; k++) {
+        VfxRb *r = &s_rb_ck[(s_rb_ck_next + k) % VFX_RB_RING];
+        D3D11_MAPPED_SUBRESOURCE m;
+        uint32_t row, rows, pitch;
+        HRESULT hr;
+        if (!r->pending)
+            continue;
+        hr = ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)r->t, 0, D3D11_MAP_READ,
+                                     D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+            break;
+        r->pending = 0;
+        if (FAILED(hr))
+            continue;
+        rb_rows(r->va, r->w, r->h, r->bpp, r->pitch, &row, &rows, &pitch);
+        if (s_rb_ck_gen[r->gen & 63] != r->gen)
+            s_rb_ck_lost++;
+        else if (rb_hash((const uint8_t *)m.pData, m.RowPitch, row, rows) == s_rb_ck_hash[r->gen & 63])
+            s_rb_ck_same++;
+        else if (s_rb_ck_diff++ < 16)
+            fprintf(stderr, "[GPU-RBRING] check: flip %u's ring copy differs from its waiting readback\n",
+                    r->gen);
+        rb_lag_note(r->gen);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)r->t, 0);
+    }
+}
+
+static void rb_check_queue(BwSurf *s, ID3D11Texture2D *src)
+{
+    VfxRb *r = &s_rb_ck[s_rb_ck_next];
+    D3D11_BOX box;
+    if (r->pending) {
+        s_rb_ck_lost++;
+        r->pending = 0;
+    }
+    if (!r->t || r->tw != s->w || r->th != s->h || r->tbpp != s->bpp) {
+        D3D11_TEXTURE2D_DESC td;
+        if (r->t) ID3D11Texture2D_Release(r->t);
+        r->t = NULL;
+        memset(&td, 0, sizeof(td));
+        td.Width = s->w; td.Height = s->h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = surf_format(s->bpp);
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &r->t)))
+            return;
+        r->tw = s->w; r->th = s->h; r->tbpp = s->bpp;
+    }
+    box.left = s_rb_crop_x; box.top = 0; box.front = 0;
+    box.right = s_rb_crop_x + s->w; box.bottom = s->h; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)r->t, 0, 0, 0, 0,
+                                              (ID3D11Resource *)src, 0, &box);
+    r->va = s->va; r->w = s->w; r->h = s->h; r->bpp = s->bpp;
+    r->pitch = s->cur_pitch ? s->cur_pitch : (s->pitch ? s->pitch : s->w * s->bpp);
+    r->pending = 1;
+    r->gen = bwg_gen;
+    s_rb_ck_next = (s_rb_ck_next + 1) % VFX_RB_RING;
+}
+
 /* Copy a rendered surface back into guest memory. */
+static uint32_t s_gfxcap_rb_va, s_gfxcap_rb_pitch, s_gfxcap_rb_row, s_gfxcap_rb_rows;
+
 static void readback(BwSurf *s)
 {
     D3D11_MAPPED_SUBRESOURCE m;
@@ -1753,13 +1535,17 @@ static void readback(BwSurf *s)
         return;
     if (!(src = readback_source(s)))       /* VFX (D9): s->tex in Original */
         return;
-    if (vfx_rb_async()) {                  /* VFX (D9): Remastered, no wait */
+    if (vfx_rb_async() && !s_rb_force_sync) {   /* VFX (D9): Remastered, no wait */
         vfx_readback_async(s, src);
         s->dirty = 0;
         return;
     }
     for (unsigned k = 0; k < VFX_RB_RING; k++)
         s_vfx_rb[k].pending = 0;           /* VFX: older queued frames must not land after this one */
+    if (rb_ring_mode() == 2) {             /* I2 check: the ring's copy, beside the waiting one */
+        rb_check_poll();
+        rb_check_queue(s, src);
+    }
     if (!s_staging || s_staging_w < s->w || s_staging_h < s->h || s_staging_bpp != s->bpp) {
         D3D11_TEXTURE2D_DESC td;
         if (s_staging) ID3D11Texture2D_Release(s_staging);
@@ -1792,7 +1578,7 @@ static void readback(BwSurf *s)
          * never past the end of the guest block. */
         uint32_t row = s->w * s->bpp, rows = s->h;
         uint32_t pitch = s->cur_pitch ? s->cur_pitch : (s->pitch ? s->pitch : row);
-        uint32_t room = xbox_ContiguousBlockSize(s->va);
+        uint32_t room = bwg_block_size(s->va);
         if (row > pitch) row = pitch;
         if (room) {
             if (row > room) {
@@ -1809,223 +1595,29 @@ static void readback(BwSurf *s)
         }
         for (uint32_t y = 0; y < rows; y++)
             memcpy(GUEST(s->va) + (size_t)y * pitch, (uint8_t *)m.pData + (size_t)y * m.RowPitch, row);
+        if (rb_ring_mode() == 2) {         /* I2 check: what this flip wrote */
+            s_rb_ck_hash[bwg_gen & 63] = rb_hash((const uint8_t *)m.pData, m.RowPitch, row, rows);
+            s_rb_ck_gen[bwg_gen & 63] = bwg_gen;
+        }
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
+        s_gfxcap_rb_va = s->va;         /* BW_GFXCAP: the rows just written, for the flip hash */
+        s_gfxcap_rb_pitch = pitch;
+        s_gfxcap_rb_row = row;
+        s_gfxcap_rb_rows = rows;
     } else if (gpu_lost(hr, "the readback's Map")) {   /* item 28 */
         return;
     }
     s->dirty = 0;
 }
 
-/* ---- widescreen: 2D markers, the per-batch x remap, wide dumps ------------
- *
- * The game-side hooks (bw_remaster_hooks.c) write a tagged NV097 NOP before
- * and after each overlay layer and each movie frame; the carried executor
- * hands them here in stream order (bw_set_nop_marker_handler). Inside them a
- * draw is 2D: pillarboxed around its view's centre, so it keeps its shape,
- * except an untextured quad covering the whole view (a fade, a flash), which
- * stretches to fill the wide view. Everything else is 3D and stretches
- * (wsx = 1, 0); the game's own projection is already k times wider (Hor+).
- * All of it runs on the executor's thread, as the draws do. */
-extern void bw_set_nop_marker_handler(void (*fn)(uint32_t));
+/* ---- widescreen: the wide dumps -------------------------------------------
+ * (The markers, the 2D tests and the per-batch x remap are the core's:
+ * bwg_draw.c.) */
 
-/* 2D is a flag, not a nesting depth: BEGIN sets it, END clears it, and every
- * flip clears it too (no frame ends inside an overlay flush), so a marker
- * that goes missing can't turn later 3D into 2D for longer than one frame.
- * A lost END was seen (run ...-mk10, flip 301) before TK-38 was fixed. */
-static int s_ws_2d;             /* inside 2D markers */
-static int s_ws_cut43;          /* this view's 3D is 4:3 (the 4:3-cutscene option) */
-static int s_ws_full;           /* this batch: an untextured full-view 2D quad */
-static uint32_t s_ws_what;      /* the last BEGIN marker's argument (BW_WS_WHAT_*) */
-static unsigned s_ws_markers, s_ws_2d_draws;
-static unsigned s_ws_rx[4], s_ws_unpaired;   /* markers received per op; frames ending in 2D */
-static int s_ws_log = -1;       /* BW_WS_LOG=<n>: the first n 2D batches, for checking */
-
-static void ws_marker(uint32_t p)
-{
-    uint32_t op = (p >> 8) & 0xFF, arg = p & 0xFF;
-    if (!s_ws_markers++)
-        fprintf(stderr, "[WS] first in-stream marker %08X\n", p);
-    if (s_ws_log > 0 && getenv("BW_WS_LOG_MARKERS"))
-        fprintf(stderr, "[WS] f%u marker op %u arg %u in2d %d\n", s_gen, op, arg, s_ws_2d);
-    if (op < 4)
-        s_ws_rx[op]++;
-    if (op == BW_WS_OP_2D_BEGIN) {
-        s_ws_2d = 1;
-        s_ws_what = arg;
-    } else if (op == BW_WS_OP_2D_END) {
-        s_ws_2d = 0;
-    } else if (op == BW_WS_OP_3D_43)
-        s_ws_cut43 = arg != 0;
-}
-
-/* At each flip: no frame ends in 2D; a summary every 30 s when logging. */
-static void ws_frame_end(void)
-{
-    static unsigned next = 900;
-    if (s_ws_2d) {
-        s_ws_unpaired++;
-        s_ws_2d = 0;
-    }
-    if (s_ws_k > 1.0f && s_gen >= next) {
-        next = s_gen + 900;
-        fprintf(stderr, "[WS] frame %u: markers received BEGIN %u END %u, unpaired %u, "
-                "2D draws %u\n", s_gen, s_ws_rx[1], s_ws_rx[2], s_ws_unpaired, s_ws_2d_draws);
-    }
-}
-
-static void ws_summary(void)
-{
-    fprintf(stderr, "[WS] markers received: BEGIN %u END %u, frames ending in 2D %u, "
-            "2D draws %u\n", s_ws_rx[1], s_ws_rx[2], s_ws_unpaired, s_ws_2d_draws);
-}
-
-/* main.c, after bw_ws_init() and before the game runs: this boot's factor.
- * k == 1 (Original, the menus, -WIDESCREEN) registers nothing. */
+/* main.c, after bw_ws_init() and before the game runs (bwg_ws_start). */
 void bw_d3d11_ws_start(void)
 {
-    s_ws_k = bw_ws_k();
-    if (s_ws_k > 1.0f) {
-        bw_set_nop_marker_handler(ws_marker);
-        bw_edition_add_summary(ws_summary);
-    }
-}
-
-/* The surface's width in logical pixels: the bound surface's guest width
- * (what the shaders normalise by) once it is bound, else the width get_surf
- * will give it. */
-static float ws_logical_w(const Nv2aSurface *s)
-{
-    uint32_t sx = s->aa_sx ? s->aa_sx : 1;
-    uint32_t bpp = s->bytes_per_pixel ? s->bytes_per_pixel : 4;
-    uint32_t w = s->pitch && s->pitch / bpp >= s->width ? s->pitch / bpp : s->width;
-    if (s_cur && s_cur->va == s->color_va)
-        w = s_cur->w;
-    return (float)w / (float)sx;
-}
-
-/* The current view's horizontal extent in logical pixels: the window clip D3D
- * sets at every SetViewport (as apply_scissor reads it), else the surface. */
-static void ws_view(const Nv2aSurface *s, float *x0, float *x1)
-{
-    uint32_t h = bw_backend_reg(0x02C0);
-    float lw = ws_logical_w(s);
-    *x0 = 0.0f;
-    *x1 = lw;
-    if (h && bw_backend_reg(0x02B4) == 0) {
-        float a = (float)(h & 0xFFF), b = (float)((h >> 16) & 0xFFF) + 1.0f;
-        if (b > a) {
-            *x0 = a;
-            *x1 = b < lw ? b : lw;
-        }
-    }
-}
-
-/* lo..hi (logical pixels, or surface pixels when real) covers the view. */
-static int ws_covers_view(const Nv2aSurface *s, float lo, float hi, int real)
-{
-    float x0, x1, sx = s->aa_sx ? (float)s->aa_sx : 1.0f;
-    if (real) {
-        lo /= sx;
-        hi /= sx;
-    }
-    ws_view(s, &x0, &x1);
-    return lo <= x0 + 1.0f && hi >= x1 - 1.0f;
-}
-
-/* The view's height in logical pixels (window clip, else 480). */
-static float ws_view_h(const Nv2aSurface *s)
-{
-    uint32_t v = bw_backend_reg(0x02E0);
-    (void)s;
-    if (v && bw_backend_reg(0x02B4) == 0) {
-        float a = (float)(v & 0xFFF), b = (float)((v >> 16) & 0xFFF) + 1.0f;
-        if (b > a)
-            return b - a;
-    }
-    return 480.0f;
-}
-
-/* A full-view 2D quad is a backdrop (stretch it to the wide view) unless it
- * shows a picture. A picture (a loading screen, a menu background) maps its
- * texels about square onto the screen, at a texel or so per pixel. A backdrop
- * is untextured, or a swatch (at most one texel per 10 pixels across), or a
- * texture squeezed far out of square. The pause screen's darkening is both:
- * a 640x480 quad over 15 x 120 texels of a 512x1024 overlay page, and every
- * 4th frame over the whole page (seen, runs ...-p15, -p17uw). u/v ranges in
- * texels, or in 0..1 when normalized. */
-static int ws_backdrop(const Nv2aSurface *s, int textured, int normalized, uint32_t tw,
-                       uint32_t th, float u0, float u1, float v0, float v1)
-{
-    float su = u1 - u0, sv = v1 - v0, x0, x1, vw, vh, r;
-    if (!textured)
-        return 1;
-    if (normalized) {
-        su *= (float)tw;
-        sv *= (float)th;
-    }
-    ws_view(s, &x0, &x1);
-    vw = x1 - x0;
-    vh = ws_view_h(s);
-    if (su <= 8.0f || su <= 0.1f * vw)
-        return 1;                               /* a swatch */
-    if (sv <= 0.0f || vh <= 0.0f)
-        return 0;
-    r = (su / sv) / (vw / vh);                  /* 1: square texels on screen */
-    return r < 0.8f || r > 1.25f;
-}
-
-static float s_ws_span_u, s_ws_span_v;   /* the last full-view batch's texel span (log) */
-
-/* A 2D draw that samples a widened surface is a copy of the screen (the
- * pause screen's frozen scene: a full-screen triangle over the 1280x480 back
- * buffer, seen in run ...-pause8): it stretches like the 3D it copies. */
-static int ws_samples_wide(int textured, uint32_t offset)
-{
-    BwSurf *rt;
-    if (!textured)
-        return 0;
-    rt = find_surf(offset);
-    return rt && rt->wsk > 1.0f;
-}
-
-/* wsx for this batch: (1, 0) stretches; (1/kx, c(1 - 1/kx)) pillarboxes
- * around the view's centre c (NDC), which maps guest x to host x + c'(kx - 1)
- * at the guest's own scale. */
-static void ws_remap(const Nv2aSurface *s, float out[4], int full)
-{
-    float kx, x0, x1, c;
-    out[0] = 1.0f;
-    out[1] = out[2] = out[3] = 0.0f;
-    if (s_ws_k <= 1.0f || !s_cur || s_cur->wsk <= 1.0f)
-        return;
-    if (!((s_ws_2d > 0 && !full) || s_ws_cut43))
-        return;
-    kx = s_cur->wsk;
-    ws_view(s, &x0, &x1);
-    c = (x0 + x1) / ws_logical_w(s) - 1.0f;
-    out[0] = 1.0f / kx;
-    out[1] = c * (1.0f - out[0]);
-    s_ws_2d_draws++;
-}
-
-static void ws_note(char path, uint32_t n, int tex, uint32_t tw, uint32_t th, float lo, float hi,
-                    const Nv2aSurface *s)
-{
-    static unsigned from;               /* BW_WS_LOG_FROM=<flip>: start there */
-    float x0, x1;
-    if (s_ws_log < 0) {
-        const char *e = getenv("BW_WS_LOG");
-        s_ws_log = e && *e ? atoi(e) : 0;
-        e = getenv("BW_WS_LOG_FROM");
-        from = e && *e ? (unsigned)atoi(e) : 0;
-    }
-    if (s_ws_log <= 0 || s_ws_2d <= 0 || s_gen < from)
-        return;
-    s_ws_log--;
-    ws_view(s, &x0, &x1);
-    fprintf(stderr, "[WS] f%u 2D L%u %c n%u tex%d %ux%u uv span %.3g x %.3g x %.1f..%.1f view %.0f..%.0f"
-            " aa%u full%d surf %08X\n", s_gen, s_ws_what, path, n, tex, tex ? tw : 0, tex ? th : 0,
-            s_ws_span_u, s_ws_span_v, lo, hi, x0, x1, s->aa_sx, s_ws_full, s_cur ? s_cur->va : 0);
+    bwg_ws_start();
 }
 
 /* The wide picture, at the flips the executor dumps (RECOMP_FB_DUMP_FLIPS:
@@ -2066,7 +1658,7 @@ static void ws_dump(BwSurf *sf)
     uint8_t hd[54];
     FILE *f;
 
-    if (s_ws_k <= 1.0f || !sf || sf->wsk <= 1.0f || !sf->tex)
+    if (bwg_ws_k <= 1.0f || !sf || sf->wsk <= 1.0f || !sf->tex)
         return;
     if (spec == (const char *)-1) {
         spec = getenv("RECOMP_FB_DUMP_FLIPS");
@@ -2163,244 +1755,20 @@ static void ws_dump(BwSurf *sf)
 
 /* ---- textures ----------------------------------------------------------- */
 
-/* Bits per texel of the NV097 colour formats this title is likely to use; 0
- * for DXT (handled by block size). Unknown codes hash as 32 bpp. */
-static uint32_t tex_bpp(uint32_t color, int *dxt)
-{
-    *dxt = 0;
-    switch (color) {
-    case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1B: case 0x1F:
-        return 8;
-    case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11: case 0x1A:
-    case 0x1C: case 0x1D: case 0x20: case 0x27: case 0x28: case 0x29: case 0x30:
-        return 16;
-    case 0x0C: *dxt = 8; return 0;        /* DXT1: 8 bytes per 4x4 */
-    case 0x0E: case 0x0F: *dxt = 16; return 0;
-    default:
-        return 32;
-    }
-}
+/* (The texture cache is the core's: bwg_tex.c.) */
 
-static uint64_t hash_bytes(const uint8_t *p, size_t n)
-{
-    uint64_t h = 1469598103934665603ull;
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint64_t v;
-        memcpy(&v, p + i, 8);
-        h = (h ^ v) * 0x100000001B3ull;
-        h ^= h >> 29;
-    }
-    for (; i < n; i++)
-        h = (h ^ p[i]) * 0x100000001B3ull;
-    return h;
-}
-
-static size_t tex_bytes(const Nv2aTexture *t)
-{
-    int dxt;
-    uint32_t bpp = tex_bpp(t->color, &dxt);
-    size_t n;
-    if (t->pitch)
-        n = (size_t)t->pitch * t->height;
-    else if (dxt)
-        n = (size_t)((t->width + 3) / 4) * ((t->height + 3) / 4) * dxt;
-    else
-        n = (size_t)t->width * t->height * bpp / 8;
-    return n > (64u << 20) ? 0 : n;
-}
-
-static uint64_t tex_hash(const Nv2aTexture *t)
-{
-    size_t n = tex_bytes(t);
-    if (!n)
-        return 0;
-    return hash_bytes(GUEST(t->offset), n) ^ ((uint64_t)t->color << 56);
-}
-
-/* 128 eight-byte samples spread over the texture: what a texture that has
- * not changed for a while is checked with each frame, instead of hashing all
- * of it. A full check still runs every 32 frames. */
-static uint64_t tex_sparse(const Nv2aTexture *t)
-{
-    size_t n = tex_bytes(t), i;
-    const uint8_t *p = GUEST(t->offset);
-    uint64_t h = 1469598103934665603ull;
-    if (n < 8)
-        return 0;
-    for (i = 0; i < 128; i++) {
-        uint64_t v;
-        size_t off = ((n - 8) * i / 127) & ~(size_t)7;
-        memcpy(&v, p + off, 8);
-        h = (h ^ v) * 0x100000001B3ull;
-        h ^= h >> 29;
-    }
-    return h;
-}
-
-/* Upload without the per-texel decoder where the layout allows: DXT blocks
- * go to the GPU as they are (BC1-3 are the same S3TC blocks), the common
- * swizzled and linear 32-bit and R5G6B5 formats are unswizzled or copied in
- * bulk. Returns 0 to fall back to nv2a_backend_decode_texture. */
-static int s_mips = -1;         /* BW_GPU_MIPS=0: level 0 only, as the CPU path */
-
-static int use_mips(void)
-{
-    if (s_mips < 0) {
-        const char *e = getenv("BW_GPU_MIPS");
-        s_mips = !(e && e[0] == '0');
-    }
-    return s_mips;
-}
-
-/* How many levels to upload: what the texture says it carries, down to 1x1,
- * at most 12. */
-static uint32_t mip_count(const Nv2aTexture *t)
-{
-    uint32_t n = 1, w = t->width, h = t->height;
-    uint32_t want = (use_mips() && !t->pitch && t->levels > 1) ? t->levels : 1;
-    while (n < want && n < 12 && (w > 1 || h > 1)) {
-        w = w > 1 ? w / 2 : 1;
-        h = h > 1 ? h / 2 : 1;
-        n++;
-    }
-    return n;
-}
-
-/* VFX (V1, VFX_HUD_EDGES): is a DXT3/DXT5 texture's alpha hard-edged:
- * opaque shapes with only a thin anti-aliased rim (the radar's compass ring,
- * weapon and bar icons), as opposed to glows and translucent art (meters, the
- * radar lens). Decided from level 0's alpha blocks: at least 3% of the texels
- * opaque (alpha >= 215) and at most half as many partial ones (41..214).
- * Checked on the 53 DXT5 overlays: 23 qualify (docs/day1/V1.md). */
-static int tex_hard_alpha(uint32_t color, const uint8_t *q, uint32_t w, uint32_t h)
-{
-    uint32_t nb, i, k, opaque = 0, partial = 0, total;
-    if ((color != 0x0E && color != 0x0F) || !q || w < 4 || h < 4 || w > 512 || h > 512)
-        return 0;
-    nb = ((w + 3) / 4) * ((h + 3) / 4);
-    total = nb * 16;
-    for (i = 0; i < nb; i++, q += 16) {
-        uint8_t pal[8];
-        uint64_t bits = 0;
-        for (k = 0; k < 16; k++) {
-            uint32_t a;
-            if (color == 0x0E) {                    /* DXT3: explicit 4-bit alpha */
-                a = (q[k >> 1] >> ((k & 1) * 4)) & 0xF;
-                a = a * 17;
-            } else {                                /* DXT5: interpolated alpha */
-                if (k == 0) {
-                    uint32_t a0 = q[0], a1 = q[1], j;
-                    pal[0] = (uint8_t)a0; pal[1] = (uint8_t)a1;
-                    if (a0 > a1)
-                        for (j = 1; j < 7; j++) pal[j + 1] = (uint8_t)(((7 - j) * a0 + j * a1) / 7);
-                    else {
-                        for (j = 1; j < 5; j++) pal[j + 1] = (uint8_t)(((5 - j) * a0 + j * a1) / 5);
-                        pal[6] = 0; pal[7] = 255;
-                    }
-                    for (j = 0; j < 6; j++) bits |= (uint64_t)q[2 + j] << (8 * j);
-                }
-                a = pal[(bits >> (3 * k)) & 7];
-            }
-            if (a >= 215) opaque++;
-            else if (a > 40) partial++;
-        }
-    }
-    return opaque * 32 >= total && partial * 2 <= opaque;
-}
-
-/* Upload without the per-texel decoder where the layout allows: DXT blocks
- * go to the GPU as they are (BC1-3 are the same S3TC blocks), the common
- * swizzled and linear 32-bit and R5G6B5 formats are unswizzled or copied in
- * bulk. Swizzled and DXT textures keep their mip levels after level 0, each
- * laid out like a texture of its own size; those are uploaded too.
- * Fills init[] and td->MipLevels; returns 0 to fall back to
- * nv2a_backend_decode_texture (level 0 only). */
-static int fast_texture(const Nv2aTexture *t, D3D11_TEXTURE2D_DESC *td,
-                        D3D11_SUBRESOURCE_DATA *init)
-{
-    uint32_t w = t->width, h = t->height, x, y, lv, levels = mip_count(t);
-    const uint8_t *src = GUEST(t->offset);
-    uint8_t *dst = (uint8_t *)s_decode;
-    switch (t->color) {
-    case 0x0C: case 0x0E: case 0x0F: {              /* DXT1, DXT3, DXT5 */
-        uint32_t bb = t->color == 0x0C ? 8 : 16;
-        if ((w & 3) || (h & 3))
-            return 0;
-        td->Format = t->color == 0x0C ? DXGI_FORMAT_BC1_UNORM
-                   : t->color == 0x0E ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
-        for (lv = 0; lv < levels; lv++) {
-            uint32_t bw = (w + 3) / 4, bh = (h + 3) / 4;
-            init[lv].pSysMem = src;
-            init[lv].SysMemPitch = bw * bb;
-            init[lv].SysMemSlicePitch = 0;
-            src += (size_t)bw * bh * bb;
-            w = w > 1 ? w / 2 : 1;
-            h = h > 1 ? h / 2 : 1;
-        }
-        td->MipLevels = levels;
-        return 1;
-    }
-    case 0x06: case 0x07: case 0x05: {             /* A8R8G8B8, X8R8G8B8, R5G6B5 (swizzled) */
-        uint32_t bpp = t->color == 0x05 ? 2 : 4;
-        if ((w & (w - 1)) || (h & (h - 1)))
-            return 0;
-        for (lv = 0; lv < levels; lv++) {
-            xbox_unswizzle_rect(dst, src, w, h, bpp);
-            if (t->color == 0x07)
-                for (x = 0; x < w * h; x++)
-                    ((uint32_t *)dst)[x] |= 0xFF000000u;
-            init[lv].pSysMem = dst;
-            init[lv].SysMemPitch = w * bpp;
-            init[lv].SysMemSlicePitch = 0;
-            src += (size_t)w * h * bpp;
-            dst += (size_t)w * h * bpp;
-            w = w > 1 ? w / 2 : 1;
-            h = h > 1 ? h / 2 : 1;
-        }
-        td->Format = bpp == 2 ? DXGI_FORMAT_B5G6R5_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
-        td->MipLevels = levels;
-        return 1;
-    }
-    case 0x12: case 0x1E:                           /* LIN_A8R8G8B8, LIN_X8R8G8B8 */
-        if (!t->pitch || t->pitch < w * 4)
-            return 0;
-        for (y = 0; y < h; y++) {
-            memcpy(s_decode + (size_t)y * w, src + (size_t)y * t->pitch, w * 4);
-            if (t->color == 0x1E)
-                for (x = 0; x < w; x++)
-                    s_decode[(size_t)y * w + x] |= 0xFF000000u;
-        }
-        td->Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        init[0].pSysMem = s_decode;
-        init[0].SysMemPitch = w * 4;
-        td->MipLevels = 1;
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-/* BW_GPU_BLACKWATCH=<prefix>: what each frame sampled, to explain a frame
- * that suddenly goes black (see bw_flip). Kinds: R a surface this back end
- * drew (render to texture), F the current target (feedback, read from guest
- * memory), U uploaded this frame, H cached (full hash equal), S cached
- * (sampled check), G cached (already checked this frame). */
-typedef struct { uint32_t offset, w, h, color; char kind; int zero_pct; } BwTexUse;
-#define BW_MAX_USE 96
-static BwTexUse s_use[2][BW_MAX_USE];
-static int s_nuse[2];
-static int s_watch = -1;
+/* BW_GPU_BLACKWATCH=<prefix>: what each frame sampled (the core's list,
+ * bwg_tex_use), to explain a frame that suddenly goes black (see bw_flip). */
 static const char *s_watch_prefix;
 
 /* Giant triangles per frame: a vertex more than 4 surfaces away from the
- * surface, or with 1/w not positive and finite. [slot] as s_use. */
+ * surface, or with 1/w not positive and finite. [slot] as bwg_tex_use. */
 static unsigned s_huge[2], s_tris_frame[2];
 static BwXVertex s_huge_v[2][3];
 
 static void note_huge(const BwXVertex *v, uint32_t n, uint32_t w, uint32_t h)
 {
-    int slot = s_gen & 1;
+    int slot = bwg_gen & 1;
     uint32_t i, k;
     float lim_x = 4.0f * w, lim_y = 4.0f * h;
     s_tris_frame[slot] += n / 3;
@@ -2431,233 +1799,81 @@ static void print_huge(const char *what, int slot)
     fprintf(stderr, "\n");
 }
 
-static void note_use(const Nv2aTexture *t, char kind)
+/* What a stage samples, as the core's texture cache decided (bwg_tex.c):
+ * the entry's view, or the surface's (render to texture). */
+static ID3D11ShaderResourceView *tex_view(BwgTexRef r)
 {
-    BwTexUse *u = s_use[s_gen & 1];
-    int *n = &s_nuse[s_gen & 1], i;
-    if (s_watch <= 0)
-        return;
-    for (i = 0; i < *n; i++)
-        if (u[i].offset == t->offset && u[i].kind == kind)
-            return;
-    if (*n < BW_MAX_USE) {
-        u[*n].offset = t->offset; u[*n].w = t->width; u[*n].h = t->height;
-        u[*n].color = t->color; u[*n].kind = kind;
-        u[*n].zero_pct = -1;
-        if (kind == 'U') {
-            /* how much of a fresh upload is zero bytes (a texture caught
-             * mid-rewrite?), sampled at 256 points of level 0 */
-            size_t nb = tex_bytes(t), k, z = 0;
-            const uint8_t *q = GUEST(t->offset);
-            if (nb >= 256) {
-                for (k = 0; k < 256; k++)
-                    z += q[(nb - 1) * k / 255] == 0;
-                u[*n].zero_pct = (int)(z * 100 / 256);
-            }
-        }
-        (*n)++;
-    }
-}
-
-static ID3D11ShaderResourceView *get_texture_(const Nv2aTexture *t, char *kind);
-static ID3D11ShaderResourceView *get_cube_texture_(const Nv2aTexture *t, char *kind);
-/* T1: the cache entry get_texture_ last returned (NULL for a render target
- * or a failure); read only by the texture restoration (Remastered). */
-static BwTex *s_tex_last;
-static int tr_is_movie(const Nv2aTexture *t);
-
-/* 0.2.5 item 43: the cache entry with this texture's identity (address,
- * size, format, pitch; 2D or cube), or NULL. It was a scan of every entry
- * for every stage of every draw (about 125 in mission 1); now a
- * direct-mapped index of the last hit for each identity is tried first. An
- * index slot is only a hint, checked against the entry it names, so a slot
- * left by an entry since released or refilled just misses (and the scan
- * runs, as before). There are never two entries with one identity: a new
- * entry is made only when the scan finds none. */
-#define TEX_IDX 1024
-static int16_t s_tex_idx[TEX_IDX];      /* entry + 1; 0: none */
-
-static int tex_is(const BwTex *c, const Nv2aTexture *t, int cube)
-{
-    return c->offset == t->offset && c->w == t->width && c->h == t->height
-        && c->color == t->color && c->pitch == t->pitch && c->cube == (uint8_t)cube;
-}
-
-static BwTex *tex_find(const Nv2aTexture *t, int cube)
-{
-    uint32_t h = (t->offset >> 7) ^ (t->offset >> 19) ^ (t->width * 31u) ^ (t->height * 131u)
-               ^ (t->color << 5) ^ (t->pitch * 7u) ^ (uint32_t)cube;
-    int k;
-    h &= TEX_IDX - 1;
-    k = s_tex_idx[h];
-    if (k && memo_on() && k <= s_ntex && tex_is(&s_tex[k - 1], t, cube))
-        return &s_tex[k - 1];
-    for (int i = 0; i < s_ntex; i++)
-        if (tex_is(&s_tex[i], t, cube)) {
-            s_tex_idx[h] = (int16_t)(i + 1);
-            return &s_tex[i];
-        }
-    return NULL;
-}
-
-/* A cache entry to (re)fill: `e` itself, a free one, or the least recently
- * used, with its D3D objects released. */
-static BwTex *tex_slot(BwTex *e)
-{
-    if (!e) {
-        if (s_ntex == BW_MAX_TEX) {
-            int lru = 0;
-            for (int i = 1; i < s_ntex; i++)
-                if (s_tex[i].last_use < s_tex[lru].last_use) lru = i;
-            e = &s_tex[lru];
-        } else {
-            e = &s_tex[s_ntex++];
-            memset(e, 0, sizeof(*e));
-        }
-    }
-    if (e->srv) { ID3D11ShaderResourceView_Release(e->srv); e->srv = NULL; }
-    if (e->tex) { ID3D11Texture2D_Release(e->tex); e->tex = NULL; }
-    if (e->tr.state)
-        bw_tr_release(&e->tr);              /* T1: never set in Original */
-    /* 0.2.5 item 36: and no identity until the caller fills it, so a
-     * texture that can't be decoded or made isn't found again with no view
-     * (it drew blank, for good) but is tried again when next used. A
-     * filled entry sets every one of these. */
-    e->offset = 0; e->w = 0; e->h = 0; e->pitch = 0; e->color = 0;
-    e->hash = 0; e->sparse = 0; e->gen = 0; e->stable = 0; e->last_use = 0; e->cube = 0;
-    return e;
-}
-
-/* Swizzled and DXT textures have no rows; CONTROL1's pitch can be stale
- * (see get_texture). */
-static const Nv2aTexture *drop_stale_pitch(const Nv2aTexture *t, Nv2aTexture *fixed)
-{
-    static int stale = -1;
-    if (stale < 0) {
-        const char *e = getenv("BW_GPU_STALEPITCH");
-        stale = e && *e == '1';
-    }
-    if (t && t->pitch && !stale
-            && (d3d8_format_is_swizzled(t->color) || d3d8_format_dxt_block_bytes(t->color))) {
-        *fixed = *t;
-        fixed->pitch = 0;
-        return fixed;
-    }
-    return t;
+    return r.rt ? r.rt->srv : r.e ? r.e->srv : NULL;
 }
 
 static ID3D11ShaderResourceView *get_texture(const Nv2aTexture *t)
 {
-    char kind = '?';
-    ID3D11ShaderResourceView *v;
-    Nv2aTexture fixed;
-    /* Only linear formats have rows. CONTROL1's pitch stays set from earlier
-     * linear work while swizzled and DXT textures are bound (seen 2026-10-26,
-     * agent R2: DXT uploads with pitch 5120), and a stale pitch made the cache
-     * hash pitch x height (2.6 MB for a 512x512 DXT5), so the texture was
-     * re-created about every frame, and made mip_count() upload level 0 only.
-     * BW_GPU_STALEPITCH=1 restores the old behaviour for comparison. */
-    t = drop_stale_pitch(t, &fixed);
-    v = get_texture_(t, &kind);
-    if (t)
-        note_use(t, v ? kind : 'X');
-    return v;
+    return tex_view(bwg_get_texture(t));
 }
 
-static ID3D11ShaderResourceView *get_texture_(const Nv2aTexture *t, char *kind)
+static ID3D11ShaderResourceView *get_cube_texture(const Nv2aTexture *t)
 {
-    BwTex *e = NULL;
-    BwSurf *rt;
-    uint64_t h;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SUBRESOURCE_DATA init[12];
-    size_t need;
+    return tex_view(bwg_get_cube_texture(t));
+}
 
-    s_tex_last = NULL;
-    if (!t || !t->width || !t->height || t->width > 4096 || t->height > 4096)
-        return NULL;
-    /* Render to texture: a surface this back end drew. */
-    rt = find_surf(t->offset);
-    if (rt && rt != s_cur) {
-        surf_resolve(rt);                   /* VFX (D9): no-op in Original */
-        rt->used_gen = s_gen;               /* item 37: sampled counts as used */
-        s_st_rtt++;
-        *kind = 'R';
-        return rt->srv;
-    }
-    *kind = rt ? 'F' : 'G';
-    e = tex_find(t, 0);                     /* item 43: indexed */
-    if (e && e->gen == s_gen) {
-        e->last_use = s_gen;
-        s_tex_last = e;
-        return e->srv;
-    }
-    /* A texture unchanged for 30 frames: a sampled check, with a full one
-     * every 32 frames (staggered by address). */
-    if (e && e->stable >= 30 && ((s_gen + (e->offset >> 12)) & 31) != 0
-            && tex_sparse(t) == e->sparse) {
-        *kind = 'S';
-        e->gen = s_gen;
-        e->last_use = s_gen;
-        s_tex_last = e;
-        return e->srv;
-    }
-    h = tex_hash(t);
-    *kind = 'H';
-    if (e && e->hash == h && h) {
-        if (e->stable < 0xFFFFFFFFu)
-            e->stable++;
-        if (e->stable == 30)
-            e->sparse = tex_sparse(t);
-        e->gen = s_gen;
-        e->last_use = s_gen;
-        s_tex_last = e;
-        return e->srv;
-    }
-    {
-        int same = e != NULL;               /* T1: re-created with new contents, or a new entry */
-        e = tex_slot(e);
-        if (!same) {
-            e->tr_churn = 0;
-            e->tr_gen = 0;
-        }
-        e->tr_bound = 0;
-    }
-    e->cube = 0;
-    need = (size_t)t->width * t->height * 2;    /* level 0, and room for its mips */
-    if (need > s_decode_cap) {
-        free(s_decode);
-        s_decode = (uint32_t *)malloc(need * 4);
-        s_decode_cap = s_decode ? need : 0;
-        if (!s_decode)
-            return NULL;
-    }
+/* The core's uploads (BwgUpload) into D3D11: a 2D texture, or a
+ * TextureCube (six faces), with its view. Item 36: a failure is logged and
+ * nothing half-made is kept; the entry stays without an identity, so it is
+ * tried again when next used. */
+static int tex_create(BwTex *e, const Nv2aTexture *t, const BwgUpload *u)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA init[6 * 12];
+    uint32_t i;
     memset(&td, 0, sizeof(td));
-    td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Width = u->w; td.Height = u->h; td.MipLevels = u->levels; td.ArraySize = u->faces;
+    td.Format = (DXGI_FORMAT)u->format;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     memset(init, 0, sizeof(init));
-    if (!fast_texture(t, &td, init)) {
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        td.MipLevels = 1;
-        init[0].pSysMem = s_decode;
-        init[0].SysMemPitch = t->width * 4;
-        if (!nv2a_backend_decode_texture(t, s_decode))
-            return NULL;
+    for (i = 0; i < u->faces * u->levels; i++) {
+        init[i].pSysMem = u->mip[i].data;
+        init[i].SysMemPitch = u->mip[i].pitch;
+    }
+    if (u->faces == 6) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        HRESULT hr;
+        td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+        hr = BW_GPU_FT("texture", E_OUTOFMEMORY,       /* item 25 test aid */
+                       ID3D11Device_CreateTexture2D(s_dev, &td, init, &e->tex));
+        if (FAILED(hr)) {
+            e->tex = NULL;
+            res_failed(RF_TEXTURE, t->offset, t->width, t->height, hr);    /* item 36 */
+            return 0;
+        }
+        memset(&sd, 0, sizeof(sd));
+        sd.Format = td.Format;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+        sd.TextureCube.MostDetailedMip = 0;
+        sd.TextureCube.MipLevels = u->levels;
+        hr = BW_GPU_FT("resource", E_OUTOFMEMORY,
+                       ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex, &sd, &e->srv));
+        if (FAILED(hr)) {
+            e->srv = NULL;
+            ID3D11Texture2D_Release(e->tex);
+            e->tex = NULL;
+            res_failed(RF_TEX_VIEW, t->offset, t->width, t->height, hr);
+            return 0;
+        }
+        return 1;
     }
     {
-        double t0 = trc_on() ? qpc_ms() : 0.0;
+        double t0 = trc_on() ? bwg_qpc_ms() : 0.0;
         HRESULT hr = BW_GPU_FT("texture", E_OUTOFMEMORY,       /* item 25 test aid */
                                ID3D11Device_CreateTexture2D(s_dev, &td, init, &e->tex));
         if (FAILED(hr)) {
             e->tex = NULL;
             res_failed(RF_TEXTURE, t->offset, t->width, t->height, hr);    /* item 36 */
-            return NULL;
+            return 0;
         }
         if (trc_on()) {                                     /* T1 test aid */
-            s_trc_up += qpc_ms() - t0;
+            s_trc_up += bwg_qpc_ms() - t0;
             s_trc_nup++;
         }
         hr = BW_GPU_FT("resource", E_OUTOFMEMORY,               /* item 36: checked */
@@ -2667,346 +1883,40 @@ static ID3D11ShaderResourceView *get_texture_(const Nv2aTexture *t, char *kind)
             ID3D11Texture2D_Release(e->tex);
             e->tex = NULL;
             res_failed(RF_TEX_VIEW, t->offset, t->width, t->height, hr);
-            return NULL;
+            return 0;
         }
     }
-    /* T1 (VFX_TEX_RESTORE): the menu and title photos (BW_TEXRESTORE_MENUS:
-     * the game decodes each JPEG into a 640x480 LIN_A8R8G8B8 screen texture,
-     * docs/remaster/texture_matching.md section 3) and the Bink frames
-     * (BW_TEXRESTORE_MOVIES, item 11) get the 8x8 deblock on the GPU as they
-     * go up; the entry then holds the deblocked copy. */
-    e->jpeg = 0;
-    e->movie = 0;
-    if (bw_vfx_active() && e->srv && t->width == 640 && t->height == 480) {
-        int kind = (bw_vfx()->tr_menus && t->color == 0x12 && td.MipLevels == 1) ? 1
-                 : (bw_vfx()->tr_movies && tr_is_movie(t)) ? 2 : 0;
-        if (kind) {
-            ID3D11Texture2D *mt;
-            ID3D11ShaderResourceView *ms;
-            if (bw_tr_deblock_gpu(s_dev, s_ctx, e->srv, t->width, t->height, 8, kind, &mt, &ms)) {
-                ID3D11ShaderResourceView_Release(e->srv);
-                ID3D11Texture2D_Release(e->tex);
-                e->srv = ms;
-                e->tex = mt;
-                e->jpeg = kind == 1;
-                e->movie = kind == 2;
-            }
-            if (s_cur)
-                bind_targets(s_cur, s_cur_depth);
-        }
-    }
-    e->offset = t->offset; e->w = t->width; e->h = t->height;
-    e->color = t->color; e->pitch = t->pitch;
-    e->hash = h; e->gen = s_gen; e->last_use = s_gen;
-    e->stable = 0; e->sparse = 0;
-    /* VFX (D9): is it one of the game's glyph sheets (text) */
-    e->glyph = (uint8_t)(t->color == 0x0C && bw_vfx_is_glyph_sheet(GUEST(t->offset), t->width, t->height));
-    e->alpha1 = 0;
-    if (bw_vfx_active() && bw_vfx()->text) {
-        if (t->color == 0x02 || t->color == 0x10)               /* A1R5G5B5, swizzled or linear */
-            e->alpha1 = 1;
-        else if (t->color == 0x0C) {                            /* DXT1: any 3-colour block with index 3 */
-            const uint8_t *q = GUEST(t->offset);
-            uint32_t nb = ((t->width + 3) / 4) * ((t->height + 3) / 4), i;
-            for (i = 0; i < nb && !e->alpha1; i++, q += 8) {
-                uint32_t c0 = q[0] | (q[1] << 8), c1 = q[2] | (q[3] << 8);
-                uint32_t ix = q[4] | (q[5] << 8) | (q[6] << 16) | ((uint32_t)q[7] << 24), k;
-                if (c0 <= c1)
-                    for (k = 0; k < 16; k++)
-                        if (((ix >> (2 * k)) & 3) == 3) { e->alpha1 = 1; break; }
-            }
-        }
-    }
-    /* VFX (V1, VFX_HUD_EDGES): hard-edged alpha (only overlay draws use it) */
-    e->hard = (uint8_t)(bw_vfx_active() && bw_vfx()->hud_edges
-                        && tex_hard_alpha(t->color, GUEST(t->offset), t->width, t->height));
-    if (e->hard) {
-        static int told_hard;
-        if (told_hard++ < 48)
-            fprintf(stderr, "[VFX] hard-edged alpha %08X %ux%u (HUD edges contour when drawn as an overlay)\n",
-                    t->offset, t->width, t->height);
-    }
-    if (e->glyph) {
-        static int told;
-        if (told++ < 24)
-            fprintf(stderr, "[VFX] glyph sheet %08X %ux%u: text drawn with the contour filter\n",
-                    t->offset, t->width, t->height);
-    }
-    s_st_uploads++;
-    *kind = 'U';
-    s_tex_last = e;
-    /* BW_GPU_TEXLOG=<file>: one line per upload with a plain FNV-1a 64 of the
-     * level-0 bytes as the game hands them to the GPU, so a script can match
-     * them against the texture files (Remastered texture packs). Test aid. */
-    {
-        static int texlog_init;
-        static FILE *texlog;
-        if (!texlog_init) {
-            const char *p = getenv("BW_GPU_TEXLOG");
-            texlog_init = 1;
-            if (p && *p)
-                texlog = fopen(p, "a");
-        }
-        if (texlog) {
-            /* Level 0 as stored: DXT blocks, or width x height x bpp (the
-             * pitch field is set even for DXT here, so it isn't used). For
-             * non-DXT textures with a pitch, a second hash covers pitch x
-             * height (linear images). */
-            int dxt;
-            uint32_t bpp = tex_bpp(t->color, &dxt);
-            size_t n = dxt ? (size_t)((t->width + 3) / 4) * ((t->height + 3) / 4) * dxt
-                           : (size_t)t->width * t->height * bpp / 8;
-            size_t nl = (!dxt && t->pitch) ? (size_t)t->pitch * t->height : 0, i;
-            const uint8_t *q = GUEST(t->offset);
-            uint64_t f = 1469598103934665603ull, fl = 1469598103934665603ull;
-            if (n > (64u << 20)) n = 0;
-            if (nl > (64u << 20)) nl = 0;
-            for (i = 0; i < n; i++)
-                f = (f ^ q[i]) * 1099511628211ull;
-            for (i = 0; i < nl; i++)
-                fl = (fl ^ q[i]) * 1099511628211ull;
-            fprintf(texlog, "T %u color 0x%02X %ux%u %s%u pitch %u l0bytes %zu fnv1a64 %016llX linbytes %zu linfnv %016llX at %08X\n",
-                    (unsigned)s_gen, (unsigned)t->color, (unsigned)t->width, (unsigned)t->height,
-                    dxt ? "dxtblock " : "bpp ", dxt ? (unsigned)dxt : bpp, (unsigned)t->pitch,
-                    n, (unsigned long long)f, nl, (unsigned long long)(nl ? fl : 0), (unsigned)t->offset);
-            fflush(texlog);
-        }
-    }
-    return e->srv;
+    return 1;
 }
 
-/* ---- cube maps ------------------------------------------------------------ */
-
-/* BW_GPU_CUBE=0: sample a cube map's first face as a 2D texture, as this back
- * end did before 2026-10-27 (reflections came out wrong). */
-static int use_cube(void)
+/* An entry's objects released before it is filled again (tex_slot). */
+static void tex_release(BwTex *e)
 {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("BW_GPU_CUBE");
-        v = !(e && e[0] == '0');
-    }
-    return v;
+    if (e->srv) { ID3D11ShaderResourceView_Release(e->srv); e->srv = NULL; }
+    if (e->tex) { ID3D11Texture2D_Release(e->tex); e->tex = NULL; }
+    if (e->tr.state)
+        bw_tr_release(&e->tr);              /* T1: never set in Original */
 }
 
-/* BW_GPU_DOTMODES=0: the dot-product reflection stages read zero, as before
- * 2026-10-27 (and as the CPU path still does). */
-static int use_dotmodes(void)
+/* T1: the menu and title photos and the Bink frames get the 8x8 deblock on
+ * the GPU as they go up; the entry then holds the deblocked copy. */
+static int tex_deblock(BwTex *e, const Nv2aTexture *t, int kind)
 {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("BW_GPU_DOTMODES");
-        v = !(e && e[0] == '0');
+    ID3D11Texture2D *mt;
+    ID3D11ShaderResourceView *ms;
+    int ok = 0;
+    if (bw_tr_deblock_gpu(s_dev, s_ctx, e->srv, t->width, t->height, 8, kind, &mt, &ms)) {
+        ID3D11ShaderResourceView_Release(e->srv);
+        ID3D11Texture2D_Release(e->tex);
+        e->srv = ms;
+        e->tex = mt;
+        ok = 1;
     }
-    return v;
+    if (bwg_cur)
+        bind_targets(bwg_cur, bwg_cur_depth);
+    return ok;
 }
 
-static int dot_program(uint32_t prog)
-{
-    int st;
-    for (st = 1; st < 4; st++) {
-        uint32_t m = (prog >> (st * 5)) & 0x1F;
-        if (m == 0x11 || m == 0x0B || m == 0x0C)
-            return 1;
-    }
-    return 0;
-}
-
-/* Does stage `st` of this program sample a cube map: CUBEMAP, or the
- * dot-product reflections (diffuse at stage 2, specular at stage 3). */
-static int cube_stage(uint32_t prog, int st)
-{
-    uint32_t m = (prog >> (st * 5)) & 0x1F;
-    if (m == 3)
-        return use_cube();
-    if ((m == 0x0B && st == 2) || (m == 0x0C && st == 3))
-        return use_cube() && use_dotmodes();
-    return 0;
-}
-
-/* Bytes between cube faces, as the CPU path (nv2a_pb_exec.c tex_face_stride,
- * after xemu): one face with every level the texture says it stores, rounded
- * up to the NV2A's 128-byte face alignment. */
-static uint32_t cube_face_stride(const Nv2aTexture *t)
-{
-    uint32_t w = t->width, h = t->height, lv, total = 0;
-    uint32_t levels = t->levels ? t->levels : 1, bpp;
-    int dxt;
-    if (t->pitch)
-        return (t->pitch * t->height + 127u) & ~127u;
-    bpp = tex_bpp(t->color, &dxt);
-    for (lv = 0; lv < levels; lv++) {
-        uint32_t lw = (w >> lv) ? (w >> lv) : 1, lh = (h >> lv) ? (h >> lv) : 1;
-        total += dxt ? ((lw + 3) / 4) * ((lh + 3) / 4) * (uint32_t)dxt : lw * lh * bpp / 8;
-    }
-    return (total + 127u) & ~127u;
-}
-
-static uint32_t *s_cube_decode;
-static size_t s_cube_cap;       /* uint32s */
-
-static ID3D11ShaderResourceView *get_cube_texture(const Nv2aTexture *t)
-{
-    char kind = '?';
-    ID3D11ShaderResourceView *v;
-    Nv2aTexture fixed;
-    t = drop_stale_pitch(t, &fixed);
-    v = get_cube_texture_(t, &kind);
-    if (t)
-        note_use(t, v ? kind : 'X');
-    return v;
-}
-
-/* Six faces, one after another at cube_face_stride, each laid out like a 2D
- * texture of its own (with its mips): uploaded as one TEXTURECUBE resource.
- * The face order (+X, -X, +Y, -Y, +Z, -Z) and the direction-to-face mapping
- * are D3D's, which the CPU path's rc_stage_fetch follows too. */
-static ID3D11ShaderResourceView *get_cube_texture_(const Nv2aTexture *t, char *kind)
-{
-    BwTex *e = NULL;
-    uint32_t stride, f, lv, levels = 1;
-    size_t face_texels;
-    uint64_t h;
-    D3D11_TEXTURE2D_DESC td;
-    D3D11_SUBRESOURCE_DATA init[6 * 12];
-    D3D11_SHADER_RESOURCE_VIEW_DESC sd;
-    uint32_t *keep;
-    size_t keep_cap;
-    int fast = 1, ok = 1, i;
-
-    if (!t || !t->width || t->width != t->height || t->width > 2048)
-        return NULL;
-    stride = cube_face_stride(t);
-    if (!stride || (size_t)stride * 6 > (64u << 20))
-        return NULL;
-    *kind = 'G';
-    e = tex_find(t, 1);                     /* item 43: indexed */
-    if (e && e->gen == s_gen) {
-        e->last_use = s_gen;
-        return e->srv;
-    }
-    /* Cube maps are few and small here: a full hash of all six faces once a
-     * frame, no sampled check. */
-    h = hash_bytes(GUEST(t->offset), (size_t)stride * 6) ^ ((uint64_t)t->color << 56) ^ 0xC0BEull;
-    *kind = 'H';
-    if (e && e->hash == h) {
-        e->gen = s_gen;
-        e->last_use = s_gen;
-        return e->srv;
-    }
-    e = tex_slot(e);
-    face_texels = (size_t)t->width * t->height * 2;  /* level 0 and room for its mips */
-    if (face_texels * 6 > s_cube_cap) {
-        free(s_cube_decode);
-        s_cube_decode = (uint32_t *)malloc(face_texels * 6 * 4);
-        s_cube_cap = s_cube_decode ? face_texels * 6 : 0;
-        if (!s_cube_decode)
-            return NULL;
-    }
-    memset(&td, 0, sizeof(td));
-    memset(init, 0, sizeof(init));
-    keep = s_decode;
-    keep_cap = s_decode_cap;
-    for (f = 0; f < 6 && ok; f++) {
-        Nv2aTexture ft = *t;
-        D3D11_TEXTURE2D_DESC fd;
-        D3D11_SUBRESOURCE_DATA fi[12];
-        ft.offset = t->offset + f * stride;
-        memset(&fd, 0, sizeof(fd));
-        memset(fi, 0, sizeof(fi));
-        fd.MipLevels = 1;
-        fd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        s_decode = s_cube_decode + f * face_texels;   /* fast_texture's scratch */
-        s_decode_cap = face_texels;
-        if (fast && fast_texture(&ft, &fd, fi)) {
-            if (f == 0) {
-                levels = fd.MipLevels;
-                td.Format = fd.Format;
-            } else if (fd.MipLevels != levels || fd.Format != td.Format) {
-                ok = 0;
-                break;
-            }
-            for (lv = 0; lv < levels; lv++)
-                init[f * levels + lv] = fi[lv];
-        } else {
-            if (f > 0 && fast) {        /* the format decides; it can't differ by face */
-                ok = 0;
-                break;
-            }
-            fast = 0;
-            levels = 1;
-            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            if (!nv2a_backend_decode_texture(&ft, s_decode)) {
-                ok = 0;
-                break;
-            }
-            init[f].pSysMem = s_decode;
-            init[f].SysMemPitch = t->width * 4;
-        }
-    }
-    s_decode = keep;
-    s_decode_cap = keep_cap;
-    if (!ok)
-        return NULL;
-    td.Width = t->width; td.Height = t->height; td.MipLevels = levels; td.ArraySize = 6;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
-    {
-        HRESULT hr = BW_GPU_FT("texture", E_OUTOFMEMORY,       /* item 25 test aid */
-                               ID3D11Device_CreateTexture2D(s_dev, &td, init, &e->tex));
-        if (FAILED(hr)) {
-            e->tex = NULL;
-            res_failed(RF_TEXTURE, t->offset, t->width, t->height, hr);    /* item 36 */
-            return NULL;
-        }
-        memset(&sd, 0, sizeof(sd));
-        sd.Format = td.Format;
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
-        sd.TextureCube.MostDetailedMip = 0;
-        sd.TextureCube.MipLevels = levels;
-        hr = BW_GPU_FT("resource", E_OUTOFMEMORY,
-                       ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)e->tex, &sd, &e->srv));
-        if (FAILED(hr)) {
-            e->srv = NULL;
-            ID3D11Texture2D_Release(e->tex);
-            e->tex = NULL;
-            res_failed(RF_TEX_VIEW, t->offset, t->width, t->height, hr);
-            return NULL;
-        }
-    }
-    e->offset = t->offset; e->w = t->width; e->h = t->height;
-    e->color = t->color; e->pitch = t->pitch; e->cube = 1;
-    e->hash = h; e->gen = s_gen; e->last_use = s_gen;
-    e->stable = 0; e->sparse = 0;
-    s_st_uploads++;
-    *kind = 'U';
-    /* BW_GPU_TEXLOG: one "C" line per face (same hash as the T lines), for
-     * texture packs that replace cube maps. */
-    {
-        const char *p = getenv("BW_GPU_TEXLOG");
-        FILE *fp = (p && *p) ? fopen(p, "a") : NULL;
-        if (fp) {
-            int dxt;
-            uint32_t bpp = tex_bpp(t->color, &dxt);
-            size_t n = dxt ? (size_t)((t->width + 3) / 4) * ((t->height + 3) / 4) * dxt
-                           : (size_t)t->width * t->height * bpp / 8, k;
-            for (f = 0; f < 6; f++) {
-                const uint8_t *q = GUEST(t->offset + f * stride);
-                uint64_t fh = 1469598103934665603ull;
-                for (k = 0; k < n; k++)
-                    fh = (fh ^ q[k]) * 1099511628211ull;
-                fprintf(fp, "C %u color 0x%02X %ux%u face %u stride %u levels %u l0bytes %zu fnv1a64 %016llX at %08X\n",
-                        (unsigned)s_gen, (unsigned)t->color, (unsigned)t->width, (unsigned)t->height,
-                        (unsigned)f, (unsigned)stride, (unsigned)levels, n,
-                        (unsigned long long)fh, (unsigned)(t->offset + f * stride));
-            }
-            fclose(fp);
-        }
-    }
-    return e->srv;
-}
 
 /* BW_GPU_STAGESTATS=1: every 10 s, how many combiner draws used each texture
  * stage mode (xemu psh.c names), how many of those had a cube map bound, and
@@ -3088,166 +1998,124 @@ static void stage_stats(const BwXBatch *b, uint32_t prog, ID3D11ShaderResourceVi
 
 /* ---- render state ------------------------------------------------------- */
 
-static D3D11_BLEND map_blend(uint32_t f)
-{
-    switch (f) {
-    case 0: return D3D11_BLEND_ZERO;
-    case 1: return D3D11_BLEND_ONE;
-    case 0x300: return D3D11_BLEND_SRC_COLOR;
-    case 0x301: return D3D11_BLEND_INV_SRC_COLOR;
-    case 0x302: return D3D11_BLEND_SRC_ALPHA;
-    case 0x303: return D3D11_BLEND_INV_SRC_ALPHA;
-    case 0x304: return D3D11_BLEND_DEST_ALPHA;
-    case 0x305: return D3D11_BLEND_INV_DEST_ALPHA;
-    case 0x306: return D3D11_BLEND_DEST_COLOR;
-    case 0x307: return D3D11_BLEND_INV_DEST_COLOR;
-    case 0x308: return D3D11_BLEND_SRC_ALPHA_SAT;
-    case 0x8001: case 0x8003: return D3D11_BLEND_BLEND_FACTOR;
-    case 0x8002: case 0x8004: return D3D11_BLEND_INV_BLEND_FACTOR;
-    default: return D3D11_BLEND_ONE;
-    }
-}
-
-static D3D11_BLEND alpha_only(D3D11_BLEND b)
-{
-    /* colour factors are not allowed in the alpha blend */
-    switch (b) {
-    case D3D11_BLEND_SRC_COLOR: return D3D11_BLEND_SRC_ALPHA;
-    case D3D11_BLEND_INV_SRC_COLOR: return D3D11_BLEND_INV_SRC_ALPHA;
-    case D3D11_BLEND_DEST_COLOR: return D3D11_BLEND_DEST_ALPHA;
-    case D3D11_BLEND_INV_DEST_COLOR: return D3D11_BLEND_INV_DEST_ALPHA;
-    default: return b;
-    }
-}
-
-static D3D11_BLEND_OP map_blend_op(uint32_t e)
-{
-    switch (e) {
-    case 0x8007: return D3D11_BLEND_OP_MIN;
-    case 0x8008: return D3D11_BLEND_OP_MAX;
-    case 0x800A: return D3D11_BLEND_OP_SUBTRACT;
-    case 0x800B: return D3D11_BLEND_OP_REV_SUBTRACT;
-    default: return D3D11_BLEND_OP_ADD;
-    }
-}
-
-static D3D11_COMPARISON_FUNC map_cmp(uint32_t f)
-{
-    switch (f) {
-    case 0x200: return D3D11_COMPARISON_NEVER;
-    case 0x201: return D3D11_COMPARISON_LESS;
-    case 0x202: return D3D11_COMPARISON_EQUAL;
-    case 0x203: return D3D11_COMPARISON_LESS_EQUAL;
-    case 0x204: return D3D11_COMPARISON_GREATER;
-    case 0x205: return D3D11_COMPARISON_NOT_EQUAL;
-    case 0x206: return D3D11_COMPARISON_GREATER_EQUAL;
-    default: return D3D11_COMPARISON_ALWAYS;
-    }
-}
-
-static D3D11_STENCIL_OP map_sop(uint32_t o)
-{
-    switch (o) {
-    case 0: return D3D11_STENCIL_OP_ZERO;
-    case 0x1E01: return D3D11_STENCIL_OP_REPLACE;
-    case 0x1E02: return D3D11_STENCIL_OP_INCR_SAT;
-    case 0x1E03: return D3D11_STENCIL_OP_DECR_SAT;
-    case 0x150A: return D3D11_STENCIL_OP_INVERT;
-    case 0x8507: return D3D11_STENCIL_OP_INCR;
-    case 0x8508: return D3D11_STENCIL_OP_DECR;
-    default: return D3D11_STENCIL_OP_KEEP;
-    }
-}
-
 static int s_vfx_a2c;       /* VFX (D9): this draw's blend state has alpha-to-coverage */
 
+/* The blend, depth-stencil and sampler states, made from the core's
+ * descriptions (bwg_state.c) in the slots it hands out; NULL for none (a
+ * full table). Its numbers are D3D11's (checked below). */
 static ID3D11BlendState *get_blend(const Nv2aRenderState *rs)
 {
-    uint32_t key[6] = { rs->blend_enable, rs->blend_src, rs->blend_dst, rs->blend_eq,
-                        rs->color_mask, (uint32_t)s_vfx_a2c };
-    D3D11_BLEND_DESC bd;
-    D3D11_RENDER_TARGET_BLEND_DESC *t = &bd.RenderTarget[0];
-    UINT8 mask = 0;
-    for (int i = 0; i < s_nblend; i++)
-        if (!memcmp(s_blend[i].key, key, sizeof(key)))
-            return s_blend[i].bs;
-    if (s_nblend == BW_MAX_STATE)
+    BwgBlendDesc g;
+    int made, i = bwg_blend(rs, s_vfx_a2c, &g, &made);
+    if (i < 0)
         return NULL;
-    memset(&bd, 0, sizeof(bd));
-    bd.AlphaToCoverageEnable = s_vfx_a2c ? TRUE : FALSE;     /* VFX (D9); FALSE in Original */
-    t->BlendEnable = rs->blend_enable ? TRUE : FALSE;
-    t->SrcBlend = map_blend(rs->blend_src);
-    t->DestBlend = map_blend(rs->blend_dst);
-    t->BlendOp = map_blend_op(rs->blend_eq);
-    t->SrcBlendAlpha = alpha_only(t->SrcBlend);
-    t->DestBlendAlpha = alpha_only(t->DestBlend);
-    t->BlendOpAlpha = t->BlendOp;
-    if (rs->color_mask & 0x00010000u) mask |= D3D11_COLOR_WRITE_ENABLE_RED;
-    if (rs->color_mask & 0x00000100u) mask |= D3D11_COLOR_WRITE_ENABLE_GREEN;
-    if (rs->color_mask & 0x00000001u) mask |= D3D11_COLOR_WRITE_ENABLE_BLUE;
-    if (rs->color_mask & 0x01000000u) mask |= D3D11_COLOR_WRITE_ENABLE_ALPHA;
-    t->RenderTargetWriteMask = mask;
-    memcpy(s_blend[s_nblend].key, key, sizeof(key));
-    ID3D11Device_CreateBlendState(s_dev, &bd, &s_blend[s_nblend].bs);
-    return s_blend[s_nblend++].bs;
+    if (!made) {
+        D3D11_BLEND_DESC bd;
+        D3D11_RENDER_TARGET_BLEND_DESC *t = &bd.RenderTarget[0];
+        memset(&bd, 0, sizeof(bd));
+        bd.AlphaToCoverageEnable = g.a2c ? TRUE : FALSE;     /* VFX (D9); FALSE in Original */
+        t->BlendEnable = g.enable ? TRUE : FALSE;
+        t->SrcBlend = (D3D11_BLEND)g.src;
+        t->DestBlend = (D3D11_BLEND)g.dst;
+        t->BlendOp = (D3D11_BLEND_OP)g.op;
+        t->SrcBlendAlpha = (D3D11_BLEND)g.src_alpha;
+        t->DestBlendAlpha = (D3D11_BLEND)g.dst_alpha;
+        t->BlendOpAlpha = (D3D11_BLEND_OP)g.op_alpha;
+        t->RenderTargetWriteMask = g.write_mask;
+        ID3D11Device_CreateBlendState(s_dev, &bd, &s_blend[i]);
+    }
+    return s_blend[i];
 }
 
 static ID3D11DepthStencilState *get_ds(const Nv2aRenderState *rs, int has_depth)
 {
-    uint32_t key[10] = { has_depth && rs->depth_test_enable, rs->depth_func,
-                         has_depth && rs->depth_write, has_depth && rs->stencil_enable,
-                         rs->stencil_func, rs->stencil_func_mask, rs->stencil_write_mask,
-                         rs->stencil_fail, rs->stencil_zfail, rs->stencil_zpass };
-    D3D11_DEPTH_STENCIL_DESC dd;
-    for (int i = 0; i < s_nds; i++)
-        if (!memcmp(s_ds[i].key, key, sizeof(key)))
-            return s_ds[i].ds;
-    if (s_nds == BW_MAX_STATE)
+    BwgDepthDesc g;
+    int made, i = bwg_depth(rs, has_depth, &g, &made);
+    if (i < 0)
         return NULL;
-    memset(&dd, 0, sizeof(dd));
-    dd.DepthEnable = key[0] || key[2] ? TRUE : FALSE;
-    dd.DepthFunc = key[0] ? map_cmp(rs->depth_func) : D3D11_COMPARISON_ALWAYS;
-    dd.DepthWriteMask = key[2] ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-    dd.StencilEnable = key[3] ? TRUE : FALSE;
-    dd.StencilReadMask = (UINT8)rs->stencil_func_mask;
-    dd.StencilWriteMask = (UINT8)rs->stencil_write_mask;
-    dd.FrontFace.StencilFunc = map_cmp(rs->stencil_func);
-    dd.FrontFace.StencilFailOp = map_sop(rs->stencil_fail);
-    dd.FrontFace.StencilDepthFailOp = map_sop(rs->stencil_zfail);
-    dd.FrontFace.StencilPassOp = map_sop(rs->stencil_zpass);
-    dd.BackFace = dd.FrontFace;
-    memcpy(s_ds[s_nds].key, key, sizeof(key));
-    ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_ds[s_nds].ds);
-    return s_ds[s_nds++].ds;
+    if (!made) {
+        D3D11_DEPTH_STENCIL_DESC dd;
+        memset(&dd, 0, sizeof(dd));
+        dd.DepthEnable = g.depth_enable ? TRUE : FALSE;
+        dd.DepthFunc = (D3D11_COMPARISON_FUNC)g.depth_func;
+        dd.DepthWriteMask = g.depth_write_all ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.StencilEnable = g.stencil_enable ? TRUE : FALSE;
+        dd.StencilReadMask = g.read_mask;
+        dd.StencilWriteMask = g.write_mask;
+        dd.FrontFace.StencilFunc = (D3D11_COMPARISON_FUNC)g.func;
+        dd.FrontFace.StencilFailOp = (D3D11_STENCIL_OP)g.fail;
+        dd.FrontFace.StencilDepthFailOp = (D3D11_STENCIL_OP)g.zfail;
+        dd.FrontFace.StencilPassOp = (D3D11_STENCIL_OP)g.pass;
+        dd.BackFace = dd.FrontFace;
+        ID3D11Device_CreateDepthStencilState(s_dev, &dd, &s_ds[i]);
+    }
+    return s_ds[i];
 }
 
-/* The screen-space path's old sampler: always bilinear (BW_GPU_SSFILTER=0).
- * Its keys carry bit 31 so they never alias get_sampler_f's: they used to,
- * and a point-filtered combiner sampler and this bilinear one with the same
- * wrap modes were handed out for each other, whichever came first. */
+static ID3D11SamplerState *samp_obj(int i, int made, const BwgSamplerDesc *g)
+{
+    if (i < 0)
+        return NULL;
+    if (!made) {
+        D3D11_SAMPLER_DESC sd;
+        memset(&sd, 0, sizeof(sd));
+        sd.Filter = (D3D11_FILTER)g->filter;
+        sd.MaxAnisotropy = (UINT)g->max_aniso;
+        sd.AddressU = (D3D11_TEXTURE_ADDRESS_MODE)g->addr_u;
+        sd.AddressV = (D3D11_TEXTURE_ADDRESS_MODE)g->addr_v;
+        sd.AddressW = (D3D11_TEXTURE_ADDRESS_MODE)g->addr_w;
+        memcpy(sd.BorderColor, g->border, sizeof(sd.BorderColor));
+        sd.MinLOD = g->min_lod;
+        sd.MaxLOD = g->max_lod;
+        sd.ComparisonFunc = (D3D11_COMPARISON_FUNC)g->cmp;
+        ID3D11Device_CreateSamplerState(s_dev, &sd, &s_samp[i]);
+    }
+    return s_samp[i];
+}
+
+/* The screen-space path's old sampler: always bilinear (BW_GPU_SSFILTER=0). */
 static ID3D11SamplerState *get_sampler(uint32_t addr_u, uint32_t addr_v)
 {
-    uint32_t key[3] = { addr_u | 0x80000000u, addr_v, 0 };
-    D3D11_SAMPLER_DESC sd;
-    for (int i = 0; i < s_nsamp; i++)
-        if (!memcmp(s_samp[i].key, key, sizeof(key)))
-            return s_samp[i].ss;
-    if (s_nsamp == BW_MAX_STATE)
-        return NULL;
-    memset(&sd, 0, sizeof(sd));
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    /* NV097 wrap modes: 1 wrap, 2 mirror, 3 clamp to edge, 4 border */
-    sd.AddressU = addr_u == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : addr_u == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
-                : addr_u == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.AddressV = addr_v == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : addr_v == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
-                : addr_v == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.MaxLOD = D3D11_FLOAT32_MAX;
-    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    memcpy(s_samp[s_nsamp].key, key, sizeof(key));
-    ID3D11Device_CreateSamplerState(s_dev, &sd, &s_samp[s_nsamp].ss);
-    return s_samp[s_nsamp++].ss;
+    BwgSamplerDesc g;
+    int made, i = bwg_sampler_ss(addr_u, addr_v, &g, &made);
+    return samp_obj(i, made, &g);
 }
+
+/* The core's numbers (bwg_state.h) are Direct3D's. */
+_Static_assert(D3D11_BLEND_ZERO == 1 && D3D11_BLEND_ONE == 2
+               && D3D11_BLEND_SRC_COLOR == 3 && D3D11_BLEND_INV_SRC_COLOR == 4
+               && D3D11_BLEND_SRC_ALPHA == 5 && D3D11_BLEND_INV_SRC_ALPHA == 6
+               && D3D11_BLEND_DEST_ALPHA == 7 && D3D11_BLEND_INV_DEST_ALPHA == 8
+               && D3D11_BLEND_DEST_COLOR == 9 && D3D11_BLEND_INV_DEST_COLOR == 10
+               && D3D11_BLEND_SRC_ALPHA_SAT == 11
+               && D3D11_BLEND_BLEND_FACTOR == 14
+               && D3D11_BLEND_INV_BLEND_FACTOR == 15, "blend factors");
+_Static_assert(D3D11_BLEND_OP_ADD == 1 && D3D11_BLEND_OP_SUBTRACT == 2
+               && D3D11_BLEND_OP_REV_SUBTRACT == 3 && D3D11_BLEND_OP_MIN == 4
+               && D3D11_BLEND_OP_MAX == 5, "blend ops");
+_Static_assert(D3D11_COMPARISON_NEVER == 1 && D3D11_COMPARISON_LESS == 2
+               && D3D11_COMPARISON_EQUAL == 3 && D3D11_COMPARISON_LESS_EQUAL == 4
+               && D3D11_COMPARISON_GREATER == 5 && D3D11_COMPARISON_NOT_EQUAL == 6
+               && D3D11_COMPARISON_GREATER_EQUAL == 7
+               && D3D11_COMPARISON_ALWAYS == 8, "comparisons");
+_Static_assert(D3D11_STENCIL_OP_KEEP == 1 && D3D11_STENCIL_OP_ZERO == 2
+               && D3D11_STENCIL_OP_REPLACE == 3 && D3D11_STENCIL_OP_INCR_SAT == 4
+               && D3D11_STENCIL_OP_DECR_SAT == 5 && D3D11_STENCIL_OP_INVERT == 6
+               && D3D11_STENCIL_OP_INCR == 7 && D3D11_STENCIL_OP_DECR == 8, "stencil ops");
+_Static_assert(D3D11_COLOR_WRITE_ENABLE_RED == 1 && D3D11_COLOR_WRITE_ENABLE_GREEN == 2
+               && D3D11_COLOR_WRITE_ENABLE_BLUE == 4
+               && D3D11_COLOR_WRITE_ENABLE_ALPHA == 8, "write masks");
+_Static_assert(D3D11_CULL_NONE == 1 && D3D11_CULL_FRONT == 2
+               && D3D11_CULL_BACK == 3, "cull modes");
+_Static_assert(D3D11_FILTER_MIN_MAG_MIP_POINT == 0
+               && D3D11_FILTER_MIN_MAG_MIP_LINEAR == 0x15
+               && D3D11_FILTER_ANISOTROPIC == 0x55
+               && D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT == 0x10 && D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT == 0x04
+               && D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR == 0x01, "filters");
+_Static_assert(D3D11_TEXTURE_ADDRESS_WRAP == 1 && D3D11_TEXTURE_ADDRESS_MIRROR == 2
+               && D3D11_TEXTURE_ADDRESS_CLAMP == 3
+               && D3D11_TEXTURE_ADDRESS_BORDER == 4, "address modes");
+_Static_assert(BWG_MAX_STATE == 128 && BWG_MAX_RS_BIAS == 32, "the tables' sizes");
 
 /* ---- the combiner path (bw_backend_ext.h) ------------------------------ */
 
@@ -3276,12 +2144,7 @@ BW_WS_REMAP_HLSL
 "  return o;\n"
 "}\n";
 
-typedef struct {
-    float surf[4], depth[4], alpha[4], fogc[4];
-    float c0[8][4], c1[8][4], fc0[4], fc1[4];
-    float texinfo[4][4];
-    float wsx[4];                       /* widescreen x remap (BW_WS shaders only) */
-} BwXConsts;
+/* (BwXConsts, the combiner path's constants: bwg_draw.h.) */
 
 #define BW_MAX_PS 512
 typedef struct { BwRcKey key; ID3D11PixelShader *ps; } BwPs;
@@ -3333,77 +2196,6 @@ static int ensure_xpipeline(void)
     return s_xready;
 }
 
-/* 0.2.5 item 41: a key's parts the generated text never reads are zeroed,
- * so states that differ only in them share one shader (one table slot, one
- * create) instead of one each: combiner stages past the count (control &
- * 0xFF), and the texture fields of a stage whose program doesn't sample
- * (bw_rc_hlsl's rc_stage_fetch: only modes 1-3 read tex_valid, those with a
- * texture read tex_normalized unless a cube is bound, modes 1-2 tex_conv;
- * only mode-5 stages read their clip_plane_mode bits). A stage with any
- * Remastered variant bit is left as it is. The text, so the bytecode and the
- * pixels, are the same. Test aid BW_GPU_RCKEY_CHECK=1 generates the text
- * from the whole key too, once per distinct key, and logs any difference. */
-static void rc_key_trim(BwRcKey *k)
-{
-    static int check = -1;
-    BwRcKey full;
-    uint32_t n = k->control & 0xFF, s, st, clip = 0;
-    if (check < 0) {
-        const char *e = getenv("BW_GPU_RCKEY_CHECK");
-        check = e && e[0] == '1';
-        if (check)
-            fprintf(stderr, "[GPU-D3D11] test aid: each combiner key's shader text checked whole and"
-                            " trimmed (BW_GPU_RCKEY_CHECK)\n");
-    }
-    if (check)
-        full = *k;
-    if (n > 8)
-        n = 8;
-    for (s = n; s < 8; s++)
-        k->color_icw[s] = k->alpha_icw[s] = k->color_ocw[s] = k->alpha_ocw[s] = 0;
-    for (st = 0; st < 4; st++) {
-        uint32_t mode = (k->stage_program >> (st * 5)) & 0x1F;
-        if (mode == 5)
-            clip |= k->clip_plane_mode & (0xFu << (st * 4));
-        if (k->vfx[st])
-            continue;
-        if (mode < 1 || mode > 3)
-            k->tex_valid[st] = 0;
-        if (!k->tex_valid[st] || (mode == 3 && k->tex_cube[st]))
-            k->tex_normalized[st] = 0;
-        if (!k->tex_valid[st] || mode == 3)
-            k->tex_conv[st] = 0;
-    }
-    k->clip_plane_mode = clip;
-    if (check && memcmp(&full, k, sizeof *k)) {
-        static uint64_t seen[4096];
-        static char a[64 * 1024], b[64 * 1024];
-        static unsigned keys, differ;
-        uint64_t h = 1469598103934665603ull;
-        const uint8_t *p = (const uint8_t *)&full;
-        size_t i, la, lb;
-        for (i = 0; i < sizeof full; i++)
-            h = (h ^ p[i]) * 1099511628211ull;
-        h |= 1;
-        for (i = h & 4095; seen[i] && seen[i] != h; i = (i + 1) & 4095)
-            ;
-        if (seen[i] == h || keys >= 3500)
-            return;
-        seen[i] = h;
-        keys++;
-        la = bw_rc_hlsl(&full, a, sizeof a);
-        lb = bw_rc_hlsl(k, b, sizeof b);
-        if (la != lb || memcmp(a, b, la)) {
-            if (differ++ < 3)
-                fprintf(stderr, "[GPU-D3D11] rc key check: a trimmed key's shader text DIFFERS (control 0x%X"
-                                " stage_program 0x%X, %u vs %u bytes)\n", full.control, full.stage_program,
-                        (unsigned)la, (unsigned)lb);
-        }
-        if (keys <= 40 || keys % 50 == 0)
-            fprintf(stderr, "[GPU-D3D11] rc key check: %u trimmed keys checked, %u with different text\n",
-                    keys, differ);
-    }
-}
 
 static ID3D11PixelShader *get_rc_shader(const BwRcKey *k)
 {
@@ -3414,7 +2206,7 @@ static ID3D11PixelShader *get_rc_shader(const BwRcKey *k)
     int rejected = 0;
     BwPs *e;
     static int last = -1;               /* item 43: consecutive draws mostly share one */
-    if (last >= 0 && last < s_nps && memo_on() && !memcmp(&s_ps_cache[last].key, k, sizeof(*k)))
+    if (last >= 0 && last < s_nps && bwg_memo_on() && !memcmp(&s_ps_cache[last].key, k, sizeof(*k)))
         return s_ps_cache[last].ps;
     for (int i = 0; i < s_nps; i++)
         if (!memcmp(&s_ps_cache[i].key, k, sizeof(*k))) {
@@ -3445,12 +2237,12 @@ static ID3D11PixelShader *get_rc_shader(const BwRcKey *k)
     /* T1: the persistent cache (bw_pscache.c, every edition): the bytecode a
      * earlier run compiled from exactly this text, with this compiler and
      * these flags. Same bytes as a compile, so the same pixels. */
-    double pt0 = qpc_ms();
+    double pt0 = bwg_qpc_ms();
     size_t csz = 0;
     const void *cblob = bw_pscache_find(src, len, &csz);
     if (cblob && !bw_pscache_verify()) {
         if (SUCCEEDED(hr = ID3D11Device_CreatePixelShader(s_dev, cblob, csz, NULL, &e->ps))) {
-            bw_pscache_note(0, qpc_ms() - pt0);
+            bw_pscache_note(0, bwg_qpc_ms() - pt0);
             return e->ps;
         }
         /* item 41: bytes the driver won't take: compile, and store the
@@ -3500,159 +2292,26 @@ static ID3D11PixelShader *get_rc_shader(const BwRcKey *k)
                             " 0x%08lX): its draws are skipped\n", (unsigned long)hr);
     }
     s_ps_compiles++;
-    bw_pscache_note(1, qpc_ms() - pt0);
+    bw_pscache_note(1, bwg_qpc_ms() - pt0);
     return e->ps;
 }
 
-/* Point or bilinear, as the CPU path chooses (rc_texel: TENT when MAG is 2
- * or MIN is 2, 4 or 6). */
-/* BW_GPU_BORDER=0: BORDER addressing reads transparent black whatever the
- * texture's FORMAT says, as before 2026-10-27. */
-static int use_border(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("BW_GPU_BORDER");
-        v = !(e && e[0] == '0');
-    }
-    return v;
-}
 
-/* BORDER (4) reads SET_TEXTURE_BORDER_COLOR when FORMAT's border source is
- * "colour" (border_src 1); with the source "texture" the CPU path clamps to
- * the edge texel, and so does this (nv2a_pb_exec.c sample_tex). Projected
- * shadow maps rely on the colour. */
-/* CONVOLUTION_2D_LOD0 (MIN 7 / MAG 4), with SET_TEXTURE_FILTER's kernel
- * (bits 13-15: 1 quincunx, 2 gaussian 3x3). Blood Wake's anti-aliasing
- * resolve (D3D_SwapAntialiased, D3DTEXF_QUINCUNX) samples the 2x-wide surface
- * this way; the sampler took MIN 7 as nearest, so the resolve point-sampled
- * one of each pair of columns. As xemu, the taps are bilinear and the
- * combiner shader sums a 3x3 Gaussian of them (bw_rc_hlsl.c); the present
- * resolves the same way (gpu_present). BW_GPU_CONV=0: a single nearest tap,
- * as before 2026-10-27. Returns the kernel, or 0. */
-static int use_conv(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("BW_GPU_CONV");
-        v = !(e && e[0] == '0');
-    }
-    return v && !bw_ab_off("conv");
-}
-
-/* Colours and fog as xemu interpolates them (a port fix, every edition):
- * perspective-correct, with the fog factor clamped per pixel rather than per
- * vertex. Both renderers interpolated colours and fog affinely in screen space
- * and clamped fog at the vertices, which on a large triangle reaching past the
- * fog's end (the sea towards the horizon) spreads the haze differently. xemu
- * declares them smooth (common.c pgraph_glsl_get_vtx_header) and clamps fog
- * in the pixel shader (psh.c), noting the per-vertex fog is only clamped to
- * the float range "to match HW interpolation". BW_GPU_PERSP=0 restores the
- * old rule (inferred hardware behaviour; xemu is the reference). */
-static int use_persp(void)
-{
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("BW_GPU_PERSP");
-        v = !(e && e[0] == '0');
-    }
-    return v && !bw_ab_off("persp");
-}
-
-/* The filter of the title's last anti-aliasing resolve (xdraw_prepare). */
-static uint32_t s_resolve_filter;
-static int s_resolve_seen;
-
-static int conv_kernel(uint32_t filter)
-{
-    uint32_t k = (filter >> 13) & 7;
-    if (!use_conv() || !(((filter >> 16) & 0xFF) == 7 || ((filter >> 24) & 0xF) == 4))
-        return 0;
-    return k ? (int)k : 1;
-}
-
+/* The texture's own filter, wrap modes, border and mips (bwg_sampler_f). */
 static ID3D11SamplerState *get_sampler_f(uint32_t addr_u, uint32_t addr_v, uint32_t filter,
                                          int border_src, uint32_t border)
 {
-    uint32_t mag = (filter >> 24) & 0xF, min = (filter >> 16) & 0xFF;
-    int linear = mag == 2 || min == 2 || min == 4 || min == 6 || conv_kernel(filter);
-    /* NV097 MIN: 1 nearest, 2 linear (level 0 only), 3/4 nearest/linear with
-     * the nearest mip, 5/6 nearest/linear blending two mips. */
-    int mipped = use_mips() && min >= 3 && min <= 6;
-    int min_lin = min == 2 || min == 4 || min == 6;
-    int mag_lin = mag == 2;
-    int mip_lin = min == 5 || min == 6;
-    int bordered;
-    uint32_t key[3];
-    if (use_border() && !border_src) {
-        if (addr_u == 4) addr_u = 3;
-        if (addr_v == 4) addr_v = 3;
-    }
-    bordered = use_border() && border_src && (addr_u == 4 || addr_v == 4);
-    key[0] = addr_u | (linear ? 0x100u : 0u) | (mipped ? 0x1000u | (min << 16) | (mag << 24) : 0u);
-    key[1] = addr_v | (bordered ? 0x100u : 0u);
-    key[2] = bordered ? border : 0;
-    D3D11_SAMPLER_DESC sd;
-    for (int i = 0; i < s_nsamp; i++)
-        if (!memcmp(s_samp[i].key, key, sizeof(key)))
-            return s_samp[i].ss;
-    if (s_nsamp == BW_MAX_STATE)
-        return NULL;
-    memset(&sd, 0, sizeof(sd));
-    if (mipped && bw_vfx_aniso() > 1 && (min_lin || mag_lin)) {
-        /* VFX (D9): anisotropic for the mipped, filtered textures (the
-         * 3D world); point-sampled ones stay as the game set them. */
-        sd.Filter = D3D11_FILTER_ANISOTROPIC;
-        sd.MaxAnisotropy = bw_vfx_aniso();
-    } else if (mipped) {
-        /* D3D11 filter bits: MIN linear 0x10, MAG linear 0x04, MIP linear 0x01. */
-        sd.Filter = (D3D11_FILTER)((min_lin ? 0x10 : 0) | (mag_lin ? 0x04 : 0) | (mip_lin ? 0x01 : 0));
-    } else {
-        sd.Filter = linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
-    }
-    sd.AddressU = addr_u == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : addr_u == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
-                : addr_u == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.AddressV = addr_v == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : addr_v == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
-                : addr_v == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    if (bordered) {
-        sd.BorderColor[0] = ((border >> 16) & 0xFF) / 255.0f;
-        sd.BorderColor[1] = ((border >> 8) & 0xFF) / 255.0f;
-        sd.BorderColor[2] = (border & 0xFF) / 255.0f;
-        sd.BorderColor[3] = (border >> 24) / 255.0f;
-    }
-    sd.MaxLOD = mipped ? D3D11_FLOAT32_MAX : 0.0f;
-    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    memcpy(s_samp[s_nsamp].key, key, sizeof(key));
-    ID3D11Device_CreateSamplerState(s_dev, &sd, &s_samp[s_nsamp].ss);
-    return s_samp[s_nsamp++].ss;
-}
-
-static void unpack_argb(uint32_t c, float o[4])
-{
-    o[0] = ((c >> 16) & 0xFF) / 255.0f;
-    o[1] = ((c >> 8) & 0xFF) / 255.0f;
-    o[2] = (c & 0xFF) / 255.0f;
-    o[3] = (c >> 24) / 255.0f;
+    BwgSamplerDesc g;
+    int made, i = bwg_sampler_f(addr_u, addr_v, filter, border_src, border, &g, &made);
+    return samp_obj(i, made, &g);
 }
 
 static float s_xlast_surf[4], s_xlast_depth[4];   /* the last draw's b0 surf, depth */
-
-/* VFX (D9): the cached texture's flags (set at upload): 1 glyph sheet,
- * 2 1-bit alpha in use, 4 hard-edged alpha (V1). */
-static int tex_vfx_flags(const Nv2aTexture *t)
-{
-    for (int i = 0; i < s_ntex; i++)
-        if (s_tex[i].offset == t->offset && s_tex[i].w == t->width && s_tex[i].h == t->height
-                && s_tex[i].color == t->color && !s_tex[i].cube)
-            return (s_tex[i].glyph ? 1 : 0) | (s_tex[i].alpha1 ? 2 : 0) | (s_tex[i].hard ? 4 : 0)
-                 | (s_tex[i].jpeg ? 8 : 0);
-    return 0;
-}
+static float s_xlast_wsx[4];                        /* ... and its widescreen remap (gfx-sprites' check) */
 
 static int tex_is_glyph(const Nv2aTexture *t)
 {
-    return tex_vfx_flags(t) & 1;
+    return bwg_tex_vfx_flags(t) & 1;
 }
 
 /* VFX (D9): set by bw_xdraw_vsh around an overlay (HUD) draw. */
@@ -3672,59 +2331,9 @@ static int s_tr_fb_overlay, s_tr_skip;
 static ID3D11SamplerState *get_sampler_tr(uint32_t addr_u, uint32_t addr_v, uint32_t filter,
                                           int border_src, uint32_t border, int lk)
 {
-    uint32_t mag = (filter >> 24) & 0xF, min = (filter >> 16) & 0xFF;
-    int mipped = use_mips() && min >= 3 && min <= 6;
-    int min_lin = min == 2 || min == 4 || min == 6, bordered;
-    uint32_t key[3];
-    D3D11_SAMPLER_DESC sd;
-    if (mipped)
-        return get_sampler_f(addr_u, addr_v, filter, border_src, border);
-    if (use_border() && !border_src) {
-        if (addr_u == 4) addr_u = 3;
-        if (addr_v == 4) addr_v = 3;
-    }
-    bordered = use_border() && border_src && (addr_u == 4 || addr_v == 4);
-    key[0] = addr_u | 0x2000u | ((uint32_t)lk << 14) | (min_lin ? 0x100u : 0u) | (mag << 24);
-    key[1] = addr_v | (bordered ? 0x100u : 0u);
-    key[2] = bordered ? border : 0;
-    for (int i = 0; i < s_nsamp; i++)
-        if (!memcmp(s_samp[i].key, key, sizeof(key)))
-            return s_samp[i].ss;
-    if (s_nsamp == BW_MAX_STATE)
-        return NULL;
-    memset(&sd, 0, sizeof(sd));
-    sd.Filter = (D3D11_FILTER)((min_lin ? 0x10 : 0) | (mag == 2 ? 0x04 : 0) | 0x01);
-    sd.AddressU = addr_u == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : addr_u == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
-                : addr_u == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.AddressV = addr_v == 1 ? D3D11_TEXTURE_ADDRESS_WRAP : addr_v == 2 ? D3D11_TEXTURE_ADDRESS_MIRROR
-                : addr_v == 4 ? D3D11_TEXTURE_ADDRESS_BORDER : D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    if (bordered) {
-        sd.BorderColor[0] = ((border >> 16) & 0xFF) / 255.0f;
-        sd.BorderColor[1] = ((border >> 8) & 0xFF) / 255.0f;
-        sd.BorderColor[2] = (border & 0xFF) / 255.0f;
-        sd.BorderColor[3] = (border >> 24) / 255.0f;
-    }
-    sd.MinLOD = 0.0f;
-    sd.MaxLOD = (float)lk;
-    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    memcpy(s_samp[s_nsamp].key, key, sizeof(key));
-    ID3D11Device_CreateSamplerState(s_dev, &sd, &s_samp[s_nsamp].ss);
-    return s_samp[s_nsamp++].ss;
-}
-
-/* T1 (item 11): is this the Bink movie texture: Movie_CreateTexture's
- * LIN_X8R8G8B8 640x480 (seen, T3: one per movie, rewritten every decode;
- * docs/remaster/texture_matching.md: the only 0x1E 640x480 uploads), from
- * guest memory (not a surface this back end drew), and, when the widescreen
- * markers run, inside Movie_DrawQuad's (BW_WS_WHAT_MOVIE). */
-static int tr_is_movie(const Nv2aTexture *t)
-{
-    if (t->color != 0x1E || t->width != 640 || t->height != 480 || find_surf(t->offset))
-        return 0;
-    if (s_ws_k > 1.0f)
-        return s_ws_2d > 0 && s_ws_what == BW_WS_WHAT_MOVIE;
-    return 1;
+    BwgSamplerDesc g;
+    int made, i = bwg_sampler_tr(addr_u, addr_v, filter, border_src, border, lk, &g, &made);
+    return samp_obj(i, made, &g);
 }
 
 /* T1 (VFX_TEX_RESTORE): stage st of a 3D draw. If it samples a 2D DXT
@@ -3743,28 +2352,28 @@ static int tr_stage(const BwXBatch *b, uint32_t prog, int st, ID3D11ShaderResour
             || (c != 0x0C && c != 0x0E && c != 0x0F) || mag != 2)
         return 0;
     v = get_texture(&b->tex[st]);
-    e = s_tex_last;
+    e = bwg_tex_last;
     *srv = v;
     if (!v || !e || e->cube || e->glyph)    /* a font page is overlay art, wherever it is drawn */
         return 0;
     if (e->tr.state == 0) {
         Nv2aTexture fixed;
-        const Nv2aTexture *t = drop_stale_pitch(&b->tex[st], &fixed);
-        if (e->tr_gen && s_gen - e->tr_gen < 120 && e->tr_churn < 255)
+        const Nv2aTexture *t = bwg_drop_stale_pitch(&b->tex[st], &fixed);
+        if (e->tr_gen && bwg_gen - e->tr_gen < 120 && e->tr_churn < 255)
             e->tr_churn++;
-        e->tr_gen = s_gen;
+        e->tr_gen = bwg_gen;
         if (e->tr_churn >= 3) {
             e->tr.state = 2;
             e->tr.why = BW_TR_WHY_CHURN;
         } else {
             /* copies the blocks and queues the work; the original draws
              * until the flip that finishes it (bw_tr_pump) */
-            double t0 = trc_on() ? qpc_ms() : 0.0;
+            double t0 = trc_on() ? bwg_qpc_ms() : 0.0;
             bw_tr_request(&e->tr, t->color, GUEST(t->offset), t->width, t->height,
-                          mip_count(t), t->addr_u, t->addr_v, t->offset);
+                          bwg_mip_count(t), t->addr_u, t->addr_v, t->offset);
             s_trc_req++;
             if (trc_on())
-                s_trc_reqt += qpc_ms() - t0;
+                s_trc_reqt += bwg_qpc_ms() - t0;
         }
     }
     {
@@ -3773,18 +2382,18 @@ static int tr_stage(const BwXBatch *b, uint32_t prog, int st, ID3D11ShaderResour
         BwTrSlot *ts = bw_tr_slot_for(&e->tr, b->tex[st].addr_u, b->tex[st].addr_v, b->tex[st].offset);
         if (ts != &e->tr && ts->state == 0) {
             Nv2aTexture fixed;
-            const Nv2aTexture *t = drop_stale_pitch(&b->tex[st], &fixed);
+            const Nv2aTexture *t = bwg_drop_stale_pitch(&b->tex[st], &fixed);
             bw_tr_request(ts, t->color, GUEST(t->offset), t->width, t->height,
-                          mip_count(t), t->addr_u, t->addr_v, t->offset);
+                          bwg_mip_count(t), t->addr_u, t->addr_v, t->offset);
             s_trc_req++;
         }
-        if (ts->state != 1 || !ts->srv)
+        if (ts->state != 1 || !BW_TR_SRV(ts))
             return 0;
         if (!e->tr_bound) {
             e->tr_bound = 1;
             s_trc_first++;              /* T1 test aid: first draw with the restored chain */
         }
-        *srv = ts->srv;
+        *srv = BW_TR_SRV(ts);
         return ts->lk;
     }
 }
@@ -3794,6 +2403,393 @@ static int tr_stage(const BwXBatch *b, uint32_t prog, int st, ID3D11ShaderResour
  * states. The caller then binds its vertex input and vertex shader and
  * draws. Returns 1 to draw, 0 if it cannot, -1 if both faces are culled. */
 static int begin(const Nv2aSurface *s, const Nv2aRenderState *rs);   /* defined below */
+
+/* I3 (BW_GPU_DELTA, lane gfx-ideas; arch.md 3.14, gate IG3): only the
+ * bindings that changed are sent to D3D11.
+ *   unset    on in Remastered and later (the lead's default), off in Original
+ *   0        every draw sets every binding of its path, as before
+ *   1        a binding equal to the one the draw paths last set is skipped
+ *   verify   as 1, and each skip checked against the context's own state (its
+ *            Get* calls); a mismatch is logged and the binding set after all
+ * Everything else that sets pipeline state (the targets, the suite's passes
+ * through bw_vfx_fullscreen_bs, the present, the resolve pass, the stream-
+ * output check, OCEAN_REFLECT_SINGLE, the flip) bumps g_bw_ctx_epoch, and the
+ * whole shadow is forgotten. Skipping a binding equal to the bound one leaves
+ * the pipeline as it was, so the pictures are the same by construction;
+ * verify proves the shadow equals the context at every skip. The counts:
+ * [GPU-DELTA] every 300 flips. */
+unsigned g_bw_ctx_epoch = 1;
+enum { SH_PS, SH_PSCB0, SH_RS, SH_BS, SH_DS, SH_VS, SH_IL, SH_TOPO, SH_IB };
+static struct {
+    unsigned epoch;
+    uint32_t valid;                 /* a bit per SH_ item */
+    uint32_t srv_ok, smp_ok, vcb_ok, vsrv_ok, vb_ok;     /* a bit per slot */
+    ID3D11PixelShader *ps;
+    ID3D11Buffer *pscb0;
+    ID3D11RasterizerState *rs;
+    ID3D11BlendState *bs;
+    FLOAT bf[4];
+    UINT mask;
+    ID3D11DepthStencilState *ds;
+    UINT ref;
+    ID3D11VertexShader *vs;
+    ID3D11InputLayout *il;
+    D3D11_PRIMITIVE_TOPOLOGY topo;
+    ID3D11Buffer *ib;
+    DXGI_FORMAT ibf;
+    UINT ibo;
+    ID3D11ShaderResourceView *srv[8];
+    ID3D11SamplerState *smp[8];
+    ID3D11Buffer *vcb[4];
+    ID3D11ShaderResourceView *vsrv[4];
+    ID3D11Buffer *vb[16];
+    UINT vbs[16], vbo[16];
+} s_sh;
+static unsigned long long s_sh_asks, s_sh_skips, s_sh_bad;
+static int s_sh_explicit;           /* BW_GPU_DELTA was set: its counts every 300 flips */
+
+static int delta_mode(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("BW_GPU_DELTA");
+        s_sh_explicit = e && *e;
+        v = !e || !*e ? bw_edition_at_least(BW_ED_REMASTERED)
+                      : !strcmp(e, "verify") ? 2 : e[0] == '1' ? 1 : 0;
+        if (v)
+            fprintf(stderr, "[GPU-DELTA] only changed bindings sent%s (BW_GPU_DELTA)\n",
+                    v == 2 ? ", every skip checked against the context" : "");
+    }
+    return v;
+}
+
+/* The mode, with the shadow forgotten if anything else set state since. */
+static int sh_mode(void)
+{
+    int m = delta_mode();
+    if (m && s_sh.epoch != g_bw_ctx_epoch) {
+        memset(&s_sh, 0, sizeof s_sh);
+        s_sh.epoch = g_bw_ctx_epoch;
+    }
+    if (m)
+        s_sh_asks++;
+    return m;
+}
+
+static int sh_bad(const char *what)
+{
+    if (s_sh_bad++ < 16)
+        fprintf(stderr, "[GPU-DELTA] verify: flip %u: the shadow's %s is not the context's\n", bwg_gen, what);
+    return 1;
+}
+
+static void sh_line(void)
+{
+    if (!delta_mode() || !s_sh_explicit || (bwg_gen % 300) != 0)
+        return;
+    fprintf(stderr, "[GPU-DELTA] flip %u: bindings asked %llu, skipped %llu (%.1f%%), verify mismatches %llu\n",
+            bwg_gen, s_sh_asks, s_sh_skips, s_sh_asks ? 100.0 * (double)s_sh_skips / (double)s_sh_asks : 0.0,
+            s_sh_bad);
+}
+
+#define SH_HAVE(bit) (s_sh.valid & (1u << (bit)))
+
+static void sh_ps(ID3D11PixelShader *ps)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_PS) && s_sh.ps == ps) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11PixelShader *c = NULL;
+            ID3D11DeviceContext_PSGetShader(s_ctx, &c, NULL, NULL);
+            bad = c != ps && sh_bad("pixel shader");
+            if (c) ID3D11PixelShader_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
+    s_sh.ps = ps;
+    s_sh.valid |= 1u << SH_PS;
+}
+
+static void sh_vs(ID3D11VertexShader *vs)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_VS) && s_sh.vs == vs) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11VertexShader *c = NULL;
+            ID3D11DeviceContext_VSGetShader(s_ctx, &c, NULL, NULL);
+            bad = c != vs && sh_bad("vertex shader");
+            if (c) ID3D11VertexShader_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_VSSetShader(s_ctx, vs, NULL, 0);
+    s_sh.vs = vs;
+    s_sh.valid |= 1u << SH_VS;
+}
+
+static void sh_ps_cb0(ID3D11Buffer *cb)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_PSCB0) && s_sh.pscb0 == cb) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11Buffer *c = NULL;
+            ID3D11DeviceContext_PSGetConstantBuffers(s_ctx, 0, 1, &c);
+            bad = c != cb && sh_bad("pixel constant buffer");
+            if (c) ID3D11Buffer_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cb);
+    s_sh.pscb0 = cb;
+    s_sh.valid |= 1u << SH_PSCB0;
+}
+
+static void sh_vs_cb(UINT start, UINT n, ID3D11Buffer *const *cb)
+{
+    int m = sh_mode(), need = !m;
+    UINT i;
+    for (i = 0; i < n && !need; i++)
+        if (!(s_sh.vcb_ok & (1u << (start + i))) || s_sh.vcb[start + i] != cb[i])
+            need = 1;
+    if (!need && m == 2) {
+        ID3D11Buffer *c[4] = { NULL, NULL, NULL, NULL };
+        ID3D11DeviceContext_VSGetConstantBuffers(s_ctx, start, n, c);
+        for (i = 0; i < n; i++) {
+            if (c[i] != cb[i] && !need)
+                need = sh_bad("vertex constant buffers");
+            if (c[i]) ID3D11Buffer_Release(c[i]);
+        }
+    }
+    if (!need) { s_sh_skips++; return; }
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, start, n, cb);
+    for (i = 0; i < n; i++) {
+        s_sh.vcb[start + i] = cb[i];
+        s_sh.vcb_ok |= 1u << (start + i);
+    }
+}
+
+static void sh_vs_srv(UINT start, UINT n, ID3D11ShaderResourceView *const *v)
+{
+    int m = sh_mode(), need = !m;
+    UINT i;
+    for (i = 0; i < n && !need; i++)
+        if (!(s_sh.vsrv_ok & (1u << (start + i))) || s_sh.vsrv[start + i] != v[i])
+            need = 1;
+    if (!need && m == 2) {
+        ID3D11ShaderResourceView *c[4] = { NULL, NULL, NULL, NULL };
+        ID3D11DeviceContext_VSGetShaderResources(s_ctx, start, n, c);
+        for (i = 0; i < n; i++) {
+            if (c[i] != v[i] && !need)
+                need = sh_bad("vertex shader resources");
+            if (c[i]) ID3D11ShaderResourceView_Release(c[i]);
+        }
+    }
+    if (!need) { s_sh_skips++; return; }
+    ID3D11DeviceContext_VSSetShaderResources(s_ctx, start, n, v);
+    for (i = 0; i < n; i++) {
+        s_sh.vsrv[start + i] = v[i];
+        s_sh.vsrv_ok |= 1u << (start + i);
+    }
+}
+
+static void sh_ps_srv(UINT start, UINT n, ID3D11ShaderResourceView *const *v)
+{
+    int m = sh_mode(), need = !m;
+    UINT i;
+    for (i = 0; i < n && !need; i++)
+        if (!(s_sh.srv_ok & (1u << (start + i))) || s_sh.srv[start + i] != v[i])
+            need = 1;
+    if (!need && m == 2) {
+        ID3D11ShaderResourceView *c[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+        ID3D11DeviceContext_PSGetShaderResources(s_ctx, start, n, c);
+        for (i = 0; i < n; i++) {
+            if (c[i] != v[i] && !need)
+                need = sh_bad("pixel shader resources");
+            if (c[i]) ID3D11ShaderResourceView_Release(c[i]);
+        }
+    }
+    if (!need) { s_sh_skips++; return; }
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, start, n, v);
+    for (i = 0; i < n; i++) {
+        s_sh.srv[start + i] = v[i];
+        s_sh.srv_ok |= 1u << (start + i);
+    }
+}
+
+static void sh_ps_smp(UINT start, UINT n, ID3D11SamplerState *const *v)
+{
+    int m = sh_mode(), need = !m;
+    UINT i;
+    for (i = 0; i < n && !need; i++)
+        if (!(s_sh.smp_ok & (1u << (start + i))) || s_sh.smp[start + i] != v[i])
+            need = 1;
+    if (!need && m == 2) {
+        ID3D11SamplerState *c[8] = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
+        ID3D11DeviceContext_PSGetSamplers(s_ctx, start, n, c);
+        for (i = 0; i < n; i++) {
+            if (c[i] != v[i] && !need)
+                need = sh_bad("samplers");
+            if (c[i]) ID3D11SamplerState_Release(c[i]);
+        }
+    }
+    if (!need) { s_sh_skips++; return; }
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, start, n, v);
+    for (i = 0; i < n; i++) {
+        s_sh.smp[start + i] = v[i];
+        s_sh.smp_ok |= 1u << (start + i);
+    }
+}
+
+static void sh_rs(ID3D11RasterizerState *rs)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_RS) && s_sh.rs == rs) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11RasterizerState *c = NULL;
+            ID3D11DeviceContext_RSGetState(s_ctx, &c);
+            bad = c != rs && sh_bad("rasteriser state");
+            if (c) ID3D11RasterizerState_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_RSSetState(s_ctx, rs);
+    s_sh.rs = rs;
+    s_sh.valid |= 1u << SH_RS;
+}
+
+static void sh_blend(ID3D11BlendState *bs, const FLOAT bf[4], UINT mask)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_BS) && s_sh.bs == bs && s_sh.mask == mask && !memcmp(s_sh.bf, bf, sizeof s_sh.bf)) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11BlendState *c = NULL;
+            FLOAT cf[4];
+            UINT cm = 0;
+            ID3D11DeviceContext_OMGetBlendState(s_ctx, &c, cf, &cm);
+            bad = (c != bs || cm != mask || memcmp(cf, bf, sizeof cf)) && sh_bad("blend state");
+            if (c) ID3D11BlendState_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, mask);
+    s_sh.bs = bs;
+    memcpy(s_sh.bf, bf, sizeof s_sh.bf);
+    s_sh.mask = mask;
+    s_sh.valid |= 1u << SH_BS;
+}
+
+static void sh_ds(ID3D11DepthStencilState *ds, UINT ref)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_DS) && s_sh.ds == ds && s_sh.ref == ref) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11DepthStencilState *c = NULL;
+            UINT cr = 0;
+            ID3D11DeviceContext_OMGetDepthStencilState(s_ctx, &c, &cr);
+            bad = (c != ds || cr != ref) && sh_bad("depth-stencil state");
+            if (c) ID3D11DepthStencilState_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, ref);
+    s_sh.ds = ds;
+    s_sh.ref = ref;
+    s_sh.valid |= 1u << SH_DS;
+}
+
+static void sh_il(ID3D11InputLayout *il)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_IL) && s_sh.il == il) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11InputLayout *c = NULL;
+            ID3D11DeviceContext_IAGetInputLayout(s_ctx, &c);
+            bad = c != il && sh_bad("input layout");
+            if (c) ID3D11InputLayout_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, il);
+    s_sh.il = il;
+    s_sh.valid |= 1u << SH_IL;
+}
+
+static void sh_topo(D3D11_PRIMITIVE_TOPOLOGY t)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_TOPO) && s_sh.topo == t) {
+        int bad = 0;
+        if (m == 2) {
+            D3D11_PRIMITIVE_TOPOLOGY c = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+            ID3D11DeviceContext_IAGetPrimitiveTopology(s_ctx, &c);
+            bad = c != t && sh_bad("topology");
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, t);
+    s_sh.topo = t;
+    s_sh.valid |= 1u << SH_TOPO;
+}
+
+static void sh_ib(ID3D11Buffer *ib, DXGI_FORMAT f, UINT off)
+{
+    int m = sh_mode();
+    if (m && SH_HAVE(SH_IB) && s_sh.ib == ib && s_sh.ibf == f && s_sh.ibo == off) {
+        int bad = 0;
+        if (m == 2) {
+            ID3D11Buffer *c = NULL;
+            DXGI_FORMAT cf = DXGI_FORMAT_UNKNOWN;
+            UINT co = 0;
+            ID3D11DeviceContext_IAGetIndexBuffer(s_ctx, &c, &cf, &co);
+            bad = (c != ib || cf != f || co != off) && sh_bad("index buffer");
+            if (c) ID3D11Buffer_Release(c);
+        }
+        if (!bad) { s_sh_skips++; return; }
+    }
+    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, ib, f, off);
+    s_sh.ib = ib;
+    s_sh.ibf = f;
+    s_sh.ibo = off;
+    s_sh.valid |= 1u << SH_IB;
+}
+
+static void sh_vb(UINT start, UINT n, ID3D11Buffer *const *b, const UINT *strides, const UINT *offs)
+{
+    int m = sh_mode(), need = !m;
+    UINT i;
+    for (i = 0; i < n && !need; i++)
+        if (!(s_sh.vb_ok & (1u << (start + i))) || s_sh.vb[start + i] != b[i]
+                || s_sh.vbs[start + i] != strides[i] || s_sh.vbo[start + i] != offs[i])
+            need = 1;
+    if (!need && m == 2) {
+        ID3D11Buffer *c[16];
+        UINT cs[16], co[16];
+        memset(c, 0, sizeof c);
+        ID3D11DeviceContext_IAGetVertexBuffers(s_ctx, start, n, c, cs, co);
+        for (i = 0; i < n; i++) {
+            if ((c[i] != b[i] || cs[i] != strides[i] || co[i] != offs[i]) && !need)
+                need = sh_bad("vertex buffers");
+            if (c[i]) ID3D11Buffer_Release(c[i]);
+        }
+    }
+    if (!need) { s_sh_skips++; return; }
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, start, n, b, strides, offs);
+    for (i = 0; i < n; i++) {
+        s_sh.vb[start + i] = b[i];
+        s_sh.vbs[start + i] = strides[i];
+        s_sh.vbo[start + i] = offs[i];
+        s_sh.vb_ok |= 1u << (start + i);
+    }
+}
+
 
 static int xdraw_prepare(const Nv2aSurface *s, const BwXBatch *b)
 {
@@ -3815,95 +2811,34 @@ static int xdraw_prepare(const Nv2aSurface *s, const BwXBatch *b)
     rs = b->state;
     rc = b->rc;
 
-    memset(&key, 0, sizeof(key));
-    memcpy(key.color_icw, rc->color_icw, sizeof(key.color_icw));
-    memcpy(key.alpha_icw, rc->alpha_icw, sizeof(key.alpha_icw));
-    memcpy(key.color_ocw, rc->color_ocw, sizeof(key.color_ocw));
-    memcpy(key.alpha_ocw, rc->alpha_ocw, sizeof(key.alpha_ocw));
-    key.final0 = rc->final0;
-    key.final1 = rc->final1;
-    key.control = rc->control;
-    key.stage_program = rc->stage_program;
-    key.clip_plane_mode = b->clip_plane_mode;
-    key.flags[0] = (uint8_t)(use_persp() ? BW_RC_PERSP : 0);     /* colour/fog interpolation */
-    for (st = 0; st < 4; st++) {
-        key.tex_valid[st] = b->tex_valid[st];
-        key.tex_normalized[st] = b->tex_normalized[st];
-        key.tex_conv[st] = (uint8_t)(b->tex_valid[st] ? conv_kernel(b->tex[st].filter) : 0);
-        /* A cube map sampled by a CUBEMAP stage goes up as six faces; in any
-         * other case (or BW_GPU_CUBE=0, or if that fails) its first face is
-         * sampled as a 2D texture. */
-        key.tex_cube[st] = 0;
-        if (b->tex_valid[st] && b->tex_cube[st] && cube_stage(rc->stage_program, st)) {
-            srv[st] = get_cube_texture(&b->tex[st]);
-            key.tex_cube[st] = srv[st] != NULL;
-        }
-    }
-    /* The dot-product stages' inputs, only where a program has them (so other
-     * programs don't compile once per stale register value). */
-    if (dot_program(rc->stage_program)) {
-        key.dot_rgbmapping = b->dot_rgbmapping;
-        key.other_stage_input = b->other_stage_input;
-    }
-    if (s_vfx_overlay && (bw_vfx()->text || bw_vfx()->hud_edges || bw_vfx()->tr_menus))  /* VFX (D9): text and HUD art (overlay draws) */
-        for (st = 0; st < 4; st++) {
-            int fl = 0;
-            uint32_t c = b->tex[st].color;
-            if (!b->tex_valid[st] || b->tex_cube[st])
-                continue;
-            if (c == 0x0C || c == 0x02 || c == 0x10 || c == 0x0E || c == 0x0F)
-                fl = tex_vfx_flags(&b->tex[st]);
-            else if (c == 0x12 && bw_vfx()->tr_menus)
-                fl = tex_vfx_flags(&b->tex[st]) & 8;
-            if (fl & 8) {                               /* T1: a menu/title photo: Lanczos-2 */
-                key.vfx[st] |= BW_RC_VFX_OVERLAY_L2;
-                continue;
-            }
-            if ((fl & 4) && bw_vfx()->hud_edges)        /* V1: hard-edged HUD art */
-                key.vfx[st] |= BW_RC_VFX_OVERLAY_HARD;
-            else if (!bw_vfx()->text)
-                continue;
-            else if (fl & 1)
-                key.vfx[st] |= BW_RC_VFX_GLYPH;
-            else if (fl & 2)
-                key.vfx[st] |= BW_RC_VFX_OVERLAY;
-            else
-                key.vfx[st] |= BW_RC_VFX_OVERLAY_CR;
-        }
-    /* T1 (BW_TEXRESTORE_MOVIES, item 11): a Bink frame, wherever it is drawn
-     * (its quad isn't always caught by the overlay test): Lanczos-2 when
-     * magnified, the game's own sample at 1:1. */
-    if (bw_vfx_active() && bw_vfx()->tr_movies)
+    {
+        BwgTexRef tex[4];               /* the cube maps the key fetched */
+        bwg_xdraw_key(b, s_vfx_overlay, &key, tex);
         for (st = 0; st < 4; st++)
-            if (b->tex_valid[st] && !b->tex_cube[st] && tr_is_movie(&b->tex[st]))
-                key.vfx[st] = (uint8_t)((key.vfx[st] & BW_RC_VFX_A2C) | BW_RC_VFX_OVERLAY_L2);
+            if (tex[st].e || tex[st].rt)
+                srv[st] = tex_view(tex[st]);
+    }
     /* T1 (VFX_TEX_RESTORE): 3D stages whose texture has a restored chain
      * (not overlays, and not the water's dot-product reflection program).
      * Test aid: BW_GPU_AB=texrestore draws odd frames with the originals. */
     int tr_lk[4] = { 0, 0, 0, 0 };
-    double trc_t0 = trc_on() ? qpc_ms() : 0.0;
+    double trc_t0 = trc_on() ? bwg_qpc_ms() : 0.0;
     if (bw_vfx_active() && bw_vfx()->tex_restore && !s_vfx_overlay && !s_tr_skip
-            && !dot_program(rc->stage_program) && !bw_ab_off("texrestore"))
+            && !bwg_dot_program(rc->stage_program) && !bw_ab_off("texrestore"))
         for (st = 0; st < 4; st++)
             if (!srv[st] && (tr_lk[st] = tr_stage(b, rc->stage_program, st, &srv[st])) != 0
                     && bw_vfx()->tr_debug)
                 key.vfx[st] |= BW_RC_VFX_TR_DEBUG;
     if (trc_on())
-        s_trc_trs += qpc_ms() - trc_t0;
-    /* VFX (D9): alpha-tested, unblended draws on an MSAA target (foliage,
-     * fences, rigging) get alpha-to-coverage instead of a hard test. */
-    int vfx_a2c = bw_vfx_active() && bw_vfx()->a2c && !s_vfx_overlay && rs->alpha_test_enable
-               && !rs->blend_enable && (rs->alpha_func == 0x204 || rs->alpha_func == 0x206)
-               && s_cur && s_cur->mtex;
-    if (vfx_a2c)
-        key.vfx[0] |= BW_RC_VFX_A2C;
+        s_trc_trs += bwg_qpc_ms() - trc_t0;
+    int vfx_a2c = bwg_xdraw_a2c(rs, s_vfx_overlay, &key);
     stage_stats(b, rc->stage_program, srv);
-    rc_key_trim(&key);                                  /* item 41: unused stages zeroed */
+    bwg_rc_key_trim(&key);                              /* item 41: unused stages zeroed */
     if (trc_on()) {                                     /* T1 test aid */
-        double t0 = qpc_ms();
+        double t0 = bwg_qpc_ms();
         unsigned n0 = s_ps_compiles;
         ps = get_rc_shader(&key);
-        s_trc_sh += qpc_ms() - t0;
+        s_trc_sh += bwg_qpc_ms() - t0;
         s_trc_nsh += s_ps_compiles - n0;
     } else
     ps = get_rc_shader(&key);
@@ -3911,56 +2846,14 @@ static int xdraw_prepare(const Nv2aSurface *s, const BwXBatch *b)
         return 0;
     rst = get_rs(rs);
     {
-        /* P2a test aid (docs/day1/P2a.md section 7), Remastered only:
-         * BW_OCEAN_CULLTEST=1|2 forces back-face culling with the front face
-         * CW (1, the game's own state, seen) or CCW (2: the game's front
-         * faces culled, only the back faces drawn) for the sea's reflection
-         * pass only (stage 3 DOT_RFLCT_SPEC on a cube). */
-        static int ct = -1;
-        if (ct < 0) {
-            const char *e = getenv("BW_OCEAN_CULLTEST");
-            ct = (e && (e[0] == '1' || e[0] == '2') && bw_edition_at_least(BW_ED_REMASTERED)) ? e[0] - '0' : 0;
-        }
-        if (ct && ((key.stage_program >> 15) & 0x1F) == 0x0C && key.tex_cube[3]) {
-            static int shown;
-            Nv2aRenderState t = *rs;
-            if (!shown++)
-                fprintf(stderr, "[BW] ocean cull test: the game's own state for the reflection pass:"
-                        " cull_enable %u cull_face 0x%X front_face 0x%X%c",
-                        (unsigned)rs->cull_enable, (unsigned)rs->cull_face, (unsigned)rs->front_face, 10);
-            t.cull_enable = 1;
-            t.cull_face = 0x405;                        /* GL_BACK */
-            t.front_face = ct == 1 ? 0x900 : 0x901;     /* GL_CW / GL_CCW */
+        Nv2aRenderState t;
+        if (bwg_ocean_culltest(&key, rs, &t))       /* P2a test aid (Remastered only) */
             rst = get_rs(&t);
-        }
     }
     if (!rst)
         return -1;              /* both faces culled */
 
-    memset(&c, 0, sizeof(c));
-    c.surf[0] = (float)s_cur->w; c.surf[1] = (float)s_cur->h;
-    c.surf[2] = 1.0f / s_cur->w; c.surf[3] = 1.0f / s_cur->h;
-    ws_remap(s, c.wsx, s_ws_full);
-    {
-        float zmin = rs->depth_min, zmax = rs->depth_max;
-        if (!(zmax > zmin)) { zmin = 0.0f; zmax = 16777215.0f; }
-        c.depth[0] = zmin;
-        c.depth[1] = 1.0f / (zmax - zmin);
-        c.depth[2] = zmode_vertex_clamp() ? 1.0f : 0.0f;
-    }
-    if (rs->alpha_test_enable) {
-        c.alpha[0] = (float)(rs->alpha_func >= 0x200 && rs->alpha_func <= 0x207
-                             ? rs->alpha_func - 0x200 : 7);
-        c.alpha[1] = (float)(rs->alpha_ref & 0xFF);
-        c.alpha[2] = 1.0f;
-    }
-    c.fogc[0] = b->fogc[0]; c.fogc[1] = b->fogc[1]; c.fogc[2] = b->fogc[2];
-    for (st = 0; st < 8; st++) {
-        unpack_argb(rc->factor0[st], c.c0[st]);
-        unpack_argb(rc->factor1[st], c.c1[st]);
-    }
-    unpack_argb(rc->final_c0, c.fc0);
-    unpack_argb(rc->final_c1, c.fc1);
+    bwg_xdraw_consts(s, b, &c);
     for (st = 0; st < 4; st++) {
         if (!b->tex_valid[st])
             continue;
@@ -3972,28 +2865,17 @@ static int xdraw_prepare(const Nv2aSurface *s, const BwXBatch *b)
         else
             ss[st] = get_sampler_f(b->tex[st].addr_u, b->tex[st].addr_v, b->tex[st].filter,
                                    b->tex_border_src[st], b->tex_border[st]);
-        c.texinfo[st][0] = 1.0f / b->tex[st].width;
-        c.texinfo[st][1] = 1.0f / b->tex[st].height;
-        /* The title's anti-aliasing resolve: a 2x-wide surface sampled into a
-         * 1x one (render targets are linear images). Its filter is how
-         * gpu_present turns the 2x-wide surface into the picture. */
-        if (!b->tex_normalized[st] && s_cur && s_cur->aa_sx == 1) {
-            BwSurf *rt = find_surf(b->tex[st].offset);
-            if (rt && rt != s_cur && rt->aa_sx == 2) {
-                s_resolve_filter = b->tex[st].filter;
-                s_resolve_seen = 1;
-            }
-        }
+        bwg_xdraw_stage(b, st, &c);
     }
     if (trc_on())
-        trc_t0 = qpc_ms();
+        trc_t0 = bwg_qpc_ms();
     {
         /* item 43: upload only when the constants changed (a DISCARD map
          * per draw renames the buffer in the driver every time). c is
          * zeroed first, so its padding compares too. */
         static BwXConsts shadow;
         static int shadow_ok;
-        if (!memo_on() || !shadow_ok || memcmp(&shadow, &c, sizeof c)) {
+        if (!bwg_memo_on() || !shadow_ok || memcmp(&shadow, &c, sizeof c)) {
             shadow_ok = 0;
             if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_xcb, 0,
                                                   D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -4006,31 +2888,25 @@ static int xdraw_prepare(const Nv2aSurface *s, const BwXBatch *b)
         }
     }
     if (trc_on())
-        s_trc_map += qpc_ms() - trc_t0;
+        s_trc_map += bwg_qpc_ms() - trc_t0;
     memcpy(s_xlast_surf, c.surf, sizeof s_xlast_surf);
     memcpy(s_xlast_depth, c.depth, sizeof s_xlast_depth);
-    bf[0] = ((rs->blend_color >> 16) & 0xFF) / 255.0f;
-    bf[1] = ((rs->blend_color >> 8) & 0xFF) / 255.0f;
-    bf[2] = (rs->blend_color & 0xFF) / 255.0f;
-    bf[3] = ((rs->blend_color >> 24) & 0xFF) / 255.0f;
-    if (rs->blend_src == 0x8003 || rs->blend_src == 0x8004 ||
-        rs->blend_dst == 0x8003 || rs->blend_dst == 0x8004)
-        bf[0] = bf[1] = bf[2] = bf[3];
+    memcpy(s_xlast_wsx, c.wsx, sizeof s_xlast_wsx);
+    bwg_blend_factor(rs, bf);
 
-    ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_xcb);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
-    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, ss);
+    sh_ps(ps);                                          /* I3: each sent only if it changed */
+    sh_ps_cb0(s_xcb);
+    sh_ps_srv(0, 4, srv);
+    sh_ps_smp(0, 4, ss);
     if (key.vfx[0] | key.vfx[1] | key.vfx[2] | key.vfx[3]) {      /* VFX (D9) */
         ID3D11SamplerState *lin = bw_vfx_linear_sampler();
-        ID3D11DeviceContext_PSSetSamplers(s_ctx, 4, 1, &lin);
+        sh_ps_smp(4, 1, &lin);
     }
-    ID3D11DeviceContext_RSSetState(s_ctx, rst);
+    sh_rs(rst);
     s_vfx_a2c = vfx_a2c;
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, get_blend(rs), bf, 0xFFFFFFFFu);
+    sh_blend(get_blend(rs), bf, 0xFFFFFFFFu);
     s_vfx_a2c = 0;
-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, get_ds(rs, s_cur_depth != NULL),
-                                               rs->stencil_ref & 0xFF);
+    sh_ds(get_ds(rs, bwg_cur_depth != NULL), rs->stencil_ref & 0xFF);
     return 1;
 }
 
@@ -4182,13 +3058,13 @@ static int vfx_wants_scene(void)
     return v->active && (v->bloom > 0.0f || v->oled_dim > 0.0f || v->ao > 0.0f);
 }
 
-/* A 3D (non-overlay) draw into s_cur. */
+/* A 3D (non-overlay) draw into bwg_cur. */
 static void vfx_scene_draw(void)
 {
-    if (!vfx_wants_scene() || !s_cur)
+    if (!vfx_wants_scene() || !bwg_cur)
         return;
-    if (s_vfx_pend_surf != s_cur) {
-        s_vfx_pend_surf = s_cur;
+    if (s_vfx_pend_surf != bwg_cur) {
+        s_vfx_pend_surf = bwg_cur;
         s_vfx_pend_on = 0;
     }
     if (!s_vfx_pend_on) {
@@ -4233,6 +3109,8 @@ static int vfx_view_proj(unsigned view, float *m11, float *zn, float *zf)
     float a, b;
     if (view > 3)
         return 0;
+    if (BW_GFXCAP_REC())                /* BW_GFXCAP: game state the suite reads */
+        bw_gfxcap_read(0x001C70F0u + (view + 1u) * 0xB0u + 0x40u, 64);
     m = (const float *)GUEST(0x001C70F0u + (view + 1u) * 0xB0u + 0x40u);
     a = m[10];
     b = m[14];
@@ -4265,18 +3143,18 @@ static int vfx_sea_starts(const BwXBatch *xb)
         return 0;
     /* BW_GPU_AB=aotrigger (test aid): the old trigger on odd frames */
     return (!old && !bw_ab_off("aotrigger") && xb->rc->stage_program == 0x21081u)
-           || dot_program(xb->rc->stage_program);
+           || bwg_dot_program(xb->rc->stage_program);
 }
 
 static void vfx_drawlog_note(const char *what);     /* BW_VFX_DRAWLOG, below */
 
 static void vfx_ao_now(const D3D11_RECT *rect)
 {
-    BwSurf *sf = s_cur;
+    BwSurf *sf = bwg_cur;
     float zf, zn, focal, m11, pzn, pzf;
     D3D11_RECT r;
-    if ((s_vfx_ao_done && s_vfx_ao_gen == s_gen) || bw_vfx()->ao <= 0.0f || !sf
-            || !s_cur_depth || !s_cur_depth->srv)
+    if ((s_vfx_ao_done && s_vfx_ao_gen == bwg_gen) || bw_vfx()->ao <= 0.0f || !sf
+            || !bwg_cur_depth || !bwg_cur_depth->srv)
         return;
     r = *rect;
     if (r.left < 0) r.left = 0;
@@ -4285,8 +3163,10 @@ static void vfx_ao_now(const D3D11_RECT *rect)
     if (r.bottom > (LONG)sf->ph) r.bottom = (LONG)sf->ph;
     if (r.right <= r.left || r.bottom <= r.top)
         return;
-    if (s_vfx_ao_gen != s_gen)
+    if (s_vfx_ao_gen != bwg_gen)
         s_vfx_ao_view = 0;
+    if (BW_GFXCAP_REC())                /* BW_GFXCAP: game state the suite reads */
+        bw_gfxcap_read(0x1A9A68, 4);
     zf = *(const float *)GUEST(0x1A9A68);
     if (!(zf > 50.0f && zf < 5000.0f))
         zf = 850.0f;
@@ -4308,17 +3188,17 @@ static void vfx_ao_now(const D3D11_RECT *rect)
     }
     s_vfx_ao_view++;
     vfx_drawlog_note("AO applied here");    /* item 50 test aid: where AO runs in the frame */
-    bw_vfx_ao_apply(s_cur_depth->srv, s_cur_depth->samples > 1, sf->pw, sf->ph,   /* item 36: its own count */
+    bw_vfx_ao_apply(bwg_cur_depth->srv, bwg_cur_depth->samples > 1, sf->pw, sf->ph,   /* item 36: its own count */
                     sf->mrtv ? sf->mrtv : sf->rtv, &r, zn, zf, focal);
-    bind_targets(sf, s_cur_depth);
+    bind_targets(sf, bwg_cur_depth);
     SURF_DRAWN(sf);
     s_vfx_ao_done = 1;
-    s_vfx_ao_gen = s_gen;
+    s_vfx_ao_gen = bwg_gen;
 }
 
 static void vfx_overlay_draw(void)
 {
-    BwSurf *sf = s_cur;
+    BwSurf *sf = bwg_cur;
     DXGI_FORMAT f;
     D3D11_BOX box;
     if (!vfx_wants_scene() || !sf || !sf->tex)
@@ -4327,7 +3207,7 @@ static void vfx_overlay_draw(void)
     if (!s_vfx_scene || s_vfx_scene_w != sf->pw || s_vfx_scene_h != sf->ph || s_vfx_scene_fmt != f) {
         static uint32_t fail_gen;           /* item 36: one try a frame after a failure */
         D3D11_TEXTURE2D_DESC td;
-        if (fail_gen == s_gen)
+        if (fail_gen == bwg_gen)
             return;
         if (s_vfx_scene_srv) ID3D11ShaderResourceView_Release(s_vfx_scene_srv);
         if (s_vfx_scene_rtv) ID3D11RenderTargetView_Release(s_vfx_scene_rtv);
@@ -4358,7 +3238,7 @@ static void vfx_overlay_draw(void)
                 s_vfx_scene = NULL;
                 s_vfx_scene_w = s_vfx_scene_h = 0;
                 s_vfx_scene_gen = 0;
-                fail_gen = s_gen;
+                fail_gen = bwg_gen;
                 res_failed(RF_SCENE, sf->va, sf->pw, sf->ph, hr);
                 return;
             }
@@ -4366,10 +3246,10 @@ static void vfx_overlay_draw(void)
         s_vfx_scene_w = sf->pw; s_vfx_scene_h = sf->ph; s_vfx_scene_fmt = f;
         s_vfx_scene_gen = 0;
     }
-    if (s_vfx_scene_gen != s_gen || s_vfx_scene_surf != sf) {
+    if (s_vfx_scene_gen != bwg_gen || s_vfx_scene_surf != sf) {
         static const float clear0[4] = { 0, 0, 0, 0 };
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_vfx_scene_rtv, clear0);
-        s_vfx_scene_gen = s_gen;
+        s_vfx_scene_gen = bwg_gen;
         s_vfx_scene_surf = sf;
     }
     if (!s_vfx_pend_on || s_vfx_pend_surf != sf)
@@ -4395,13 +3275,13 @@ static void vfx_overlay_draw(void)
  * (3D drawn after the last overlay draw is copied in now). */
 static ID3D11ShaderResourceView *vfx_scene_for(BwSurf *sf)
 {
-    if (s_vfx_scene_gen != s_gen || s_vfx_scene_surf != sf)
+    if (s_vfx_scene_gen != bwg_gen || s_vfx_scene_surf != sf)
         return NULL;
     if (s_vfx_pend_on && s_vfx_pend_surf == sf) {
-        BwSurf *keep = s_cur;
-        s_cur = sf;
+        BwSurf *keep = bwg_cur;
+        bwg_cur = sf;
         vfx_overlay_draw();
-        s_cur = keep;
+        bwg_cur = keep;
     }
     return s_vfx_scene_srv;
 }
@@ -4420,10 +3300,10 @@ static void vfx_drawlog(char path, uint32_t n, const BwXBatch *b, const BwXVerte
         const char *e = getenv("BW_VFX_DRAWLOG");
         want = e ? atol(e) : -1;
     }
-    if (want < 0 || (long)s_gen < want || (long)s_gen > want + 1 || !rs)
+    if (want < 0 || (long)bwg_gen < want || (long)bwg_gen > want + 1 || !rs)
         return;
-    fprintf(stderr, "[VFX-DRAW] f%u %c n%u surf %08X%s", s_gen, path, n, s_cur ? s_cur->va : 0,
-            s_cur && s_cur_depth ? "+z" : "");
+    fprintf(stderr, "[VFX-DRAW] f%u %c n%u surf %08X%s", bwg_gen, path, n, bwg_cur ? bwg_cur->va : 0,
+            bwg_cur && bwg_cur_depth ? "+z" : "");
     if (v0)
         fprintf(stderr, " v0(%.1f,%.1f,%.4g,rhw %.4g)", v0->x, v0->y, v0->z, v0->rhw);
     else
@@ -4446,8 +3326,8 @@ static void vfx_drawlog_note(const char *what)
         const char *e = getenv("BW_VFX_DRAWLOG");
         want = e ? atol(e) : -1;
     }
-    if (want >= 0 && (long)s_gen >= want && (long)s_gen <= want + 1)
-        fprintf(stderr, "[VFX-DRAW] f%u -- %s\n", s_gen, what);
+    if (want >= 0 && (long)bwg_gen >= want && (long)bwg_gen <= want + 1)
+        fprintf(stderr, "[VFX-DRAW] f%u -- %s\n", bwg_gen, what);
 }
 
 /* V1 test aid (with BW_VFX_DRAWLOG=<frame>): for overlay draws (D3D's
@@ -4462,7 +3342,7 @@ static void vfx_drawlog_inputs(const BwXVsBatch *b)
         const char *e = getenv("BW_VFX_DRAWLOG");
         want = e ? atol(e) : -1;
     }
-    if (want < 0 || (long)s_gen != want || b->ninstr > 4 || !b->inputs)
+    if (want < 0 || (long)bwg_gen != want || b->ninstr > 4 || !b->inputs)
         return;
     fprintf(stderr, "[VFX-IN] t0 %08X addr %u/%u mask %04X nverts %u:",
             b->xb.tex_valid[0] ? b->xb.tex[0].offset : 0, b->xb.tex[0].addr_u, b->xb.tex[0].addr_v,
@@ -4477,6 +3357,43 @@ static void vfx_drawlog_inputs(const BwXVsBatch *b)
     fprintf(stderr, "\n");
 }
 
+/* BW_GFXCAP_CLASSES (test aid, lane gfx-capef; the replay only, unset inert):
+ * the texture a draw into sf renders into, and the draw just made into bwg_cur
+ * classed for the comparison tool's region masks (bw_gfxcls.c). xb is NULL
+ * for a screen-space batch, whose texture is t. */
+static void *gfxcls_tex(const BwSurf *sf)
+{
+    return sf ? (void *)(sf->mrtv ? sf->mtex : sf->tex) : NULL;
+}
+
+static void gfxcls_drawn(const BwXBatch *xb, int overlay, const Nv2aTexture *t, const Nv2aRenderState *rs,
+                         const BwXVsBatch *vb)
+{
+    BwClsDraw d;
+    int st;
+    memset(&d, 0, sizeof(d));
+    d.overlay = overlay;
+    d.gen = bwg_gen;
+    d.points = bw_backend_batch_points();  /* gfx-sprites: the sprite class (BW_GFXCLS_SPRITES) */
+    if (vb && vb->nstreams && vb->streams[vb->in[0].stream].data)    /* the first array, as a guest address */
+        d.vtx = (uint32_t)((uintptr_t)vb->streams[vb->in[0].stream].data - (uintptr_t)g_xbox_mem_offset);
+    d.depth_test = rs && rs->depth_test_enable;
+    d.sea = xb && xb->rc && (xb->rc->stage_program == 0x21081u || bwg_dot_program(xb->rc->stage_program));
+    for (st = 0; st < 4; st++) {
+        const Nv2aTexture *x = xb ? (xb->tex_valid[st] && !xb->tex_cube[st] ? &xb->tex[st] : NULL)
+                                  : (st ? NULL : t);
+        if (!x)
+            continue;
+        d.tex[st].valid = 1;
+        d.tex[st].surface = bwg_find_surf(x->offset) != NULL;
+        d.tex[st].offset = x->offset;
+        d.tex[st].width = x->width;
+        d.tex[st].height = x->height;
+        d.tex[st].color = x->color;
+    }
+    bw_gfxcls_draw(s_ctx, gfxcls_tex(bwg_cur), bwg_gen, bw_gfxcls_classify(&d));
+}
+
 static void bw_xdraw(const Nv2aSurface *s, const BwXBatch *b)
 {
     UINT stride = sizeof(BwXVertex), offs;
@@ -4484,26 +3401,7 @@ static void bw_xdraw(const Nv2aSurface *s, const BwXBatch *b)
 
     if (!b || !b->count)
         return;
-    if (s_ws_k > 1.0f) {
-        float lo = b->vertices[0].x, hi = lo;
-        float u0 = b->vertices[0].tc[0][0], u1 = u0, v0 = b->vertices[0].tc[0][1], v1 = v0;
-        for (uint32_t i = 1; i < b->count; i++) {
-            const BwXVertex *q = &b->vertices[i];
-            if (q->x < lo) lo = q->x;
-            if (q->x > hi) hi = q->x;
-            if (q->tc[0][0] < u0) u0 = q->tc[0][0];
-            if (q->tc[0][0] > u1) u1 = q->tc[0][0];
-            if (q->tc[0][1] < v0) v0 = q->tc[0][1];
-            if (q->tc[0][1] > v1) v1 = q->tc[0][1];
-        }
-        s_ws_span_u = u1 - u0;
-        s_ws_span_v = v1 - v0;
-        s_ws_full = (ws_covers_view(s, lo, hi, 1)
-                     && ws_backdrop(s, b->tex_valid[0], b->tex_normalized[0], b->tex[0].width,
-                                    b->tex[0].height, u0, u1, v0, v1))
-                    || ws_samples_wide(b->tex_valid[0], b->tex[0].offset);
-        ws_note('x', b->count, b->tex_valid[0], b->tex[0].width, b->tex[0].height, lo, hi, s);
-    }
+    bwg_ws_xbatch(s, b);                /* widescreen (D5): the 2D test */
     /* 0.2.5 item 50: a vertex-program batch handed back to this path (its
      * shader still compiling) keeps its overlay decision. An overlay (HUD)
      * draw takes the scene copy before it and the HUD's own treatments, as
@@ -4515,7 +3413,7 @@ static void bw_xdraw(const Nv2aSurface *s, const BwXBatch *b)
         static unsigned n_ov;
         if (++n_ov <= 3 || n_ov % 100 == 0)
             fprintf(stderr, "[VFX] HUD draw %u went the CPU way (its vertex program is still compiling),"
-                            " frame %u: kept as HUD for the effects\n", n_ov, s_gen);
+                            " frame %u: kept as HUD for the effects\n", n_ov, bwg_gen);
     }
     s_tr_skip = s_tr_fb_overlay;            /* T1 */
     s_vfx_log_ov = s_tr_fb_overlay;         /* item 50: for the drawlog */
@@ -4523,37 +3421,40 @@ static void bw_xdraw(const Nv2aSurface *s, const BwXBatch *b)
     if (bw_vfx_active() && b->state && begin(s, b->state)) {
         if (ov)
             vfx_overlay_draw();
-        else if (vfx_sea_starts(b) && s_vfx_pend_on && s_vfx_pend_surf == s_cur)
+        else if (vfx_sea_starts(b) && s_vfx_pend_on && s_vfx_pend_surf == bwg_cur)
             vfx_ao_now(&s_vfx_pend);
     }
     s_vfx_overlay = ov;
     {
-        double t0 = trc_on() ? qpc_ms() : 0.0;
+        double t0 = trc_on() ? bwg_qpc_ms() : 0.0;
         int r = xdraw_prepare(s, b);
         if (trc_on())
-            s_trc_prep += qpc_ms() - t0;
+            s_trc_prep += bwg_qpc_ms() - t0;
         s_tr_skip = 0;
         s_vfx_overlay = 0;
         if (r <= 0)
             return;
     }
-    if (s_watch > 0 && s_cur)
-        note_huge(b->vertices, b->count, s_cur->w, s_cur->h);
+    if (bwg_tex_watch > 0 && bwg_cur)
+        note_huge(b->vertices, b->count, bwg_cur->w, bwg_cur->h);
     offs = ring_push(&s_vring, b->vertices, b->count * stride, stride);
     if (offs == ~0u)
         return;
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_xlayout);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vring.buf, &stride, &offs);
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_xvs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_xcb);
+    sh_il(s_xlayout);                   /* I3: each sent only if it changed */
+    sh_topo(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    sh_vb(0, 1, &s_vring.buf, &stride, &offs);
+    sh_vs(s_xvs);
+    sh_vs_cb(0, 1, &s_xcb);
     if (trc_on()) {                                         /* T1 test aid */
-        double t0 = qpc_ms();
+        double t0 = bwg_qpc_ms();
         ID3D11DeviceContext_Draw(s_ctx, b->count, 0);
-        s_trc_draw += qpc_ms() - t0;
+        s_trc_draw += bwg_qpc_ms() - t0;
         s_trc_ndraw++;
     } else
     ID3D11DeviceContext_Draw(s_ctx, b->count, 0);
+    if (g_bw_gfxcls) gfxcls_drawn(b, s_vfx_log_ov, NULL, b->state, NULL);     /* BW_GFXCAP_CLASSES (test aid) */
+    if (bw_edgeprobe_on())              /* BW_GPU_EDGEPROBE (test aid) */
+        bw_edgeprobe_at(BW_EP_DRAW, s_ctx, (bwg_cur->mtex ? (void *)bwg_cur->mtex : (void *)bwg_cur->tex), bwg_gen);
     {
         const BwXVertex *v0 = &b->vertices[0];
         uint32_t c0 = ((uint32_t)(v0->d0[3] * 255.0f) << 24) | ((uint32_t)(v0->d0[0] * 255.0f) << 16)
@@ -4566,7 +3467,7 @@ static void bw_xdraw(const Nv2aSurface *s, const BwXBatch *b)
         ft_draw('x', b->count, v0->x, v0->y, v0->z, v0->rhw, c0,
                 b->tex_valid[0] ? b->tex[0].offset : 0, b->state);
     }
-    SURF_DRAWN(s_cur);
+    SURF_DRAWN(bwg_cur);
     s_st_draws++;
     s_st_xdraws++;
     s_st_tris += b->count / 3;
@@ -4591,6 +3492,7 @@ typedef struct {
     uint64_t hash;
     uint32_t n, mask, nin;
     uint8_t conv[16];           /* P1: the shader's conversions (in_conv of bw_vsh_hlsl.c); 0 = floats */
+    uint8_t points;             /* gfx-sprites: the point variant (writes oPts and the sprite's centre) */
     BwRawIl raw[BW_VSH_RAW_IL]; /* P1: input layouts for raw streams, by formats/slots/offsets */
     uint32_t raw_next;
     uint32_t words[BW_VSH_MAX_INSTR][4];
@@ -4603,6 +3505,8 @@ typedef struct {
     void *code;                 /* BW_GPU_VSH_VERIFY: the bytecode, for ... */
     SIZE_T code_size;
     ID3D11GeometryShader *so;   /* ... its stream-output twin */
+    int ffp;                    /* gfx-ffp: a fixed-function shader (fkey; n 0, words unused) */
+    BwFfpKey fkey;
 } BwVsh;
 
 static BwVsh *s_vsh;            /* BW_MAX_VSH entries, allocated on first use */
@@ -4613,6 +3517,8 @@ static int s_kvalid;
 static int s_gpu_vsh = -1;      /* BW_GPU_VSH=0: vertex programs on the CPU */
 static BwVsh *s_vlast;          /* the last draw_vsh, for vsh_readback */
 static UINT s_vlast_voff, s_vlast_stride, s_vlast_nverts;
+static UINT s_vlast_ioff, s_vlast_nidx;  /* gfx-sprites: the last batch's indices ... */
+static int s_vlast_points;              /* ... and whether it was a point list */
 
 static DWORD WINAPI vsh_worker(LPVOID arg)
 {
@@ -4726,7 +3632,7 @@ static void vsh_finish(BwVsh *v)
             fprintf(stderr, "[GPU-VSH] the device refused a compiled vertex program's %s (error 0x%08lX):"
                             " that program runs on the CPU\n", what, (unsigned long)hr);
     } else if (v->src)
-        bw_pscache_store_vs(v->src, v->len, s_ws_k > 1.0f, code, size);
+        bw_pscache_store_vs(v->src, v->len, bwg_ws_k > 1.0f, code, size);
     ID3D10Blob_Release(v->blob);
     v->blob = NULL;
     free(v->src);
@@ -4745,6 +3651,402 @@ static void vsh_finish_compiled(void)
     for (i = 0; i < n; i++)
         if (s_vsh[i].state == 1)
             vsh_finish(&s_vsh[i]);
+}
+
+/* The shader-compile worker, started at the first new program (0.2.5 item
+ * 42: both checked. Without the event the worker's wait returned at once and
+ * it spun a core; a failed thread leaked the event and was tried again on
+ * every new program. Either way the vertex programs now stay on the CPU path
+ * (as BW_GPU_VSH=0)). 1 when it runs. */
+static int vsh_worker_start(void)
+{
+    if (!s_vsh_thread) {
+        const char *what = "CreateEventA";
+        DWORD le = 0;
+        s_vsh_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (!s_vsh_wake)
+            le = GetLastError();
+        else {
+            what = "CreateThread";
+            s_vsh_thread = CreateThread(NULL, 0, vsh_worker, NULL, 0, NULL);
+            if (!s_vsh_thread) {
+                le = GetLastError();
+                CloseHandle(s_vsh_wake);
+                s_vsh_wake = NULL;
+            }
+        }
+        if (!s_vsh_thread) {
+            s_gpu_vsh = 0;
+            fprintf(stderr, "[GPU-VSH] the shader-compile worker could not start (%s failed, error %lu):"
+                            " vertex programs run on the CPU from now on, as with BW_GPU_VSH=0\n",
+                    what, (unsigned long)le);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ---- gfx-ffp: GPU_FFP and GPU_VSH_SYNC (bw_fixes.def) -------------------
+ * GPU_FFP is a port change in every edition since GA-13 (the maintainer,
+ * 2026-11-05: "Original gets the 100% native treatment"; `port` below):
+ * on by default everywhere, outside the registry as ORIG-1 is for the audio;
+ * in Remastered and later the registry's GPU_FFP stays as an alias
+ * (BW_FIX=-GPU_FFP: the CPU path), and BW_GPU_FFP = 0 or 1 sets it in every
+ * edition. The CPU path stays as the reference and the undo.
+ * GPU_VSH_SYNC too since the load-time compile (lane gfx-regen, bw_vshpre.c)
+ * showed 0 misses after load (the five smoke scenes from empty caches, the
+ * 26-scene corpus: docs/gfx/lanes/regen.md section 5): a port change in every
+ * edition, Original included (GA-13), on by default; the registry's
+ * GPU_VSH_SYNC stays as an alias in Remastered and later (BW_FIX=-GPU_VSH_SYNC),
+ * and BW_GPU_VSH_SYNC = 0 or 1 sets it in every edition (0: a shader still
+ * compiling draws on the CPU path for those frames, as before). */
+static int native_switch(const char *name, bw_fix_id_t id, int port, int *cache)
+{
+    if (*cache < 0) {
+        char any_name[64];
+        const char *e = getenv(name), *any;
+        int rx = bw_edition_at_least(BW_ED_REMASTERED);
+        int on = port && !rx ? 1 : bw_fix_enabled(id), replay_any;
+        _snprintf(any_name, sizeof any_name, "%s_ANY_EDITION", name);
+        any_name[sizeof any_name - 1] = 0;
+        any = getenv(any_name);
+        replay_any = !port && g_bw_gfxcap == 2 && any && any[0] == '1';
+        if (e && *e && (port || rx || replay_any))
+            on = e[0] != '0';
+        *cache = on;
+        if (on || (e && *e))
+            fprintf(stderr, "[GPU-NATIVE] %s: %s\n", name,
+                    on ? (replay_any && !rx ? "on (an Original capture's replay: measuring aid)" : "on")
+                       : port ? "off (the CPU path, the reference)" : "off (Original keeps today's path)");
+    }
+    return *cache;
+}
+
+static int s_ffp_sw = -1, s_vsync_sw = -1;
+/* the fixed function as a generated vertex shader (bw_ffp_hlsl, get_ffp) */
+static int ffp_on(void) { return native_switch("BW_GPU_FFP", BW_FIX_GPU_FFP, 1, &s_ffp_sw); }
+/* no CPU fallback while a vertex shader compiles: the manifest's warm-up and
+ * a miss compiled at once (vsh_adopt) */
+static int vsh_sync_on(void) { return native_switch("BW_GPU_VSH_SYNC", BW_FIX_GPU_VSH_SYNC, 1, &s_vsync_sw); }
+
+/* This run's first sights of a vertex shader, by where its shader came from
+ * (BW_GPU_STATS' [GPU-NATIVE] line): the warm-up, the cache, a compile on
+ * this thread (a miss, BW_GPU_VSH_SYNC), the worker (a miss without it) */
+static unsigned s_vs_warm, s_vs_cache, s_vs_now, s_vs_queued, s_vs_nowfail;
+static double s_vs_now_ms, s_vs_now_max, s_vs_first_ms;
+/* lane gfx-regen: first sights against the load-time compile (bw_vshpre.c):
+ * its texts, of them waited for (and the longest wait), not among them; the
+ * misses (compiled now, or queued without GPU_VSH_SYNC) once its batch was
+ * done, and the longest of those compiles */
+static unsigned s_pre_cov, s_pre_waits, s_pre_not, s_vs_now_late, s_vs_queued_late, s_pre_said;
+static double s_pre_wait_max, s_vs_late_max, s_vs_cache_max;
+
+static void vshpre_note(const BwVsh *v, int pre, double wms)
+{
+    if (pre) {
+        s_pre_cov++;
+        if (wms > 0.0) {
+            s_pre_waits++;
+            if (wms > s_pre_wait_max)
+                s_pre_wait_max = wms;
+        }
+        return;
+    }
+    if (s_pre_not++ < 16) {
+        /* what it is, as hashes and shape only (no program words): a
+         * program's word hash, or the fixed-function shape's key bytes */
+        char kx[2 * sizeof(BwFfpKey) + 1];
+        size_t j;
+        const uint8_t *kb = (const uint8_t *)&v->fkey;
+        for (j = 0; j < sizeof(BwFfpKey); j++)
+            _snprintf(kx + 2 * j, 3, "%02X", kb[j]);
+        kx[2 * sizeof(BwFfpKey)] = 0;
+        fprintf(stderr, "[GPU-VSHPRE] first sight at frame %u of a %s's shader not made at load time"
+                        " (%u instructions, inputs %04X, conv %02X%02X%02X%02X%02X%02X%02X%02X, points %d, %s %s)\n",
+                bwg_gen, v->ffp ? "fixed-function state" : "program", v->n, v->mask, v->conv[0], v->conv[1],
+                v->conv[2], v->conv[3], v->conv[4], v->conv[5], v->conv[6], v->conv[7], (int)v->points,
+                v->ffp ? "key" : "hash", v->ffp ? kx : "");
+        if (!v->ffp) {
+            fprintf(stderr, "[GPU-VSHPRE]   program hash %016llX\n", (unsigned long long)v->hash);
+            if (getenv("BW_GPU_VSHPRE_WORDS")) {    /* analysis aid: the words, into this run's log only */
+                uint32_t i;
+                for (i = 0; i < v->n; i++)
+                    fprintf(stderr, "[GPU-VSHPRE]   %2u: %08X %08X %08X %08X\n", i, v->words[i][0],
+                            v->words[i][1], v->words[i][2], v->words[i][3]);
+            }
+        }
+    }
+}
+
+/* The first sights' line, at a flip once a second when a count moved. */
+static void vshpre_flip_line(void)
+{
+    static double last;
+    unsigned sum = s_pre_cov + s_pre_not + s_vs_now + s_vs_queued;
+    double now;
+    bw_vshpre_line(0);
+    if (sum == s_pre_said || (now = bwg_qpc_ms()) - last < 1000.0)
+        return;
+    last = now;
+    s_pre_said = sum;
+    fprintf(stderr, "[GPU-VSHPRE] first sights: %u made at load time (%u waited for its compile, the longest"
+                    " %.1f ms), %u not; misses %u compiled now (%u after the load-time batch, the longest %.1f ms),"
+                    " %u to the worker (%u after it); from the cache %u (the longest %.2f ms)\n", s_pre_cov, s_pre_waits, s_pre_wait_max, s_pre_not,
+            s_vs_now, s_vs_now_late, s_vs_late_max, s_vs_queued, s_vs_queued_late, s_vs_cache, s_vs_cache_max);
+}
+
+/* The manifest's warm-up (BW_GPU_VSH_SYNC): at the first new vertex shader
+ * of the run, every shader the manifest lists and the cache holds is made on
+ * the device, so the driver's own compile happens here, before the game's
+ * first frame, and a program's first sight only finds it. */
+typedef struct {
+    uint64_t h1, h2;
+    uint32_t textlen;
+    ID3D11VertexShader *vs;
+    const void *code;           /* the cache's bytes */
+    size_t size;
+} BwVsWarm;
+static BwVsWarm *s_warm;
+static unsigned s_nwarm;
+static uint64_t s_vs_stamp;
+
+/* The translator's name for the manifest: the cache keys of a probe program's
+ * and a probe fixed-function state's shaders (no game data), so a build
+ * whose translation changed starts a list of its own. */
+static uint64_t vsh_stamp(void)
+{
+    static char src[16 * 1024];
+    static const uint32_t probe[1][4] = { { 0, 0x0020001Bu, 0x0836106Cu, 0x2F100FF9u } };
+    BwFfpKey k;
+    uint64_t h1, h2, s = 0;
+    size_t n = bw_vsh_hlsl(probe, 1, bw_vsh_inputs_used(probe, 1), NULL, src, sizeof src);
+    bw_pscache_vs_key(src, n, bwg_ws_k > 1.0f, &h1, &h2);
+    s ^= h1;
+    memset(&k, 0, sizeof k);
+    memset(k.in, -1, sizeof k.in);
+    k.in[BW_FFP_POS] = 0;
+    k.nin = 1;
+    n = bw_ffp_hlsl(&k, src, sizeof src);
+    bw_pscache_vs_key(src, n, bwg_ws_k > 1.0f, &h1, &h2);
+    return s ^ (h1 * 31u) ^ (uint64_t)n;
+}
+
+static void vsh_warmup(void)
+{
+    static int done;
+    BwVsManifestEntry *m = NULL;
+    unsigned n, i, made = 0, absent = 0, refused = 0, other = 0;
+    double t0;
+    if (done)
+        return;
+    done = 1;
+    t0 = bwg_qpc_ms();
+    s_vs_stamp = vsh_stamp();
+    n = bw_pscache_manifest_read(s_vs_stamp, &m);
+    if (n && (s_warm = (BwVsWarm *)calloc(n, sizeof *s_warm)) != NULL)
+        for (i = 0; i < n; i++) {
+            BwVsWarm *w = &s_warm[s_nwarm];
+            size_t sz = 0;
+            const void *cb;
+            if (m[i].ws != (bwg_ws_k > 1.0f)) {
+                other++;                /* another settings group's (widescreen or not) */
+                continue;
+            }
+            if (!(cb = bw_pscache_find_vs_key(m[i].h1, m[i].h2, m[i].textlen, &sz))) {
+                absent++;
+                continue;
+            }
+            if (FAILED(ID3D11Device_CreateVertexShader(s_dev, cb, sz, NULL, &w->vs))) {
+                w->vs = NULL;
+                refused++;
+                continue;
+            }
+            w->h1 = m[i].h1;
+            w->h2 = m[i].h2;
+            w->textlen = m[i].textlen;
+            w->code = cb;
+            w->size = sz;
+            s_nwarm++;
+            made++;
+        }
+    free(m);
+    fprintf(stderr, "[GPU-NATIVE] warm-up: %u vertex shaders made from the manifest in %.1f ms (%u listed:"
+                    " %u not in the cache, %u refused, %u for other settings)\n",
+            made, bwg_qpc_ms() - t0, n, absent, refused, other);
+}
+
+/* A new entry's shader is ready (made from bytecode): list it in the
+ * manifest (BW_GPU_VSH_SYNC) unless the warm-up made it. */
+static void vsh_manifest_note(const BwVsh *v, const char *src, int warm)
+{
+    BwVsManifestEntry e;
+    if (!vsh_sync_on() || warm)
+        return;
+    memset(&e, 0, sizeof e);
+    bw_pscache_vs_key(src, v->len, bwg_ws_k > 1.0f, &e.h1, &e.h2);
+    e.textlen = (uint32_t)v->len;
+    e.ws = bwg_ws_k > 1.0f;
+    e.kind = v->ffp ? 'f' : 'p';
+    bw_pscache_manifest_add(s_vs_stamp, &e);
+}
+
+/* The shader of a new entry n (filled in up to its text, `src`, v->len): the
+ * warm-up's (BW_GPU_VSH_SYNC), the cache's (item 43: the bytecode an earlier
+ * run compiled from this text with these flags, so the program draws on the
+ * GPU from its first batch), a compile now (BW_GPU_VSH_SYNC: counted, never
+ * the CPU path), else the worker's (the CPU path draws it until then, as
+ * before). Returns v when it can draw now, else NULL; the entry is published
+ * (s_nvsh) either way. */
+static BwVsh *vsh_adopt(BwVsh *v, LONG n, const char *src)
+{
+    double t0 = bwg_qpc_ms();
+    int sync = vsh_sync_on();
+    if (!v->len || !(v->src = (char *)malloc(v->len + 1))) {
+        v->state = -1;
+        InterlockedExchange(&s_nvsh, n + 1);
+        return NULL;
+    }
+    memcpy(v->src, src, v->len + 1);
+    {
+        /* lane gfx-regen: the game's programs compiled at load time
+         * (bw_vshpre.c, through the cache below). A first sight whose
+         * compile is still running waits for it with GPU_VSH_SYNC; one not
+         * started yet is made here, as any other */
+        double wms = 0.0;
+        int pre = bw_vshpre_wait(v->src, v->len, bwg_ws_k > 1.0f, sync, &wms);
+        vshpre_note(v, pre, wms);
+    }
+    if (sync) {
+        uint64_t h1, h2;
+        unsigned i;
+        vsh_warmup();
+        bw_pscache_vs_key(v->src, v->len, bwg_ws_k > 1.0f, &h1, &h2);
+        for (i = 0; i < s_nwarm; i++) {
+            BwVsWarm *w = &s_warm[i];
+            static const uint8_t no_conv[16];
+            if (!w->vs || w->h1 != h1 || w->h2 != h2 || w->textlen != (uint32_t)v->len)
+                continue;
+            /* the warm-up's shader; its input layout (vsh_make's) and the
+             * bytecode copy now */
+            v->vs = w->vs;
+            w->vs = NULL;
+            if (v->nin && !memcmp(v->conv, no_conv, sizeof no_conv)) {
+                D3D11_INPUT_ELEMENT_DESC il[16];
+                uint32_t k;
+                for (k = 0; k < v->nin; k++) {
+                    il[k].SemanticName = "ATTR";
+                    il[k].SemanticIndex = k;
+                    il[k].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                    il[k].InputSlot = 0;
+                    il[k].AlignedByteOffset = 16 * k;
+                    il[k].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+                    il[k].InstanceDataStepRate = 0;
+                }
+                if (FAILED(ID3D11Device_CreateInputLayout(s_dev, il, v->nin, w->code, w->size, &v->il))) {
+                    ID3D11VertexShader_Release(v->vs);
+                    v->vs = NULL;
+                    v->il = NULL;
+                    break;              /* made again below, as any other */
+                }
+            }
+            if ((v->code = malloc(w->size)) != NULL) {
+                memcpy(v->code, w->code, w->size);
+                v->code_size = w->size;
+            }
+            free(v->src);
+            v->src = NULL;
+            v->state = 2;
+            s_vs_warm++;
+            s_vs_first_ms += bwg_qpc_ms() - t0;
+            InterlockedExchange(&s_nvsh, n + 1);
+            return v;
+        }
+    }
+    {
+        size_t csz = 0;
+        const void *cb = bw_pscache_find_vs(v->src, v->len, bwg_ws_k > 1.0f, &csz);
+        if (cb) {
+            const char *what = "shader";
+            HRESULT hr = S_OK;
+            static unsigned hits;
+            if (vsh_make(v, cb, csz, &what, &hr)) {
+                vsh_manifest_note(v, v->src, 0);
+                free(v->src);
+                v->src = NULL;
+                v->state = 2;
+                if (hits++ < 3 || hits % 50 == 0)
+                    fprintf(stderr, "[PSCACHE] vertex shader from the cache (%u this run)\n", hits);
+                s_vs_cache++;
+                s_vs_first_ms += bwg_qpc_ms() - t0;
+                {
+                    /* lane gfx-regen: the longest first sight from the cache, and
+                     * any over 2 ms (when, for the gate's "worst stall") */
+                    double ms = bwg_qpc_ms() - t0;
+                    static unsigned slow;
+                    if (ms > s_vs_cache_max)
+                        s_vs_cache_max = ms;
+                    if (ms > 2.0 && slow++ < 12)
+                        fprintf(stderr, "[GPU-VSHPRE] a first sight from the cache took %.2f ms (frame %u, %s,"
+                                        " the load-time batch %s)\n", ms, bwg_gen, v->ffp ? "fixed function" : "program",
+                                bw_vshpre_busy() ? "still going" : "done");
+                }
+                InterlockedExchange(&s_nvsh, n + 1);
+                return v;
+            }
+            fprintf(stderr, "[PSCACHE] the driver rejected a cached vertex shader's %s (error 0x%08lX):"
+                            " compiling it again\n", what, (unsigned long)hr);
+        }
+    }
+    if (sync) {
+        /* a miss: compiled here and now, with the worker's compiler and
+         * flags, so the batch draws on the GPU (no CPU fallback; D-028) */
+        ID3DBlob *blob = NULL, *err = NULL;
+        double ms;
+        if (FAILED(D3DCompile(v->src, v->len, "bw_vsh", WS_DEFINES, NULL, "vs_main", "vs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS,
+                              0, &blob, &err))) {
+            if (InterlockedIncrement(&s_vsh_failures) <= 3) {
+                fprintf(stderr, "[GPU-VSH] shader %ld failed: %s\n", (long)n,
+                        err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+                fprintf(stderr, "%s\n", v->src);
+            }
+            if (err) ID3D10Blob_Release(err);
+            free(v->src);
+            v->src = NULL;
+            v->state = -1;
+            s_vs_nowfail++;
+            InterlockedExchange(&s_nvsh, n + 1);
+            return NULL;
+        }
+        if (err) ID3D10Blob_Release(err);
+        v->blob = blob;
+        ms = bwg_qpc_ms() - t0;
+        s_vsh_compile_ms += ms;
+        InterlockedIncrement(&s_vsh_compiles);
+        vsh_manifest_note(v, v->src, 0);
+        vsh_finish(v);                  /* made on the device, kept in the cache */
+        s_vs_now++;
+        s_vs_now_ms += ms;
+        if (ms > s_vs_now_max)
+            s_vs_now_max = ms;
+        if (!bw_vshpre_busy()) {        /* lane gfx-regen: after the load-time batch */
+            s_vs_now_late++;
+            if (ms > s_vs_late_max)
+                s_vs_late_max = ms;
+        }
+        if (s_vs_now <= 5 || s_vs_now % 20 == 0)
+            fprintf(stderr, "[GPU-NATIVE] a %s's vertex shader was not in the cache: compiled now in %.1f ms"
+                            " (%u this run, %.0f ms)\n", v->ffp ? "fixed-function state" : "program", ms,
+                    s_vs_now, s_vs_now_ms);
+        InterlockedExchange(&s_nvsh, n + 1);
+        return v->state == 2 ? v : NULL;
+    }
+    s_vs_queued++;
+    if (!bw_vshpre_busy())
+        s_vs_queued_late++;             /* lane gfx-regen */
+    InterlockedExchange(&s_nvsh, n + 1);
+    SetEvent(s_vsh_wake);
+    return NULL;
 }
 
 /* The program's entry, or NULL while its shader compiles (or if it failed).
@@ -4779,11 +4081,11 @@ static BwVsh *get_vsh(const BwXVsBatch *b)
     BwVsh *v;
 
     vsh_conv_key(b, conv);
-    if (last >= 0 && memo_on()) {
+    if (last >= 0 && bwg_memo_on()) {
         /* item 43: the last program first, compared word for word without
          * hashing the whole program (up to 136 instructions) every draw */
         v = &s_vsh[last];
-        if (v->n == b->ninstr && !memcmp(v->conv, conv, sizeof conv)
+        if (v->n == b->ninstr && v->points == (b->points != 0) && !memcmp(v->conv, conv, sizeof conv)
                 && !memcmp(v->words, b->program, b->ninstr * sizeof v->words[0])) {
             if (v->state == 1)
                 vsh_finish(v);
@@ -4796,7 +4098,8 @@ static BwVsh *get_vsh(const BwXVsBatch *b)
         if (j < 0 || (i >= 0 && i == last))
             continue;
         v = &s_vsh[j];
-        if (v->hash != h || v->n != b->ninstr || memcmp(v->conv, conv, sizeof conv)
+        if (v->hash != h || v->n != b->ninstr || v->points != (b->points != 0)
+            || memcmp(v->conv, conv, sizeof conv)
             || memcmp(v->words, b->program, b->ninstr * sizeof v->words[0]))
             continue;
         last = j;
@@ -4808,33 +4111,8 @@ static BwVsh *get_vsh(const BwXVsBatch *b)
         return NULL;
     if (!s_vsh && !(s_vsh = (BwVsh *)calloc(BW_MAX_VSH, sizeof *s_vsh)))
         return NULL;
-    if (!s_vsh_thread) {
-        /* 0.2.5 item 42: both checked. Without the event the worker's wait
-         * returned at once and it spun a core; a failed thread leaked the
-         * event and was tried again on every new program. Either way the
-         * vertex programs now stay on the CPU path (as BW_GPU_VSH=0). */
-        const char *what = "CreateEventA";
-        DWORD le = 0;
-        s_vsh_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
-        if (!s_vsh_wake)
-            le = GetLastError();
-        else {
-            what = "CreateThread";
-            s_vsh_thread = CreateThread(NULL, 0, vsh_worker, NULL, 0, NULL);
-            if (!s_vsh_thread) {
-                le = GetLastError();
-                CloseHandle(s_vsh_wake);
-                s_vsh_wake = NULL;
-            }
-        }
-        if (!s_vsh_thread) {
-            s_gpu_vsh = 0;
-            fprintf(stderr, "[GPU-VSH] the shader-compile worker could not start (%s failed, error %lu):"
-                            " vertex programs run on the CPU from now on, as with BW_GPU_VSH=0\n",
-                    what, (unsigned long)le);
-            return NULL;
-        }
-    }
+    if (!vsh_worker_start())
+        return NULL;
     v = &s_vsh[n];
     memset(v, 0, sizeof *v);
     v->hash = h;
@@ -4842,41 +4120,16 @@ static BwVsh *get_vsh(const BwXVsBatch *b)
     v->mask = b->input_mask;
     v->nin = b->ninputs;
     memcpy(v->conv, conv, sizeof conv);
+    v->points = (uint8_t)(b->points != 0);
     memcpy(v->words, b->program, b->ninstr * sizeof v->words[0]);
-    v->len = bw_vsh_hlsl(b->program, b->ninstr, b->input_mask, conv, src, sizeof src);
-    if (!v->len || !(v->src = (char *)malloc(v->len + 1))) {
-        v->state = -1;
-    } else {
-        size_t csz = 0;
-        const void *cb;
-        memcpy(v->src, src, v->len + 1);
-        if (getenv("BW_GPU_VSH_DUMP") && n < 8)
-            fprintf(stderr, "[GPU-VSH] shader %ld (%u instructions, inputs %04X):\n%s\n",
-                    (long)n, b->ninstr, b->input_mask, v->src);
-        /* item 43: the bytecode an earlier run compiled from this text with
-         * these flags (bw_pscache.c), so the program draws on the GPU from
-         * its first batch instead of on the CPU until the worker is done */
-        cb = bw_pscache_find_vs(v->src, v->len, s_ws_k > 1.0f, &csz);
-        if (cb) {
-            const char *what = "shader";
-            HRESULT hr = S_OK;
-            static unsigned hits;
-            if (vsh_make(v, cb, csz, &what, &hr)) {
-                free(v->src);
-                v->src = NULL;
-                v->state = 2;
-                if (hits++ < 3 || hits % 50 == 0)
-                    fprintf(stderr, "[PSCACHE] vertex shader from the cache (%u this run)\n", hits);
-                InterlockedExchange(&s_nvsh, n + 1);
-                last = n;
-                return v;
-            }
-            fprintf(stderr, "[PSCACHE] the driver rejected a cached vertex shader's %s (error 0x%08lX):"
-                            " compiling it again\n", what, (unsigned long)hr);
-        }
+    v->len = bw_vsh_hlsl_ex(b->program, b->ninstr, b->input_mask, conv, v->points, src, sizeof src);
+    if (v->len && getenv("BW_GPU_VSH_DUMP") && n < 8)
+        fprintf(stderr, "[GPU-VSH] shader %ld (%u instructions, inputs %04X):\n%s\n",
+                (long)n, b->ninstr, b->input_mask, src);
+    if (vsh_adopt(v, n, src)) {
+        last = n;
+        return v;
     }
-    InterlockedExchange(&s_nvsh, n + 1);
-    SetEvent(s_vsh_wake);
     return NULL;
 }
 
@@ -4892,7 +4145,7 @@ static ID3D11GeometryShader *s_gs_bound;
 
 static void gs_set(ID3D11GeometryShader *g)
 {
-    if (g == s_gs_bound && memo_on())
+    if (g == s_gs_bound && bwg_memo_on())
         return;
     ID3D11DeviceContext_GSSetShader(s_ctx, g, NULL, 0);
     s_gs_bound = g;
@@ -4900,7 +4153,7 @@ static void gs_set(ID3D11GeometryShader *g)
 
 static void gs_unbind(void)
 {
-    if (s_gs_bound || !memo_on())
+    if (s_gs_bound || !bwg_memo_on())
         gs_set(NULL);
 }
 
@@ -4934,6 +4187,68 @@ static ID3D11GeometryShader *vsh_filter_gs(void)
         gs = NULL;
     ID3D10Blob_Release(blob);
     return gs;
+}
+
+/* gfx-sprites (I6): the sprite geometry shader (bw_vsh_sprite_gs_hlsl),
+ * compiled once, with the vertex shaders' widescreen define; and its b1,
+ * the core's BwgSpriteConsts. NULL if it can't be made: point batches then
+ * stay on the CPU path. */
+static ID3D11GeometryShader *sprite_gs(void)
+{
+    static ID3D11GeometryShader *gs;
+    static int tried;
+    ID3DBlob *blob = NULL, *err = NULL;
+    if (tried)
+        return gs;
+    tried = 1;
+    if (FAILED(D3DCompile(bw_vsh_sprite_gs_hlsl, strlen(bw_vsh_sprite_gs_hlsl), "bw_sprite_gs", WS_DEFINES,
+                          NULL, "gs_main", "gs_5_0",
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &blob, &err))) {
+        fprintf(stderr, "[GPU-SPRITES] the sprite geometry shader failed: %s\n",
+                err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (err) ID3D10Blob_Release(err);
+        return NULL;
+    }
+    if (err) ID3D10Blob_Release(err);
+    if (FAILED(ID3D11Device_CreateGeometryShader(s_dev, ID3D10Blob_GetBufferPointer(blob),
+                                                ID3D10Blob_GetBufferSize(blob), NULL, &gs))) {
+        fprintf(stderr, "[GPU-SPRITES] the device refused the sprite geometry shader: points stay on the CPU%c", 10);
+        gs = NULL;
+    }
+    ID3D10Blob_Release(blob);
+    return gs;
+}
+
+static ID3D11Buffer *s_scb;             /* the sprite GS's b1 */
+static BwgSpriteConsts s_scb_shadow;
+static int s_scb_valid;
+
+static int sprite_consts(const BwXVsBatch *b)
+{
+    BwgSpriteConsts c;
+    D3D11_MAPPED_SUBRESOURCE m;
+    bwg_sprite_consts(b, &c);
+    if (!s_scb) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof(bd));
+        bd.ByteWidth = (sizeof(BwgSpriteConsts) + 15) & ~15u;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_scb))) {
+            s_scb = NULL;
+            return 0;
+        }
+    }
+    if (s_scb_valid && !memcmp(&c, &s_scb_shadow, sizeof c))
+        return 1;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_scb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, &c, sizeof c);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_scb, 0);
+    s_scb_shadow = c;
+    s_scb_valid = 1;
+    return 1;
 }
 
 static int gpu_vsh_on(void)
@@ -4990,30 +4305,13 @@ static ID3D11ShaderResourceView *vfetch_table(void)
     return srv;
 }
 
-static DXGI_FORMAT vfetch_format(uint8_t conv)
-{
-    uint32_t s = conv & 15u;
-    switch (conv >> 4) {
-    case BW_XVS_FLOAT:
-        return s == 1 ? DXGI_FORMAT_R32_FLOAT : s == 2 ? DXGI_FORMAT_R32G32_FLOAT
-             : s == 3 ? DXGI_FORMAT_R32G32B32_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
-    case BW_XVS_CONST: return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    case BW_XVS_COLOR: return DXGI_FORMAT_R8G8B8A8_UINT;
-    case BW_XVS_UBYTE:
-        return s == 1 ? DXGI_FORMAT_R8_UINT : s == 2 ? DXGI_FORMAT_R8G8_UINT : DXGI_FORMAT_R8G8B8A8_UINT;
-    case BW_XVS_SHORT:
-        return s == 1 ? DXGI_FORMAT_R16_SINT : s == 2 ? DXGI_FORMAT_R16G16_SINT
-                                                     : DXGI_FORMAT_R16G16B16A16_SINT;
-    case BW_XVS_CMP:   return DXGI_FORMAT_R32_UINT;
-    default:           return DXGI_FORMAT_UNKNOWN;
-    }
-}
 
 /* The input layout for this batch's streams: one element per input, in its
  * stream's slot at its offset, in its own format. Kept per shader. */
 static ID3D11InputLayout *vfetch_layout(BwVsh *v, const BwXVsBatch *b)
 {
     D3D11_INPUT_ELEMENT_DESC el[16];
+    BwgVElem ge[16];
     uint64_t key = 1469598103934665603ull;
     uint32_t k, i;
     BwRawIl *e;
@@ -5021,18 +4319,15 @@ static ID3D11InputLayout *vfetch_layout(BwVsh *v, const BwXVsBatch *b)
     if (!v->code || !v->nin || v->nin > 16)
         return NULL;
     memset(el, 0, sizeof el);
+    if (!bwg_vfetch_elements(b, v->nin, ge, &key))      /* the core's formats and key (P1) */
+        return NULL;
     for (k = 0; k < v->nin; k++) {
-        const BwXVsInput *in = &b->in[k];
         el[k].SemanticName = "ATTR";
         el[k].SemanticIndex = k;
-        el[k].Format = vfetch_format(in->conv);
-        el[k].InputSlot = in->stream;
-        el[k].AlignedByteOffset = in->offset;
+        el[k].Format = (DXGI_FORMAT)ge[k].format;
+        el[k].InputSlot = ge[k].slot;
+        el[k].AlignedByteOffset = ge[k].offset;
         el[k].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
-        if (el[k].Format == DXGI_FORMAT_UNKNOWN)
-            return NULL;
-        key = (key ^ ((uint64_t)el[k].Format | (uint64_t)in->stream << 8
-                      | (uint64_t)in->offset << 16)) * 1099511628211ull;
     }
     for (i = 0; i < BW_VSH_RAW_IL; i++) {
         e = &v->raw[i];
@@ -5062,7 +4357,7 @@ static ID3D11InputLayout *vfetch_layout(BwVsh *v, const BwXVsBatch *b)
  * test is about to read this batch's positions on the CPU. */
 static int bw_vsh_raw_ok(void)
 {
-    return gpu_vsh_on() && !(s_ws_k > 1.0f && s_ws_2d > 0);
+    return gpu_vsh_on() && !(bwg_ws_k > 1.0f && bwg_ws_2d > 0);
 }
 
 /* The last raw draw's binding, for vsh_readback. */
@@ -5219,102 +4514,39 @@ static int bw_xdraw_vsh(const Nv2aSurface *s, const BwXVsBatch *b)
 
     if (!gpu_vsh_on() || !b || !b->nindices || !ensure_device())
         return 0;
+    if (b->points && (!bwg_sprites_on() || !sprite_gs()))
+        return 0;               /* gfx-sprites: points stay on the CPU path */
     if (bw_vfx_active())
         gs_unbind();            /* item 43: the visual suite's passes below draw without one */
     if (!(v = get_vsh(b))) {
         s_st_vfall++;
+        if (b->points)
+            s_st_spr_fall++;
         return 0;
     }
     /* VFX (D9): an overlay (HUD) draw: D3D's pass-through program, no depth test */
-    s_vfx_overlay = bw_vfx_active() && b->ninstr <= 4 && b->xb.state && !b->xb.state->depth_test_enable;
-    if (s_vfx_overlay && b->xb.tex_valid[0]) {
-        /* V1 test aid: BW_VFX_HUDSKIP=<hex texture address> leaves out the
-         * overlay draws of that texture (which HUD draw is which). */
-        static int skip_init;
-        static uint32_t skip;           /* 0: none */
-        if (!skip_init) {
-            const char *e = getenv("BW_VFX_HUDSKIP");
-            skip_init = 1;
-            skip = e ? (uint32_t)strtoul(e, NULL, 16) : 0;
-        }
-        if (skip && b->xb.tex[0].offset == skip) {
-            s_vfx_overlay = 0;
+    {
+        int skip;                       /* BW_VFX_HUDSKIP (V1 test aid) */
+        s_vfx_overlay = bwg_vsh_overlay(b, &skip);
+        if (skip)
             return 1;
-        }
     }
-    if (s_ws_k > 1.0f) {
-        /* Position is input 0 when the program reads it; for 2D (D3D's
-         * pass-through program) it is in logical pixels. */
-        s_ws_full = 0;
-        if (s_ws_2d > 0 && (b->input_mask & 1u) && b->ninputs && b->nverts && b->inputs) {
-            /* The overlay system's quads read v0 position (logical pixels),
-             * v1 colour, v2 texture coordinate 0 (normalized) (seen, run
-             * ...-r6-gpu-in7: mask 000F); D3D's own fixed-function layout
-             * would put it in v9. Inputs arrive in ascending order of the
-             * mask (bw_backend_ext.h). */
-            int tci = -1, tca = (b->input_mask & (1u << 2)) ? 2 : 9;
-            float lo = b->inputs[0], hi = lo, u0 = 0, u1 = 0, v0 = 0, v1 = 0;
-            if (b->input_mask & (1u << tca)) {
-                uint32_t m = b->input_mask & ((1u << tca) - 1u);
-                tci = 0;
-                while (m) { tci += (int)(m & 1u); m >>= 1; }
-                u0 = u1 = b->inputs[tci * 4];
-                v0 = v1 = b->inputs[tci * 4 + 1];
-            }
-            for (uint32_t i = 1; i < b->nverts; i++) {
-                const float *in = &b->inputs[(size_t)i * b->ninputs * 4];
-                if (in[0] < lo) lo = in[0];
-                if (in[0] > hi) hi = in[0];
-                if (tci >= 0) {
-                    float u = in[tci * 4], vv = in[tci * 4 + 1];
-                    if (u < u0) u0 = u;
-                    if (u > u1) u1 = u;
-                    if (vv < v0) v0 = vv;
-                    if (vv > v1) v1 = vv;
-                }
-            }
-            s_ws_span_u = u1 - u0;
-            s_ws_span_v = v1 - v0;
-            if (s_ws_log > 0) {
-                static uint32_t seen[8];
-                int k;
-                for (k = 0; k < 8 && seen[k] && seen[k] != b->input_mask; k++)
-                    ;
-                if (k < 8 && !seen[k]) {
-                    seen[k] = b->input_mask;
-                    fprintf(stderr, "[WS] 2D vertex-program inputs: mask %04X (%u), first vertex",
-                            b->input_mask, b->ninputs);
-                    for (uint32_t a = 0; a < b->ninputs && a < 6; a++)
-                        fprintf(stderr, " (%g %g %g %g)", b->inputs[a * 4], b->inputs[a * 4 + 1],
-                                b->inputs[a * 4 + 2], b->inputs[a * 4 + 3]);
-                    fprintf(stderr, "\n");
-                }
-            }
-            /* Textured with no known texture coordinate: not a backdrop. */
-            s_ws_full = (ws_covers_view(s, lo, hi, 0)
-                         && (b->xb.tex_valid[0] ? tci >= 0 : 1)
-                         && ws_backdrop(s, b->xb.tex_valid[0], b->xb.tex_normalized[0],
-                                        b->xb.tex[0].width, b->xb.tex[0].height, u0, u1, v0, v1))
-                        || ws_samples_wide(b->xb.tex_valid[0], b->xb.tex[0].offset);
-            ws_note('v', b->nindices, b->xb.tex_valid[0], b->xb.tex[0].width, b->xb.tex[0].height,
-                    lo, hi, s);
-        }
-    }
+    bwg_ws_vsbatch(s, b);               /* widescreen (D5): the 2D test */
     if (bw_vfx_active() && b->xb.state && begin(s, b->xb.state)) {
         /* the scene before the HUD (and AO), per view; before this draw's
          * own state is set, since the AO passes change the pipeline */
         if (s_vfx_overlay)
             vfx_overlay_draw();
         else {
-            if (vfx_sea_starts(&b->xb) && s_vfx_pend_on && s_vfx_pend_surf == s_cur)
+            if (vfx_sea_starts(&b->xb) && s_vfx_pend_on && s_vfx_pend_surf == bwg_cur)
                 vfx_ao_now(&s_vfx_pend);        /* the water starts: AO on what's under it */
             vfx_scene_draw();
         }
     }
     if (trc_on()) {                                         /* T1 test aid */
-        double t0 = qpc_ms();
+        double t0 = bwg_qpc_ms();
         r = xdraw_prepare(s, &b->xb);
-        s_trc_prep += qpc_ms() - t0;
+        s_trc_prep += bwg_qpc_ms() - t0;
     } else
     r = xdraw_prepare(s, &b->xb);
     s_vfx_log_ov = s_vfx_overlay;           /* item 50: for the drawlog */
@@ -5346,11 +4578,7 @@ static int bw_xdraw_vsh(const Nv2aSurface *s, const BwXVsBatch *b)
         static uint32_t kgen;
         static int kgen_ok, kgen_on = -1;
         float vsinfo[4], foginfo[4];
-        vsinfo[0] = b->aa[0]; vsinfo[1] = b->aa[1];
-        vsinfo[2] = b->near_clip ? 1.0f : 0.0f; vsinfo[3] = 0.0f;
-        foginfo[0] = b->fog_enable ? 1.0f : 0.0f;
-        foginfo[1] = (float)b->fog_mode;
-        foginfo[2] = b->fog_param[0]; foginfo[3] = b->fog_param[1];
+        bwg_vsh_info(b, vsinfo, foginfo);
         if (kgen_on < 0) {
             const char *e = getenv("BW_GPU_KGEN");
             kgen_on = !(e && e[0] == '0');
@@ -5410,10 +4638,10 @@ bw_kdone:
             ID3D11ShaderResourceView *t = vfetch_table();
             if (!t)
                 return 0;
-            ID3D11DeviceContext_VSSetShaderResources(s_ctx, 0, 1, &t);
+            sh_vs_srv(0, 1, &t);        /* I3 */
             conv_bound = 1;
         }
-        ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, b->nstreams, bufs, s_vlast_strides, s_vlast_offs);
+        sh_vb(0, b->nstreams, bufs, s_vlast_strides, s_vlast_offs);     /* I3 */
         s_vlast_ns = b->nstreams;
         s_vlast_il = il;
         s_vlast_raw = 1;
@@ -5432,16 +4660,29 @@ bw_kdone:
     cbs[0] = s_xcb;
     cbs[1] = s_kcb;
 
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, il);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (b->points && !sprite_consts(b))
+        return 0;               /* gfx-sprites: no constants for the GS: the CPU path draws it */
+    sh_il(il);                          /* I3: each sent only if it changed */
+    sh_topo(b->points ? D3D11_PRIMITIVE_TOPOLOGY_POINTLIST : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (v->nin && !s_vlast_raw)
-        ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vring.buf, &stride, &voff);
-    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_iring.buf, DXGI_FORMAT_R32_UINT, 0);
-    ID3D11DeviceContext_VSSetShader(s_ctx, v->vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 2, cbs);
+        sh_vb(0, 1, &s_vring.buf, &stride, &voff);
+    sh_ib(s_iring.buf, DXGI_FORMAT_R32_UINT, 0);
+    sh_vs(v->vs);
+    sh_vs_cb(0, 2, cbs);
+    if (b->points) {
+        /* gfx-sprites (I6): each point's quad by bw_draw_points's rules; b0
+         * the combiner constants (surf, wsx), b1 the sprite's. The geometry
+         * stage's constant buffers are not in I3's shadow (only this branch
+         * and the sprite check set them). */
+        ID3D11Buffer *gcbs[2];
+        gcbs[0] = s_xcb;
+        gcbs[1] = s_scb;
+        gs_set(sprite_gs());
+        ID3D11DeviceContext_GSSetConstantBuffers(s_ctx, 0, 2, gcbs);
+    } else
     gs_set(vsh_filter_gs());    /* item 43: only when it isn't bound already */
     ors = 0;
-    {
+    if (!b->points) {           /* gfx-sprites: points leave the sea's state alone, as on the CPU path */
         /* OCEAN_REFLECT_SINGLE (see ors_prepare). The sea's lit pass (stage
          * program 0x21081, seen: the run of draws right before the
          * reflection run, one per tile) primes a private copy of the scene's
@@ -5452,20 +4693,20 @@ bw_kdone:
             s_ors_inlit = 0;            /* any other draw: the copy is stale */
             s_ors_primed = 0;
             s_ors_gaveup = 0;           /* item 49: the next run of the sea may try again */
-        } else if (s_cur && s_cur_depth && s_cur_depth->tex && s_cur_depth->dsv && ors_enabled()
+        } else if (bwg_cur && bwg_cur_depth && bwg_cur_depth->tex && bwg_cur_depth->dsv && ors_enabled()
                    && !s_ors_gaveup) {
             if (lit) {
                 if (!s_ors_inlit) {     /* a new run: copy the scene's depth at its first draw */
                     s_ors_src = NULL;
                     s_ors_primed = 0;
                 }
-                if (ors_prepare(s_cur_depth)) {
+                if (ors_prepare(bwg_cur_depth)) {
                     s_ors_inlit = 1;    /* item 49: only once the copy exists */
                     ors = 2;
                 } else
                     s_ors_gaveup = 1;   /* item 49: this run as shipped, without copying again */
             } else if (s_ors_inlit || s_ors_primed) {
-                ID3D11RenderTargetView *rtv = s_cur->mrtv ? s_cur->mrtv : s_cur->rtv;
+                ID3D11RenderTargetView *rtv = bwg_cur->mrtv ? bwg_cur->mrtv : bwg_cur->rtv;
                 static int shown;
                 if (!shown++ && b->xb.state)
                     fprintf(stderr, "[BW] ocean reflect single on: the game's depth state for the reflection"
@@ -5476,20 +4717,30 @@ bw_kdone:
                 s_ors_primed = 1;
                 ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, s_ors_dsv);
                 ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ors_eq, 0);
+                g_bw_ctx_epoch++;       /* I3: not the draw path's own state */
                 ors = 1;
                 s_ors_draws++;
             }
         }
     }
     if (trc_on()) {                                         /* T1 test aid */
-        double t0 = qpc_ms();
+        double t0 = bwg_qpc_ms();
         ID3D11DeviceContext_DrawIndexed(s_ctx, b->nindices, ioff / 4u, 0);
-        s_trc_draw += qpc_ms() - t0;
+        s_trc_draw += bwg_qpc_ms() - t0;
         s_trc_ndraw++;
     } else
     ID3D11DeviceContext_DrawIndexed(s_ctx, b->nindices, ioff / 4u, 0);
+    if (b->points) {            /* gfx-sprites: the other draws expect triangles */
+        sh_topo(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);     /* I3: through the shadow, so it stays true */
+        s_st_spr_draws++;
+        s_st_spr_pts += b->nindices;
+    }
+    if (bw_edgeprobe_on())              /* BW_GPU_EDGEPROBE (test aid) */
+        bw_edgeprobe_at(BW_EP_DRAW, s_ctx, (bwg_cur->mtex ? (void *)bwg_cur->mtex : (void *)bwg_cur->tex), bwg_gen);
+    if (ors)
+        g_bw_ctx_epoch++;               /* I3: OCEAN_REFLECT_SINGLE sets state of its own */
     if (ors == 2) {                 /* OCEAN_REFLECT_SINGLE: the lit tile again, depth only, into the copy */
-        ID3D11RenderTargetView *rtv = s_cur->mrtv ? s_cur->mrtv : s_cur->rtv;
+        ID3D11RenderTargetView *rtv = bwg_cur->mrtv ? bwg_cur->mrtv : bwg_cur->rtv;
         ID3D11BlendState *obs = NULL;
         FLOAT obf[4] = { 0, 0, 0, 0 };
         UINT omask = 0xFFFFFFFFu, oref = 0;
@@ -5532,28 +4783,382 @@ bw_kdone:
         if (ods) ID3D11DepthStencilState_Release(ods);
     }
     if (ors) {                      /* OCEAN_REFLECT_SINGLE: the scene's own depth view again */
-        ID3D11RenderTargetView *rtv = s_cur->mrtv ? s_cur->mrtv : s_cur->rtv;
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, s_cur_depth->dsv);
+        ID3D11RenderTargetView *rtv = bwg_cur->mrtv ? bwg_cur->mrtv : bwg_cur->rtv;
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, bwg_cur_depth->dsv);
     }
+    if (g_bw_gfxcls) gfxcls_drawn(&b->xb, b->ninstr <= 4 && b->xb.state && !b->xb.state->depth_test_enable, NULL, b->xb.state, b);   /* BW_GFXCAP_CLASSES */
     if (bw_vfx_active()) {
         vfx_drawlog('v', b->nindices, &b->xb, NULL, b->ninstr);     /* VFX (D9) test aid */
         vfx_drawlog_inputs(b);                                      /* V1: the HUD quads' inputs */
     }
     ft_draw('v', b->nindices, (float)b->ninstr, (float)b->nverts, 0.0f, 0.0f, b->input_mask,
             b->xb.tex_valid[0] ? b->xb.tex[0].offset : 0, b->xb.state);
-    if (!memo_on())
+    if (!bwg_memo_on())
         gs_set(NULL);           /* BW_GPU_MEMO=0: unbound after every draw, as before */
     s_vlast = v;
     s_vlast_voff = voff;
     s_vlast_stride = stride;
     s_vlast_nverts = b->nverts;
-    SURF_DRAWN(s_cur);
+    s_vlast_ioff = ioff;                /* gfx-sprites: for sprite_readback */
+    s_vlast_nidx = b->nindices;
+    s_vlast_points = b->points != 0;
+    SURF_DRAWN(bwg_cur);
     s_st_draws++;
     s_st_vdraws++;
+    s_st_tris += b->points ? 2u * b->nindices : b->nindices / 3;
+    return 1;
+}
+
+
+/* ---- gfx-ffp: the fixed function on the GPU (GPU_FFP, BW_GPU_FFP) --------
+ *
+ * A fixed-function batch (the executor's gpu_ffp_batch: the sky dome, the
+ * beach props) arrives untransformed, like a vertex-program batch, with its
+ * state in b->ffp. Its shader is generated from that state (bw_ffp_hlsl), kept
+ * in the same table, cache, worker and manifest as the programs' (s_vsh,
+ * vsh_adopt), and drawn here: the CPU path's glue (bw_xdraw's, in its order:
+ * these batches were drawn there, never as overlays, never by the sea's
+ * single-reflection test) with the program path's vertex binding (the raw
+ * streams or the gathered floats, the finite-vertex filter). Its constants
+ * are its own: cbuffer V (b1) in a buffer of its own, so the programs' upload
+ * shortcuts never see it, and BwFfpConsts (b2). Declined (back to the CPU
+ * path, counted): while its shader compiles (without BW_GPU_VSH_SYNC), and
+ * where the widescreen 2D test reads the CPU's positions
+ * (bwg_ws_needs_positions: a 2D section, the 4:3-cutscene option). */
+_Static_assert(sizeof(((BwFfpKey *)0)->in) == BW_FFP_ROLES, "BwFfpKey.in holds every BW_FFP_* role");
+_Static_assert(sizeof(BwFfpConsts) == 50 * 16, "BwFfpConsts is bw_ffp_hlsl's cbuffer F");
+
+static ID3D11Buffer *s_kcb_ffp, *s_fcb;
+static unsigned s_st_fdraws, s_st_ffall, s_st_fdecl;            /* in the last second */
+static unsigned long long s_ffp_draws, s_ffp_fall, s_ffp_decl;  /* this run */
+
+static void ffp_key(const BwXVsBatch *b, BwFfpKey *k)
+{
+    const BwXFfp *f = b->ffp;
+    memset(k, 0, sizeof *k);
+    memcpy(k->in, f->in, sizeof k->in);
+    vsh_conv_key(b, k->conv);
+    k->nin = b->ninputs;
+    k->lit = f->lit ? 1 : 0;
+    k->light_mask = f->lit ? f->light_mask & 0xFFFFu : 0;     /* lit_color reads 8 lights */
+    k->colmat = f->lit ? f->colmat & 3 : 0;
+    k->fog_on = f->fog_on ? 1 : 0;
+    k->fog_gen = f->fog_on ? f->fog_gen : 0;
+}
+
+/* Lane gfx-regen: the fixed-function shapes the game draws with (GPU_FFP),
+ * for the load-time compile. The fixed function's shader is generated from
+ * the state's shape (bw_ffp_hlsl), not from anything the game creates, so no
+ * wrapper sees it; these are the shapes the corpus and the smoke scenes meet
+ * (logged by vshpre_note at a first sight), each with its raw inputs and
+ * gathered (no conversions). Descriptions of state only: which input each
+ * role reads, the conversions, lit or not, the lights' kinds, colour
+ * material, fog. Empty: the shapes compile at their first sight, as before. */
+static const BwFfpKey s_known_ffp[] = {
+    /* roles in BW_FFP_* order (POS, NRM, COL, TC0, TC1-3, FOG): input k or -1;
+     * conversions per input; inputs; light mask; lit, colour material, fog,
+     * fog generation. Seen at first sights in Remastered mission 1 (run
+     * 20261105-...-regen-probe-m01r), the same 4 shapes gfx-ffp counted over
+     * the corpus. */
+    { { 0, -1, -1, 1, -1, -1, -1, -1 }, { 0 }, 2, 0, 0, 0, 0, 0 },            /* unlit, position + 1 texture */
+    { { 0, -1, -1, 1, -1, -1, -1, -1 }, { 0 }, 2, 0, 0, 0, 1, 2 },            /* the same, with fog */
+    { { 0, -1, 1, 2, -1, -1, -1, -1 }, { 0, BW_XVS_COLOR << 4 | 4 }, 3, 0, 0, 0, 0, 0 },  /* unlit, a D3DCOLOR colour */
+    { { 0, 1, -1, 2, -1, -1, -1, -1 }, { 0, BW_XVS_CMP << 4 | 1 }, 3, 1, 1, 0, 1, 2 },    /* lit by light 0, a packed normal, fog */
+    { { 0 } }                           /* end */
+};
+
+static void vshpre_known_ffp(void)
+{
+    static char src[96 * 1024];
+    unsigned i;
+    if (!ffp_on() || !gpu_vsh_on())
+        return;
+    for (i = 0; s_known_ffp[i].nin; i++) {
+        BwFfpKey k = s_known_ffp[i];
+        size_t n = bw_ffp_hlsl(&k, src, sizeof src);
+        bw_vshpre_add_text(src, n, 'f');
+        memset(k.conv, 0, sizeof k.conv);   /* the gathered batch's shader */
+        n = bw_ffp_hlsl(&k, src, sizeof src);
+        bw_vshpre_add_text(src, n, 'f');
+    }
+}
+
+/* The fixed-function state's entry, or NULL while its shader compiles (or if
+ * it failed). The last one found is checked first. */
+static BwVsh *get_ffp(const BwXVsBatch *b)
+{
+    static char src[96 * 1024];
+    static LONG last = -1;
+    static unsigned dumped;
+    BwFfpKey k;
+    const uint8_t *p = (const uint8_t *)&k;
+    uint64_t h = 1469598103934665603ull;
+    LONG i, n = s_nvsh;
+    size_t j;
+    BwVsh *v;
+
+    ffp_key(b, &k);
+    for (j = 0; j < sizeof k; j++)
+        h = (h ^ p[j]) * 1099511628211ull;
+    for (i = -1; i < n; i++) {
+        LONG x = i < 0 ? last : i;
+        if (x < 0 || (i >= 0 && i == last))
+            continue;
+        v = &s_vsh[x];
+        if (!v->ffp || v->hash != h || memcmp(&v->fkey, &k, sizeof k))
+            continue;
+        last = x;
+        if (v->state == 1)
+            vsh_finish(v);
+        return v->state == 2 ? v : NULL;
+    }
+    if (n == BW_MAX_VSH)
+        return NULL;
+    if (!s_vsh && !(s_vsh = (BwVsh *)calloc(BW_MAX_VSH, sizeof *s_vsh)))
+        return NULL;
+    if (!vsh_worker_start())
+        return NULL;
+    v = &s_vsh[n];
+    memset(v, 0, sizeof *v);
+    v->ffp = 1;
+    v->fkey = k;
+    v->hash = h;
+    v->mask = b->input_mask;
+    v->nin = b->ninputs;
+    memcpy(v->conv, k.conv, sizeof v->conv);
+    v->len = bw_ffp_hlsl(&k, src, sizeof src);
+    /* BW_GPU_FFP_DUMP (test aid): the first shaders' text */
+    if (v->len && getenv("BW_GPU_FFP_DUMP") && dumped++ < 8)
+        fprintf(stderr, "[GPU-FFP] shader %ld (lit %u lights %04X colmat %u fog %u/%u, %u inputs):\n%s\n",
+                (long)n, k.lit, k.light_mask, k.colmat, k.fog_on, k.fog_gen, k.nin, src);
+    if (vsh_adopt(v, n, src)) {
+        last = n;
+        return v;
+    }
+    return NULL;
+}
+
+/* BwFfpConsts from the batch's state (bw_ffp_hlsl's FL layout: per light
+ * ambient + range, diffuse, direction, position, attenuation, from its
+ * method block: 0x00, 0x0C, 0x24, 0x34, 0x5C, 0x68). */
+static void ffp_consts(const BwXFfp *f, BwFfpConsts *c)
+{
+    int i;
+    memset(c, 0, sizeof *c);
+    memcpy(c->m, f->composite, sizeof c->m);
+    memcpy(c->mv, f->modelview, sizeof c->mv);
+    memcpy(c->ambient, f->ambient, sizeof c->ambient);
+    memcpy(c->imm_fog, f->imm_fog, sizeof c->imm_fog);
+    for (i = 0; i < 8; i++) {
+        const float *l = f->light[i];
+        if (!f->lit || !((f->light_mask >> (2 * i)) & 3))
+            continue;
+        c->light[i][0][0] = l[0];  c->light[i][0][1] = l[1];  c->light[i][0][2] = l[2];  c->light[i][0][3] = l[9];
+        c->light[i][1][0] = l[3];  c->light[i][1][1] = l[4];  c->light[i][1][2] = l[5];
+        c->light[i][2][0] = l[13]; c->light[i][2][1] = l[14]; c->light[i][2][2] = l[15];
+        c->light[i][3][0] = l[23]; c->light[i][3][1] = l[24]; c->light[i][3][2] = l[25];
+        c->light[i][4][0] = l[26]; c->light[i][4][1] = l[27]; c->light[i][4][2] = l[28];
+    }
+}
+
+static ID3D11Buffer *ffp_cbuf(ID3D11Buffer **pb, UINT size)
+{
+    if (!*pb) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof(bd));
+        bd.ByteWidth = (size + 15) & ~15u;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, pb)))
+            *pb = NULL;
+    }
+    return *pb;
+}
+
+/* Upload only on a change (a DISCARD map per draw renames the buffer). */
+static int ffp_upload(ID3D11Buffer *buf, void *shadow, int *ok, const void *data, size_t size)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (*ok && !memcmp(shadow, data, size))
+        return 1;
+    *ok = 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)buf, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, data, size);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)buf, 0);
+    memcpy(shadow, data, size);
+    *ok = 1;
+    return 1;
+}
+
+static int bw_xdraw_ffp(const Nv2aSurface *s, const BwXVsBatch *b)
+{
+    static BwVshConsts k, kshadow;
+    static BwFfpConsts fc, fshadow;
+    static int kok, fok, conv_bound;
+    BwVsh *v;
+    ID3D11Buffer *cbs[3];
+    ID3D11InputLayout *il;
+    UINT voff = 0, ioff, stride;
+    int ov, r;
+
+    if (!ffp_on() || !gpu_vsh_on() || !b || !b->ffp || !b->nindices || !ensure_device())
+        return 0;
+    if (bwg_ws_needs_positions()) {
+        s_st_fdecl++;
+        s_ffp_decl++;
+        return 0;
+    }
+    if (!(v = get_ffp(b))) {
+        s_st_ffall++;
+        s_ffp_fall++;
+        return 0;
+    }
+    /* everything that can still send the batch back, before the glue */
+    il = v->il;
+    if (b->nstreams && v->nin
+        && (b->nstreams > BW_XVS_MAX_STREAMS || !(il = vfetch_layout(v, b)) || !vfetch_table())) {
+        s_st_fdecl++;
+        s_ffp_decl++;
+        return 0;
+    }
+    if (!ffp_cbuf(&s_kcb_ffp, sizeof(BwVshConsts)) || !ffp_cbuf(&s_fcb, sizeof(BwFfpConsts)))
+        return 0;
+
+    /* bw_xdraw's glue, in its order (bw_xdraw_m's unbind first) */
+    gs_unbind();
+    ov = bw_vfx_active() && s_tr_fb_overlay;
+    s_tr_skip = s_tr_fb_overlay;
+    s_vfx_log_ov = s_tr_fb_overlay;
+    s_tr_fb_overlay = 0;
+    if (bw_vfx_active() && b->xb.state && begin(s, b->xb.state)) {
+        if (ov)
+            vfx_overlay_draw();
+        else if (vfx_sea_starts(&b->xb) && s_vfx_pend_on && s_vfx_pend_surf == bwg_cur)
+            vfx_ao_now(&s_vfx_pend);
+    }
+    s_vfx_overlay = ov;
+    r = xdraw_prepare(s, &b->xb);
+    s_tr_skip = 0;
+    s_vfx_overlay = 0;
+    if (r <= 0)
+        return 1;                       /* as bw_xdraw: nothing to draw */
+
+    {
+        float vsinfo[4], foginfo[4];
+        bwg_vsh_info(b, vsinfo, foginfo);
+        memcpy(k.k, b->consts, sizeof k.k);
+        memcpy(k.vsinfo, vsinfo, sizeof vsinfo);
+        memcpy(k.foginfo, foginfo, sizeof foginfo);
+        ffp_consts(b->ffp, &fc);
+        if (!ffp_upload(s_kcb_ffp, &kshadow, &kok, &k, sizeof k)
+            || !ffp_upload(s_fcb, &fshadow, &fok, &fc, sizeof fc))
+            return 1;
+    }
+    stride = 16u * v->nin;
+    if (b->nstreams && v->nin) {
+        /* P1's raw streams, as bw_xdraw_vsh binds them */
+        ID3D11Buffer *bufs[BW_XVS_MAX_STREAMS];
+        UINT pos[BW_XVS_MAX_STREAMS], total = 0, base = 0, q;
+        uint8_t *dst;
+        for (q = 0; q < b->nstreams; q++) {
+            total = (total + 15u) & ~15u;
+            pos[q] = total;
+            total += b->streams[q].bytes;
+        }
+        if (!(dst = ring_begin(&s_vring, total, 16, &base)))
+            return 1;
+        for (q = 0; q < b->nstreams; q++) {
+            memcpy(dst + pos[q], b->streams[q].data, b->streams[q].bytes);
+            bufs[q] = s_vring.buf;
+            s_vlast_strides[q] = b->streams[q].stride;
+            s_vlast_offs[q] = base + pos[q];
+        }
+        ring_end(&s_vring, base, total);
+        if (!conv_bound) {
+            ID3D11ShaderResourceView *t = vfetch_table();
+            sh_vs_srv(0, 1, &t);        /* I3 */
+            conv_bound = 1;
+        }
+        sh_vb(0, b->nstreams, bufs, s_vlast_strides, s_vlast_offs);     /* I3 */
+        s_vlast_ns = b->nstreams;
+        s_vlast_il = il;
+        s_vlast_raw = 1;
+    } else {
+        if (v->nin) {
+            voff = ring_push(&s_vring, b->inputs, b->nverts * stride, stride);
+            if (voff == ~0u)
+                return 1;
+        }
+        s_vlast_raw = 0;
+    }
+    ioff = ring_push(&s_iring, b->indices, b->nindices * 4u, 4);
+    if (ioff == ~0u)
+        return 1;
+    cbs[0] = s_xcb;
+    cbs[1] = s_kcb_ffp;
+    cbs[2] = s_fcb;
+    /* I3 (gfx-03x's merge): the fourth draw path's bindings go through the
+     * same shadow as the other three, so a later skip never trusts a binding
+     * this draw replaced; with I3 off each is the plain call, as before */
+    sh_il(il);
+    sh_topo(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (v->nin && !s_vlast_raw)
+        sh_vb(0, 1, &s_vring.buf, &stride, &voff);
+    sh_ib(s_iring.buf, DXGI_FORMAT_R32_UINT, 0);
+    sh_vs(v->vs);
+    sh_vs_cb(0, 3, cbs);
+    gs_set(vsh_filter_gs());
+    ID3D11DeviceContext_DrawIndexed(s_ctx, b->nindices, ioff / 4u, 0);
+    if (bw_edgeprobe_on())              /* BW_GPU_EDGEPROBE (test aid) */
+        bw_edgeprobe_at(BW_EP_DRAW, s_ctx, (bwg_cur->mtex ? (void *)bwg_cur->mtex : (void *)bwg_cur->tex), bwg_gen);
+    /* BW_GFXCAP_CLASSES (test aid): classed as bw_xdraw classes it */
+    if (g_bw_gfxcls) gfxcls_drawn(&b->xb, s_vfx_log_ov, NULL, b->xb.state, NULL);
+    /* bw_xdraw's tail */
+    if (bw_vfx_active()) {
+        vfx_drawlog('f', b->nindices, &b->xb, NULL, 0);
+        if (!ov)
+            vfx_scene_draw();
+    }
+    ft_draw('f', b->nindices, 0.0f, 0.0f, 0.0f, 0.0f, 0,
+            b->xb.tex_valid[0] ? b->xb.tex[0].offset : 0, b->xb.state);
+    if (!bwg_memo_on())
+        gs_set(NULL);
+    s_vlast = v;
+    s_vlast_voff = voff;
+    s_vlast_stride = stride;
+    s_vlast_nverts = b->nverts;
+    SURF_DRAWN(bwg_cur);
+    s_st_draws++;
+    s_st_fdraws++;
+    s_ffp_draws++;
     s_st_tris += b->nindices / 3;
     return 1;
 }
 
+/* The executor asks before it builds a fixed-function batch. BW_GPU_AB=gpuffp
+ * (test aid) leaves odd frames on the CPU path, for a same-run A/B. */
+static int bw_ffp_ok(void)
+{
+    return ffp_on() && gpu_vsh_on() && !bw_ab_off("gpuffp");
+}
+
+/* BW_GPU_STATS: the native finish's line, when either switch is on. */
+static void native_stats_line(void)
+{
+    unsigned long long ex[3];
+    if (!ffp_on() && !vsh_sync_on())
+        return;
+    bw_exec_ffp_counts(ex);
+    fprintf(stderr, "[GPU-NATIVE] fixed function: %u GPU draws, %u back to the CPU while compiling, %u declined"
+                    " (this run: %llu GPU batches, %llu CPU, %llu of them a vertex fetch_attr couldn't read)"
+                    " | vertex shaders first seen this run: %u from the warm-up, %u from the cache, %u compiled"
+                    " now (%.0f ms, worst %.1f; %u failed), %u to the worker | CPU fallback draws %u\n",
+            s_st_fdraws, s_st_ffall, s_st_fdecl, ex[0], ex[1], ex[2], s_vs_warm, s_vs_cache, s_vs_now,
+            s_vs_now_ms, s_vs_now_max, s_vs_nowfail, s_vs_queued, s_st_vfall + s_st_ffall);
+    s_st_fdraws = s_st_ffall = s_st_fdecl = 0;
+}
 
 /* BW_GPU_VSH_VERIFY: run the last batch's vertices through its shader again,
  * as points into a stream-output buffer, and read them back. The executor
@@ -5563,6 +5168,7 @@ static int bw_vsh_readback(BwXVsOut *out, uint32_t n)
 {
     static ID3D11Buffer *sob, *stg;
     static UINT so_cap;
+    g_bw_ctx_epoch++;                   /* I3: it sets state of its own */
     static const D3D11_SO_DECLARATION_ENTRY decl[] = {
         { 0, "SV_POSITION", 0, 0, 4, 0 },
         { 0, "COLOR", 0, 0, 4, 0 },
@@ -5646,6 +5252,144 @@ static int bw_vsh_readback(BwXVsOut *out, uint32_t n)
     return 1;
 }
 
+/* gfx-sprites (I6): the executor asks before it hands a point batch over. */
+static int bw_points_ok(void)
+{
+    return gpu_vsh_on() && bwg_sprites_on() && ensure_device() && sprite_gs() != NULL;
+}
+
+/* BW_GPU_SPRITES_VERIFY (gfx-sprites; nv2a_pb_exec.c gpu_sprite_verify): run
+ * the last point batch again through its vertex shader and the sprite
+ * geometry shader compiled with BW_SPR_SO (the same text, plus each
+ * vertex's point and corner), into a stream-output buffer, and read it back
+ * in the executor's terms (surface pixels, the title's z): the widescreen
+ * remap and the mapping undone as bw_vsh_readback does. Slow; sampled. */
+static int bw_sprite_readback(BwXSpriteOut *out, uint32_t max, uint32_t *count)
+{
+    static ID3D11GeometryShader *sogs;
+    static int tried;
+    static ID3D11Buffer *sob, *stg;
+    static ID3D11Query *q;
+    static UINT so_cap;
+    static const D3D11_SO_DECLARATION_ENTRY decl[] = {
+        { 0, "SV_POSITION", 0, 0, 4, 0 },
+        { 0, "TEXCOORD", 3, 0, 4, 0 },
+        { 0, "SPRCHK", 0, 0, 4, 0 },
+    };
+    UINT stride = sizeof(BwXSpriteOut), zero = 0, need, i;
+    BwVsh *v = s_vlast;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_QUERY_DATA_SO_STATISTICS st;
+    ID3D11Buffer *nullb = NULL, *gcbs[2];
+    ID3D11GeometryShader *gs_was = s_gs_bound;
+
+    *count = 0;
+    if (!v || !v->vs || !s_vlast_points || !s_vlast_nidx || !s_scb)
+        return 0;
+    g_bw_ctx_epoch++;                   /* I3: it sets state of its own (gfx-03x's merge) */
+    if (!tried) {
+        D3D_SHADER_MACRO mac[3] = { { "BW_SPR_SO", "1" }, { NULL, NULL }, { NULL, NULL } };
+        ID3DBlob *blob = NULL, *err = NULL;
+        D3D11_QUERY_DESC qd;
+        tried = 1;
+        if (bwg_ws_k > 1.0f) {
+            mac[1].Name = "BW_WS";
+            mac[1].Definition = "1";
+        }
+        if (FAILED(D3DCompile(bw_vsh_sprite_gs_hlsl, strlen(bw_vsh_sprite_gs_hlsl), "bw_sprite_gs_so", mac,
+                              NULL, "gs_main", "gs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &blob, &err))) {
+            fprintf(stderr, "[SPR-VERIFY] the stream-output geometry shader failed: %s\n",
+                    err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+            if (err) ID3D10Blob_Release(err);
+            return 0;
+        }
+        if (err) ID3D10Blob_Release(err);
+        if (FAILED(ID3D11Device_CreateGeometryShaderWithStreamOutput(
+                        s_dev, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob), decl, 3,
+                        &stride, 1, D3D11_SO_NO_RASTERIZED_STREAM, NULL, &sogs)))
+            sogs = NULL;
+        ID3D10Blob_Release(blob);
+        memset(&qd, 0, sizeof qd);
+        qd.Query = D3D11_QUERY_SO_STATISTICS;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &q)))
+            q = NULL;
+    }
+    if (!sogs || !q)
+        return 0;
+    need = s_vlast_nidx * 6u * stride;
+    if (need > so_cap) {
+        D3D11_BUFFER_DESC bd;
+        if (sob) ID3D11Buffer_Release(sob);
+        if (stg) ID3D11Buffer_Release(stg);
+        sob = stg = NULL;
+        so_cap = 0;
+        memset(&bd, 0, sizeof(bd));
+        bd.ByteWidth = need;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_STREAM_OUTPUT;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &sob)))
+            return 0;
+        bd.Usage = D3D11_USAGE_STAGING;
+        bd.BindFlags = 0;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &stg)))
+            return 0;
+        so_cap = need;
+    }
+    if (s_vlast_raw) {
+        ID3D11Buffer *bufs[BW_XVS_MAX_STREAMS];
+        for (i = 0; i < s_vlast_ns; i++)
+            bufs[i] = s_vring.buf;
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, s_vlast_il);
+        ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, s_vlast_ns, bufs, s_vlast_strides, s_vlast_offs);
+    } else {
+        ID3D11DeviceContext_IASetInputLayout(s_ctx, v->il);
+        if (v->nin)
+            ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vring.buf, &s_vlast_stride,
+                                                   &s_vlast_voff);
+    }
+    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_iring.buf, DXGI_FORMAT_R32_UINT, 0);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, v->vs, NULL, 0);
+    gcbs[0] = s_xcb;
+    gcbs[1] = s_scb;
+    gs_set(sogs);
+    ID3D11DeviceContext_GSSetConstantBuffers(s_ctx, 0, 2, gcbs);
+    ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &sob, &zero);
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)q);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, s_vlast_nidx, s_vlast_ioff / 4u, 0);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)q);
+    ID3D11DeviceContext_SOSetTargets(s_ctx, 1, &nullb, &zero);
+    gs_set(gs_was);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)stg, (ID3D11Resource *)sob);
+    while (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)q, &st, sizeof st, 0) == S_FALSE)
+        ;
+    if (st.NumPrimitivesWritten * 3u > max || st.NumPrimitivesWritten * 3u * stride > need)
+        return 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m)))
+        return 0;
+    memcpy(out, m.pData, (size_t)st.NumPrimitivesWritten * 3u * stride);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stg, 0);
+    *count = (uint32_t)st.NumPrimitivesWritten * 3u;
+    for (i = 0; i < *count; i++) {
+        float *p = out[i].pos, w = p[3];
+        float pf = ((float *)&out[i].point)[0], cf = ((float *)&out[i].corner)[0];
+        out[i].point = (uint32_t)pf;
+        out[i].corner = (uint32_t)cf;
+        if (w != 0.0f) {
+            float zd = p[2] / w, xn = p[0] / w;
+            if (s_xlast_wsx[0] != 0.0f && bwg_ws_k > 1.0f)
+                xn = (xn - s_xlast_wsx[1]) / s_xlast_wsx[0];
+            p[0] = (xn + 1.0f) * 0.5f * s_xlast_surf[0];
+            p[1] = (1.0f - p[1] / w) * 0.5f * s_xlast_surf[1];
+            p[2] = s_xlast_depth[1] != 0.0f ? zd / s_xlast_depth[1] + s_xlast_depth[0] : zd;
+        }
+    }
+    return 1;
+}
+
 /* T1 (VFX_TEX_RESTORE): a vertex-program batch handed back to the CPU path
  * (its shader still compiling) comes back as the next bw_xdraw; remember if
  * it was an overlay draw (D3D's pass-through program, no depth test), so the
@@ -5654,7 +5398,13 @@ static int bw_vsh_readback(BwXVsOut *out, uint32_t n)
 static int bw_xdraw_vsh_t1(const Nv2aSurface *s, const BwXVsBatch *b)
 {
     ULONG64 c0 = draw_cpu_begin();     /* item 43: draw cpu */
-    int r = bw_xdraw_vsh(s, b);
+    int r;
+    if (b && b->ffp) {                  /* gfx-ffp: never an overlay handed back */
+        r = bw_xdraw_ffp(s, b);
+        draw_cpu_end(c0);
+        return r;
+    }
+    r = bw_xdraw_vsh(s, b);
     s_tr_fb_overlay = !r && b && b->ninstr <= 4 && b->xb.state && !b->xb.state->depth_test_enable;
     draw_cpu_end(c0);
     return r;
@@ -5668,46 +5418,26 @@ static void bw_xdraw_m(const Nv2aSurface *s, const BwXBatch *b)
     draw_cpu_end(c0);
 }
 
-static const BwXBackend s_xbackend = { bw_xdraw_m, bw_xdraw_vsh_t1, bw_vsh_readback, bw_vsh_raw_ok };
+/* By name (gfx-ffp, the lead's ask): several lanes append entries. */
+static const BwXBackend s_xbackend = {
+    .draw = bw_xdraw_m,
+    .draw_vsh = bw_xdraw_vsh_t1,
+    .vsh_readback = bw_vsh_readback,
+    .vsh_raw_ok = bw_vsh_raw_ok,
+    .points_ok = bw_points_ok,              /* gfx-sprites (I6) */
+    .sprite_readback = bw_sprite_readback,  /* gfx-sprites */
+    .ffp_ok = bw_ffp_ok,                    /* gfx-ffp */
+};
 
 /* ---- the three back-end entry points ------------------------------------ */
 
-/* The title's window clip as the scissor rectangle. NV097 window clip 0
- * (SET_WINDOW_CLIP_HORIZONTAL 0x02C0 / _VERTICAL 0x02E0: min in bits 0-11,
- * max in bits 16-27, inclusive, in logical pixels) is how split screen keeps
- * each player's view in its half (2-player battle: y 0..239, then 240..479).
- * The executor never applied it; the CPU rasteriser clamps to the surface
- * clip only. Scaled by the AA factor, clamped to the surface. Unset (both 0)
- * or BW_GPU_SCISSOR=0: the whole surface. */
+/* The title's window clip as the scissor rectangle (the core's, bwg_scissor). */
 static void apply_scissor(const Nv2aSurface *s)
 {
-    static int on = -1;
     D3D11_RECT r;
-    uint32_t h = bw_backend_reg(0x02C0), v = bw_backend_reg(0x02E0);
-    uint32_t sx = s->aa_sx ? s->aa_sx : 1, sy = s->aa_sy ? s->aa_sy : 1;
-
-    if (on < 0) {
-        const char *e = getenv("BW_GPU_SCISSOR");
-        on = !(e && e[0] == '0');
-    }
-    r.left = 0; r.top = 0;
-    r.right = (LONG)s_cur->w; r.bottom = (LONG)s_cur->h;
-    if (on && (h || v) && bw_backend_reg(0x02B4) == 0) {
-        LONG x0 = (LONG)(h & 0xFFF) * sx, x1 = ((LONG)((h >> 16) & 0xFFF) + 1) * sx;
-        LONG y0 = (LONG)(v & 0xFFF) * sy, y1 = ((LONG)((v >> 16) & 0xFFF) + 1) * sy;
-        if (x0 > r.left) r.left = x0;
-        if (y0 > r.top) r.top = y0;
-        if (x1 < r.right) r.right = x1;
-        if (y1 < r.bottom) r.bottom = y1;
-        if (r.right < r.left) r.right = r.left;
-        if (r.bottom < r.top) r.bottom = r.top;
-    }
-    if (s_cur->pw != s_cur->w || s_cur->ph != s_cur->h) {
-        /* VFX (D9): logical pixels to the render-scaled surface's */
-        float fx = (float)s_cur->pw / s_cur->w, fy = (float)s_cur->ph / s_cur->h;
-        r.left = (LONG)(r.left * fx + 0.5f); r.right = (LONG)(r.right * fx + 0.5f);
-        r.top = (LONG)(r.top * fy + 0.5f); r.bottom = (LONG)(r.bottom * fy + 0.5f);
-    }
+    BwgRect g;
+    bwg_scissor(s, bwg_cur->w, bwg_cur->h, bwg_cur->pw, bwg_cur->ph, &g);
+    r.left = (LONG)g.left; r.top = (LONG)g.top; r.right = (LONG)g.right; r.bottom = (LONG)g.bottom;
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &r);
     s_vfx_scissor = r;                      /* VFX (D9): the scene copy's per-view rectangle */
 }
@@ -5718,18 +5448,24 @@ static int begin(const Nv2aSurface *s, const Nv2aRenderState *rs)
     BwDepth *d;
     if (!ensure_device() || !s || !s->color_va)
         return 0;
-    surf = get_surf(s);
+    surf = bwg_get_surf(s);
     if (!surf)
         return 0;
+    BWG_LATCH_USE(surf);                /* I1: a CPU write into it since its last use, up first */
+    if (bwg_feedback_mode())
+        bwg_fb_begin();                 /* I5 (BW_GPU_FEEDBACK): a new clear or draw */
     /* VFX (D9): pw, ph = w, h in Original; item 36: the depth buffer has the
      * colour target's sample count (1 in Original) */
-    d = rs ? get_depth(rs->zeta_va, surf->pw, surf->ph, surf->mrtv ? bw_vfx_msaa() : 1) : NULL;
-    surf->used_gen = s_gen;                 /* item 37: a full table reuses the oldest */
+    d = rs ? bwg_get_depth(rs->zeta_va, surf->pw, surf->ph, surf->mrtv ? bw_vfx_msaa() : 1) : NULL;
+    surf->used_gen = bwg_gen;                 /* item 37: a full table reuses the oldest */
     if (d)
-        d->used_gen = s_gen;
-    if (surf != s_cur || d != s_cur_depth)
+        d->used_gen = bwg_gen;
+    if (surf != bwg_cur || d != bwg_cur_depth)
         bind_targets(surf, d);
     apply_scissor(s);
+    if (g_bw_gfxcls) bw_gfxcls_sync(s_ctx, gfxcls_tex(bwg_cur), bwg_gen);  /* BW_GFXCAP_CLASSES (test aid) */
+    if (bw_edgeprobe_on())              /* BW_GPU_EDGEPROBE (test aid) */
+        bw_edgeprobe_at(BW_EP_BEGIN, s_ctx, (bwg_cur->mtex ? (void *)bwg_cur->mtex : (void *)bwg_cur->tex), bwg_gen);
     return 1;
 }
 
@@ -5742,13 +5478,14 @@ static void bw_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     if (flags & 0xF0) {
         float c[4] = { ((argb >> 16) & 0xFF) / 255.0f, ((argb >> 8) & 0xFF) / 255.0f,
                        (argb & 0xFF) / 255.0f, ((argb >> 24) & 0xFF) / 255.0f };
-        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_cur->mrtv ? s_cur->mrtv : s_cur->rtv, c);
-        SURF_DRAWN(s_cur);
-        ft_note('C', s_cur->va);
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, bwg_cur->mrtv ? bwg_cur->mrtv : bwg_cur->rtv, c);
+        if (g_bw_gfxcls) bw_gfxcls_clear(s_ctx, gfxcls_tex(bwg_cur), bwg_gen);   /* BW_GFXCAP_CLASSES (test aid) */
+        SURF_DRAWN(bwg_cur);
+        ft_note('C', bwg_cur->va);
     }
-    if ((flags & 0x3) && s_cur_depth && s_cur_depth->dsv) {         /* item 36: never a NULL view */
+    if ((flags & 0x3) && bwg_cur_depth && bwg_cur_depth->dsv) {         /* item 36: never a NULL view */
         UINT f = ((flags & 1) ? D3D11_CLEAR_DEPTH : 0) | ((flags & 2) ? D3D11_CLEAR_STENCIL : 0);
-        ID3D11DeviceContext_ClearDepthStencilView(s_ctx, s_cur_depth->dsv, f,
+        ID3D11DeviceContext_ClearDepthStencilView(s_ctx, bwg_cur_depth->dsv, f,
                                                   (zstencil >> 8) / 16777215.0f,
                                                   (UINT8)(zstencil & 0xFF));
     }
@@ -5803,87 +5540,39 @@ static void bw_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         ss = ssf ? get_sampler_f(b->texture->addr_u, b->texture->addr_v, b->texture->filter, 1, 0)
                  : get_sampler(b->texture->addr_u, b->texture->addr_v);
     }
-    memset(&c, 0, sizeof(c));
-    c.surf[0] = (float)s_cur->w; c.surf[1] = (float)s_cur->h;
-    c.surf[2] = 1.0f / s_cur->w; c.surf[3] = 1.0f / s_cur->h;
-    if (s_ws_k > 1.0f) {
-        float lo = b->vertices[0].x, hi = lo;
-        for (uint32_t i = 1; i < b->count; i++) {
-            if (b->vertices[i].x < lo) lo = b->vertices[i].x;
-            if (b->vertices[i].x > hi) hi = b->vertices[i].x;
-        }
-        {
-            float u0 = b->vertices[0].u, u1 = u0, v0 = b->vertices[0].v, v1 = v0;
-            for (uint32_t i = 1; i < b->count; i++) {
-                if (b->vertices[i].u < u0) u0 = b->vertices[i].u;
-                if (b->vertices[i].u > u1) u1 = b->vertices[i].u;
-                if (b->vertices[i].v < v0) v0 = b->vertices[i].v;
-                if (b->vertices[i].v > v1) v1 = b->vertices[i].v;
-            }
-            s_ws_span_u = u1 - u0;
-            s_ws_span_v = v1 - v0;
-            s_ws_full = (ws_covers_view(s, lo, hi, 1)
-                         && ws_backdrop(s, b->texture != NULL, 0, 0, 0, u0, u1, v0, v1))
-                        || ws_samples_wide(b->texture != NULL, b->texture ? b->texture->offset : 0);
-        }
-        ws_note('s', b->count, b->texture != NULL, b->texture ? b->texture->width : 0,
-                b->texture ? b->texture->height : 0, lo, hi, s);
-    }
-    ws_remap(s, c.wsx, s_ws_full);
-    if (srv) {
-        c.tex[0] = 1.0f / b->texture->width;
-        c.tex[1] = 1.0f / b->texture->height;
-        c.tex[2] = 1.0f;
-    }
-    if (rs->alpha_test_enable) {
-        c.alpha[0] = (float)(rs->alpha_func >= 0x200 && rs->alpha_func <= 0x207
-                             ? rs->alpha_func - 0x200 : 7);
-        c.alpha[1] = rs->alpha_ref / 255.0f;
-        c.alpha[2] = 1.0f;
-    }
-    {
-        float zmin = rs->depth_min, zmax = rs->depth_max;
-        if (!(zmax > zmin)) { zmin = 0.0f; zmax = 16777215.0f; }
-        c.depth[0] = zmin;
-        c.depth[1] = 1.0f / (zmax - zmin);
-        c.depth[2] = zmode_vertex_clamp() ? 1.0f : 0.0f;
-    }
+    bwg_ss_consts(s, b, srv != NULL, &c);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0,
                                           D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         memcpy(m.pData, &c, sizeof(c));
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
     }
-    bf[0] = ((rs->blend_color >> 16) & 0xFF) / 255.0f;
-    bf[1] = ((rs->blend_color >> 8) & 0xFF) / 255.0f;
-    bf[2] = (rs->blend_color & 0xFF) / 255.0f;
-    bf[3] = ((rs->blend_color >> 24) & 0xFF) / 255.0f;
-    if (rs->blend_src == 0x8003 || rs->blend_src == 0x8004 ||
-        rs->blend_dst == 0x8003 || rs->blend_dst == 0x8004)
-        bf[0] = bf[1] = bf[2] = bf[3];
+    bwg_blend_factor(rs, bf);
 
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &offs);
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
+    sh_il(s_layout);                    /* I3: each sent only if it changed */
+    sh_topo(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    sh_vb(0, 1, &s_vb, &stride, &offs);
+    sh_vs(s_vs);
+    sh_vs_cb(0, 1, &s_cb);
+    sh_ps(s_ps);
+    sh_ps_cb0(s_cb);
+    sh_ps_srv(0, 1, &srv);
     if (ss)
-        ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &ss);
+        sh_ps_smp(0, 1, &ss);
     {
         ID3D11RasterizerState *rst = get_rs(rs);
         if (!rst)
             return;              /* both faces culled */
-        ID3D11DeviceContext_RSSetState(s_ctx, rst);
+        sh_rs(rst);
     }
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, get_blend(rs), bf, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, get_ds(rs, s_cur_depth != NULL),
-                                               rs->stencil_ref & 0xFF);
+    sh_blend(get_blend(rs), bf, 0xFFFFFFFFu);
+    sh_ds(get_ds(rs, bwg_cur_depth != NULL), rs->stencil_ref & 0xFF);
     ID3D11DeviceContext_Draw(s_ctx, b->count, 0);
+    if (g_bw_gfxcls) gfxcls_drawn(NULL, 1, b->texture, rs, NULL);            /* BW_GFXCAP_CLASSES (test aid) */
+    if (bw_edgeprobe_on())              /* BW_GPU_EDGEPROBE (test aid) */
+        bw_edgeprobe_at(BW_EP_DRAW, s_ctx, (bwg_cur->mtex ? (void *)bwg_cur->mtex : (void *)bwg_cur->tex), bwg_gen);
     ft_draw('s', b->count, b->vertices[0].x, b->vertices[0].y, b->vertices[0].z,
             b->vertices[0].rhw, b->vertices[0].diffuse, b->texture ? b->texture->offset : 0, rs);
-    SURF_DRAWN(s_cur);
+    SURF_DRAWN(bwg_cur);
     s_st_draws++;
     s_st_tris += b->count / 3;
 }
@@ -5976,8 +5665,8 @@ static void print_uses(const char *what, int slot)
 {
     int i;
     fprintf(stderr, "    %s:", what);
-    for (i = 0; i < s_nuse[slot]; i++) {
-        const BwTexUse *u = &s_use[slot][i];
+    for (i = 0; i < bwg_tex_nuse[slot]; i++) {
+        const BwgTexUse *u = &bwg_tex_use[slot][i];
         fprintf(stderr, " %c%08X/%ux%u/%02X", u->kind, u->offset, u->w, u->h, u->color);
         if (u->zero_pct >= 0)
             fprintf(stderr, "/z%d", u->zero_pct);
@@ -6035,7 +5724,7 @@ static void flash_watch(const BwSurf *sf)
         img_w[0] = img_w[1]; img_w[1] = img_w[2];
         img_h[0] = img_h[1]; img_h[1] = img_h[2];
         img_pitch[0] = img_pitch[1]; img_pitch[1] = img_pitch[2];
-        frame_no[0] = frame_no[1]; frame_no[1] = frame_no[2]; frame_no[2] = s_gen;
+        frame_no[0] = frame_no[1]; frame_no[1] = frame_no[2]; frame_no[2] = bwg_gen;
     }
     slot = 2;
     img_w[2] = img_h[2] = img_pitch[2] = 0;
@@ -6204,23 +5893,23 @@ static void black_watch(const BwSurf *sf)
     static float prev;
     static int dumps;
     float b;
-    if (s_watch < 0) {
+    if (bwg_tex_watch < 0) {
         s_watch_prefix = getenv("BW_GPU_BLACKWATCH");
-        s_watch = s_watch_prefix && *s_watch_prefix;
+        bwg_tex_watch = s_watch_prefix && *s_watch_prefix;
     }
-    if (s_watch <= 0)
+    if (bwg_tex_watch <= 0)
         return;
     b = black_fraction(sf);
     if (b > prev + 0.25f && b > 0.3f) {
         fprintf(stderr, "[BW-BLACK] frame %u: lower screen %.0f%% black (previous frame %.0f%%),"
-                        " surface %08X %ux%u\n", s_gen, b * 100, prev * 100, sf->va, sf->w, sf->h);
-        print_uses("this frame", s_gen & 1);
-        print_uses("previous frame", (s_gen + 1) & 1);
-        print_huge("this frame", s_gen & 1);
-        print_huge("previous frame", (s_gen + 1) & 1);
+                        " surface %08X %ux%u\n", bwg_gen, b * 100, prev * 100, sf->va, sf->w, sf->h);
+        print_uses("this frame", bwg_gen & 1);
+        print_uses("previous frame", (bwg_gen + 1) & 1);
+        print_huge("this frame", bwg_gen & 1);
+        print_huge("previous frame", (bwg_gen + 1) & 1);
         if (dumps < 12) {
             char path[512];
-            _snprintf(path, sizeof path, "%s_%06u.bmp", s_watch_prefix, s_gen);
+            _snprintf(path, sizeof path, "%s_%06u.bmp", s_watch_prefix, bwg_gen);
             path[sizeof path - 1] = 0;
             write_bmp(path, sf);
             dumps++;
@@ -6234,15 +5923,15 @@ static void black_watch(const BwSurf *sf)
             const char *e = getenv("BW_GPU_HUGE");
             huge_log = e && e[0] == '1';
         }
-        if (huge_log && s_huge[s_gen & 1] && logged < 60) {
+        if (huge_log && s_huge[bwg_gen & 1] && logged < 60) {
             logged++;
-            fprintf(stderr, "[BW-HUGE] frame %u (lower screen %.0f%% black)\n", s_gen, b * 100);
-            print_huge("frame", s_gen & 1);
+            fprintf(stderr, "[BW-HUGE] frame %u (lower screen %.0f%% black)\n", bwg_gen, b * 100);
+            print_huge("frame", bwg_gen & 1);
         }
     }
-    s_nuse[(s_gen + 1) & 1] = 0;    /* the next frame's list */
-    s_huge[(s_gen + 1) & 1] = 0;
-    s_tris_frame[(s_gen + 1) & 1] = 0;
+    bwg_tex_nuse[(bwg_gen + 1) & 1] = 0;    /* the next frame's list */
+    s_huge[(bwg_gen + 1) & 1] = 0;
+    s_tris_frame[(bwg_gen + 1) & 1] = 0;
 }
 
 /* ---- presenting from the GPU (BW_GPU_PRESENT) ---------------------------- */
@@ -6318,6 +6007,8 @@ static int readback_wanted(void)
                    || getenv("RECOMP_FB_DUMP") || getenv("RECOMP_FB_DUMP_FLIPS")
                    || getenv("BW_GPU_BLACKWATCH") || getenv("BW_GPU_FLASHWATCH")
                    || getenv("BW_GPU_PEEK");
+        if (BW_GFXCAP_PINNED())
+            want = 1;                   /* BW_GFXCAP: the flip records hash the readback */
         if (!want)
             fprintf(stderr, "[GPU-D3D11] readback off: the flipped frame stays on the GPU\n");
         s_rb_want = want;
@@ -6392,6 +6083,11 @@ static ID3D11ShaderResourceView *gamma_lut(void)
     }
     on = bw_gamma_lut(ramp);
     seq = on ? bw_gamma_get(ramp) : 0;
+    if (BW_GFXCAP_REC()) {              /* BW_GFXCAP: the title's newest ramp, identity or not */
+        uint8_t cr[768];
+        uint32_t cs = bw_gamma_get(cr);
+        bw_gfxcap_gamma(cs, cr);
+    }
     if (seq != s_lut_seq || on != s_lut_was_on) {
         for (i = 0; i < 256; i++) {
             texels[i * 4 + 0] = on ? ramp[i] : (uint8_t)i;
@@ -6548,6 +6244,7 @@ static const char *swap_flags_name(UINT f, DXGI_SWAP_EFFECT e)
 /* The swap chain on the framebuffer window, sized to its client area. */
 static int swap_ensure(void)
 {
+    g_bw_ctx_epoch++;                   /* I3: it may set state of its own */
     HWND hwnd = (HWND)bw_fb_window();
     RECT c;
     UINT w, h;
@@ -6743,7 +6440,7 @@ static void present_shot(void)
     if (!nw || !prefix || !*prefix || !s_swap_rtv)
         return;
     for (i = 0; i < nw; i++)
-        if (want[i] && s_gen >= want[i]) {          /* the game's flip number, first presented one at or after it */
+        if (want[i] && bwg_gen >= want[i]) {          /* the game's flip number, first presented one at or after it */
             want[i] = 0;
             ID3D11Resource *res = NULL;
             ID3D11Texture2D *stg = NULL;
@@ -6764,7 +6461,7 @@ static void present_shot(void)
                 if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
                     int fp16 = td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
                     UINT y, x;
-                    _snprintf(path, sizeof path, "%sflip_%05u.%s", prefix, s_gen, fp16 ? "pfm" : "bmp");
+                    _snprintf(path, sizeof path, "%sflip_%05u.%s", prefix, bwg_gen, fp16 ? "pfm" : "bmp");
                     path[sizeof path - 1] = 0;
                     if ((f = fopen(path, "wb")) != NULL) {
                         if (fp16) {
@@ -6798,7 +6495,7 @@ static void present_shot(void)
                                 fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, td.Width, f);
                         }
                         fclose(f);
-                        fprintf(stderr, "[GPU-PRESENT] shot %s (flip %u, present %u, %ux%u, %s)\n", path, s_gen, count,
+                        fprintf(stderr, "[GPU-PRESENT] shot %s (flip %u, present %u, %ux%u, %s)\n", path, bwg_gen, count,
                                 td.Width, td.Height, fp16 ? "scRGB, cd/m2" : "8-bit");
                     }
                     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stg, 0);
@@ -6905,7 +6602,7 @@ static const char *shown_due(void)
     }
     if (!prefix || !*prefix)
         return NULL;
-    return (s_gen % every) == 0 || (pairs && (s_gen % every) == 1) ? prefix : NULL;
+    return (bwg_gen % every) == 0 || (pairs && (bwg_gen % every) == 1) ? prefix : NULL;
 }
 
 static int shown_old(void)
@@ -6964,7 +6661,7 @@ static void shown_write(ID3D11Texture2D *tex, UINT w, UINT h, const char *prefix
                                               (ID3D11Resource *)tex, 0, &box);
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_pic_staging, 0, D3D11_MAP_READ, 0, &m)))
         return;
-    snprintf(path, sizeof path, "%s%06u.bmp", prefix, (unsigned)s_gen);
+    snprintf(path, sizeof path, "%s%06u.bmp", prefix, (unsigned)bwg_gen);
     f = fopen(path, "wb");
     row = (uint32_t *)malloc((size_t)w * 4);
     if (f && row) {
@@ -7012,6 +6709,7 @@ static void resolve_pass(BwSurf *sf, int kernel)
     D3D11_VIEWPORT vp;
     D3D11_MAPPED_SUBRESOURCE m;
     float cb[8];
+    g_bw_ctx_epoch++;                   /* I3: it sets state of its own */
     cb[0] = 1.0f / sf->w; cb[1] = 1.0f / sf->h;     /* one texel */
     cb[2] = 0.0f; cb[3] = 0.0f;                     /* offset (normalized) */
     cb[4] = (float)kernel; cb[5] = cb[6] = cb[7] = 0.0f;
@@ -7063,10 +6761,10 @@ static ID3D11ShaderResourceView *shown_picture(BwSurf *sf)
         resolve_pass(sf, 0);
         shown_write(s_pic_tex, w, h, "old_", 0);
     }
-    kernel = s_resolve_seen ? conv_kernel(s_resolve_filter) : 0;
+    kernel = bwg_resolve_seen ? bwg_conv_kernel(bwg_resolve_filter) : 0;
     resolve_pass(sf, kernel);
     shown_write(due ? s_pic_tex : NULL, w, h, due, 1);
-    return use_conv() ? s_pic_srv : sf->srv;
+    return bwg_use_conv() ? s_pic_srv : sf->srv;
 }
 
 /* P2b: what the screen does with the presented frames (BW_GPU_STATS test
@@ -7076,33 +6774,8 @@ static ID3D11ShaderResourceView *shown_picture(BwSurf *sf)
  * latency, and the refresh count's step says how many refreshes the screen
  * made meanwhile (with variable refresh, one per frame shown). Not every
  * mode reports them (a composed window may not): the line then says so. */
-static DWORD s_screen_wait_ms;          /* P2b: bw_d3d11_pace_config */
-/* lat-q: 1 while the NV2A thread waits on the present side (the present
- * pacing, the screen, the GPU limit): BW_HIFPS_JIT=2 waits only then. */
-volatile LONG g_bw_present_waiting;
-/* ... and whether the last finished flip waited there at all (BW_HIFPS_JIT=2
- * reads it: a flip that waited means the next frame would queue). */
-volatile LONG g_bw_last_flip_waited;
-/* ... and when the last flip reached the back end, before any of those
- * waits (qpc ms): BW_HIFPS_JIT learns from it how long a pass takes to
- * get its frame to the present. */
-volatile double g_bw_flip_ready_ms;
-/* ... and 1 while the present pacing itself waits (that frame's present
- * hasn't happened yet: the next beat is one period after its slot). */
-volatile LONG g_bw_pace_waiting;
-/* ... and 1 while the frame cap is being reached (cap_watch, below:
- * BW_HIFPS_JIT=3 turns just-in-time frames on only then). */
-volatile LONG g_bw_cap_reached;
-static int s_cap_watch;                 /* bw_d3d11_cap_watch */
-/* ... and the flips the back end has finished (after the GPU limit's wait):
- * BW_HIFPS_JIT=4 counts the frames not yet through the NV2A thread. */
-volatile LONG g_bw_flips_done;
-/* ... and the presents the pacing has let through (its schedule advanced):
- * BW_HIFPS_JIT=4 aims a pass at the slot after the ones still to come. */
-volatile LONG g_bw_paced_n;
-static int s_flip_waited;
-static unsigned s_screen_timeouts, s_screen_st_n;
-static double s_screen_st_ms;
+/* (The screen wait and the present side's wait flags for the high frame
+ * rate, g_bw_present_waiting and the rest, are the core's: bwg_pace.c.) */
 #define PST_N 256
 static LARGE_INTEGER s_pst_t[PST_N];
 static UINT s_pst_last_pc, s_pst_last_src;
@@ -7162,45 +6835,6 @@ static void pstat_line(void)
     s_pst_lat_sum = s_pst_lat_max = s_pst_lat_min = 0.0;
 }
 
-/* The screen wait's fallback, made visible (0.2.5, for C2's item 64): one
- * line when four timeouts in a row turn the wait to zero (frames are then
- * dropped at once until the screen takes one), one when it takes one again.
- * The first ten of each. */
-static void screen_wait_note(int engaged)
-{
-    static unsigned n[2];
-    if (++n[engaged] <= 10)
-        fprintf(stderr, engaged
-                ? "[GPU-PRESENT] the screen didn't take a frame in 4 waits in a row (frame %u): frames are"
-                  " dropped without waiting until it takes one%s\n"
-                : "[GPU-PRESENT] the screen takes frames again (frame %u)%s\n",
-                (unsigned)s_gen, n[engaged] == 10 ? "; later ones aren't logged" : "");
-}
-
-/* BW_TEST_SCREENWAIT=<from_frame>:<count> (test aid, every edition, off by
- * default, never in a preset): from flip <from_frame> on, the next <count>
- * screen waits are treated as timed out (the timeout's time is slept, the
- * waitable isn't touched), so the fallback above can be tested on a screen
- * that is awake. */
-static int screen_test_timeout(void)
-{
-    static int parsed;
-    static unsigned from, left;
-    if (!parsed) {
-        const char *e = getenv("BW_TEST_SCREENWAIT");
-        parsed = 1;
-        if (e && *e && sscanf(e, "%u:%u", &from, &left) == 2 && left)
-            fprintf(stderr, "[GPU-PRESENT] BW_TEST_SCREENWAIT: %u screen waits from flip %u treated as"
-                            " timed out (test aid)\n", left, from);
-        else
-            left = 0;
-    }
-    if (!left || s_gen < from)
-        return 0;
-    left--;
-    return 1;
-}
-
 /* Item 31: what the visual suite's present returned; 1 = it drew nothing,
  * show the plain picture. One line when that starts and one when the suite
  * draws again (the first five of each). */
@@ -7212,13 +6846,13 @@ static int vfx_present_note(int drew)
         frames++;
         if (!failing && ++n[0] <= 5)
             fprintf(stderr, "[VFX] the visual suite couldn't draw frame %u: the plain picture is shown"
-                            " until it can (visual effects off meanwhile)\n", (unsigned)s_gen);
+                            " until it can (visual effects off meanwhile)\n", (unsigned)bwg_gen);
         failing = 1;
         return 1;
     }
     if (failing && ++n[1] <= 5)
         fprintf(stderr, "[VFX] the visual suite draws again (frame %u, after %u plain frames)\n",
-                (unsigned)s_gen, frames);
+                (unsigned)bwg_gen, frames);
     failing = 0;
     frames = 0;
     return 0;
@@ -7229,9 +6863,10 @@ static int vfx_present_note(int drew)
 static int gpu_present(BwSurf *sf)
 {
     static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_bw_ctx_epoch++;                   /* I3: the present sets state of its own */
     ID3D11ShaderResourceView *none = NULL, *pic;
     D3D11_VIEWPORT vp;
-    float fw, fh, cw, ch, w, h;
+    float w, h;
     HRESULT hr;
     int waited = 0;                     /* item 30: the waitable said a buffer is free */
 
@@ -7273,8 +6908,8 @@ static int gpu_present(BwSurf *sf)
         bw_vfx_set_picture_aspect(4.0f / 3.0f * sf->wsk);     /* widescreen (D5) */
         bw_vfx_set_gamma_lut(gamma_lut());          /* the title's DAC ramp (TK-50) */
         bw_vfx_present(sf->srv, sf->pw, sf->ph, NULL, NULL);
-        if (s_cur)
-            bind_targets(s_cur, s_cur_depth);
+        if (bwg_cur)
+            bind_targets(bwg_cur, bwg_cur_depth);
         return 0;
     }
     if (!sf || !sf->srv || !blit_ensure())
@@ -7283,61 +6918,27 @@ static int gpu_present(BwSurf *sf)
      * visual suite (D9) presents the surface itself, below. */
     pic = bw_vfx_active() ? sf->srv : shown_picture(sf);
     if (!s_present_mode || !swap_ensure()) {
-        if (s_cur)
-            bind_targets(s_cur, s_cur_depth);
+        if (bwg_cur)
+            bind_targets(bwg_cur, bwg_cur_depth);
         return 0;
     }
     bw_hdr_follow(s_swap_w, s_swap_h);              /* item 97: the screen, every edition */
     if (s_swap_wait) {
-        /* P2b (Remastered high frame rate): wait a little for the screen
-         * to take the next frame instead of dropping it at once (seen on
-         * A 360 Hz screen: 13-54 frames a second dropped near the cap,
-         * each a skipped image). A screen that keeps not taking frames
-         * (asleep: D7's case) gets the old zero wait after a few timeouts,
-         * until it signals again. BW_HIFPS_SCREENWAIT=0 restores. */
-        DWORD to = (s_screen_wait_ms && s_screen_timeouts < 4) ? s_screen_wait_ms : 0, r;
-        double tw = to ? qpc_ms() : 0.0;
-        g_bw_present_waiting = to != 0;     /* lat-q */
-        if (screen_test_timeout()) {    /* BW_TEST_SCREENWAIT (test aid): as if timed out */
-            if (to)
-                Sleep(to);
-            r = WAIT_TIMEOUT;
-        } else {
-            r = WaitForSingleObject(s_swap_wait, to);
-        }
-        g_bw_present_waiting = 0;
-        if (to) {
-            double w = qpc_ms() - tw;
-            if (w > 0.05) {
-                s_screen_st_n++;
-                s_screen_st_ms += w;
-            }
-            if (w > 0.2)
-                s_flip_waited = 1;      /* lat-q */
-        }
-        if (r != WAIT_OBJECT_0) {
-            if (to && ++s_screen_timeouts == 4)
-                screen_wait_note(1);    /* the zero-wait fallback engages */
+        /* P2b: the screen wait (the core's policy, bwg_screen_wait) */
+        if (!bwg_screen_wait(s_swap_wait)) {
             s_st_dropped++;
-            if (s_cur)
-                bind_targets(s_cur, s_cur_depth);
+            if (bwg_cur)
+                bind_targets(bwg_cur, bwg_cur_depth);
             return 0;
         }
-        if (s_screen_timeouts >= 4)
-            screen_wait_note(0);        /* the screen takes frames again */
-        s_screen_timeouts = 0;
         waited = 1;
     }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_swap_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_swap_rtv, black);
     /* A 4:3 picture, as the console sends to the TV: the flipped surface is
-     * often the 2x-wide anti-aliased 1280x480 one, which the GPU filters down. */
-    fw = 4.0f * sf->wsk; fh = 3.0f;      /* widescreen (D5): the picture's own shape */
-    cw = (float)s_swap_w; ch = (float)s_swap_h;
-    if (cw * fh <= ch * fw) { w = cw; h = cw * fh / fw; }
-    else { h = ch; w = ch * fw / fh; }
-    vp.TopLeftX = (float)(int)((cw - w) * 0.5f);
-    vp.TopLeftY = (float)(int)((ch - h) * 0.5f);
+     * often the 2x-wide anti-aliased 1280x480 one, which the GPU filters down.
+     * The rectangle: the core's (bwg_letterbox). */
+    bwg_letterbox(sf->wsk, s_swap_w, s_swap_h, &vp.TopLeftX, &vp.TopLeftY, &w, &h);
     vp.Width = w; vp.Height = h;
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
     /* VFX (D9): the render scale follows the picture's size (no-op in
@@ -7409,6 +7010,8 @@ static int gpu_present(BwSurf *sf)
     } else if (SUCCEEDED(hr)) {
         s_st_presented++;
         pstat_after_present();           /* P2b: when presented frames reach the screen */
+        if (bwg_gate_mode())
+            gate_screen((uint32_t)g_bw_flips_done + 1);   /* gfx-lat11: the horizon */
     }
     if (FAILED(hr) && !gpu_lost(hr, "Present")) {      /* item 28: removed or reset ends the boot */
         static int shown;
@@ -7416,9 +7019,305 @@ static int gpu_present(BwSurf *sf)
             fprintf(stderr, "[GPU-PRESENT] Present failed 0x%08lX\n", (unsigned long)hr);
     }
     /* Back to what the executor had bound. */
-    if (s_cur)
-        bind_targets(s_cur, s_cur_depth);
+    if (bwg_cur)
+        bind_targets(bwg_cur, bwg_cur_depth);
     return SUCCEEDED(hr);
+}
+
+/* ---- the latency mode's GPU side (lane gfx-lat11, BW_HIFPS_LATMODE) -------
+ * docs/gfx/arch.md 3.3, 3.8 and 4: in the latency mode (Remastered's high
+ * frame rate, opt-in) the GPU limit is held at one gate before the game pass
+ * (bw_hifps_hooks.c, jit_wait; the policy is the core's, bwg_gate.c), so the
+ * walk never waits for the GPU. What D3D11 adds for it, per flip, at the end
+ * of the flip (every wait in it, the pacing, the screen and the present,
+ * unchanged):
+ *   - a fence mark with the flip's number and the frame submitted at once
+ *     (Flush): a watcher thread waits on the mark's event and tells the core
+ *     when the GPU finished the flip. The device is single-threaded, so the
+ *     watcher touches no D3D11 object, only its Win32 events (as lat-m's
+ *     latency log does);
+ *   - two GPU timestamps around the frame (TIMESTAMP_DISJOINT, read a frame
+ *     or two later without flushing): the GPU's own time per frame, and the
+ *     done watcher's lag (BW_HIFPS_LATMODE_TS=0 leaves them out);
+ *   - on screen, DXGI's frame statistics: when each present reached the
+ *     screen (the measured horizon).
+ * The device check of the GPU limit's wait (item 28, at most every 50 ms
+ * while the GPU has frames to finish) moves here with it, so a lost device
+ * still ends the boot (BW_GPU_FAILTEST=gpuwait:<n>); BW_TEST_LATSLOW=<ms>
+ * makes the watcher see a GPU that slow, as it does the limit's wait.
+ * Parity mode (the default, and Original always) never reaches any of it. */
+#define GT_R 64
+static int s_gt_on = -1;                /* -1 not set up yet, 0 off (failed), 1 live */
+static ID3D11Fence *s_gt_fence;
+static ID3D11DeviceContext4 *s_gt_ctx4;
+static ID3D11Device *s_gt_dev;
+static HANDLE s_gt_ev[GT_R], s_gt_kick;
+static uint32_t s_gt_flip[GT_R];
+static LONGLONG s_gt_sim[GT_R], s_gt_sim_last;   /* BW_TEST_LATSLOW, QPC ticks */
+static unsigned s_gt_slow_ms;
+static volatile LONG s_gt_head, s_gt_tail;       /* head: marked (NV2A), tail: seen (watcher) */
+static unsigned long s_gt_skipped;
+static double s_gt_pres_ms;             /* this flip's present call returned, qpc ms */
+static double s_gt_dev_check;
+#define TS_R 8
+static ID3D11Query *s_ts_dj[TS_R], *s_ts_b[TS_R], *s_ts_e[TS_R];
+static uint32_t s_ts_flip[TS_R];
+static unsigned char s_ts_st[TS_R];     /* 0 free, 1 begun, 2 ended (its data to read) */
+static unsigned s_ts_cur = ~0u;         /* the slot of the frame in progress */
+static int s_ts_off;
+static uint32_t s_gt_pc_flip[256];      /* DXGI present count -> flip */
+static UINT s_gt_last_spc;
+
+static DWORD WINAPI gt_watch(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        LONG tail = s_gt_tail;
+        unsigned i;
+        if (tail == s_gt_head) {
+            WaitForSingleObject(s_gt_kick, 100);
+            continue;
+        }
+        i = (unsigned)tail % GT_R;
+        if (WaitForSingleObject(s_gt_ev[i], 100) != WAIT_OBJECT_0)
+            continue;                   /* a slow frame: wait on (the gate has its own guard) */
+        while (s_gt_sim[i]) {           /* BW_TEST_LATSLOW, _GPUSTALL (test aids): not finished before then */
+            LARGE_INTEGER c;
+            QueryPerformanceCounter(&c);
+            if (c.QuadPart >= s_gt_sim[i])
+                break;
+            Sleep(1);
+        }
+        bwg_gate_gpu_done(s_gt_flip[i], bwg_qpc_ms());
+        InterlockedExchange(&s_gt_tail, tail + 1);
+    }
+}
+
+/* 1 when the gate's GPU side is live on this device. */
+static int gt_setup(void)
+{
+    ID3D11Device5 *d5 = NULL;
+    unsigned i;
+    const char *e;
+    if (s_gt_on >= 0) {
+        if (s_gt_on == 1 && s_gt_dev != s_dev) {
+            /* a new device: the old fence's events never come (item 28 ends
+             * the boot on a lost device, so this is a safety net only) */
+            s_gt_on = 0;
+            bwg_gate_live(0);
+            fprintf(stderr, "[GPU-GATE] a new graphics device: the gate's GPU limit is off for this boot\n");
+        }
+        return s_gt_on;
+    }
+    if (!s_dev || !s_ctx)
+        return 0;                       /* not yet: asked again at the next flip */
+    s_gt_on = 0;
+    s_gt_dev = s_dev;
+    if (FAILED(ID3D11Device_QueryInterface(s_dev, &IID_ID3D11Device5, (void **)&d5))
+        || FAILED(ID3D11Device5_CreateFence(d5, 0, D3D11_FENCE_FLAG_NONE, &IID_ID3D11Fence,
+                                            (void **)&s_gt_fence))
+        || FAILED(ID3D11DeviceContext_QueryInterface(s_ctx, &IID_ID3D11DeviceContext4, (void **)&s_gt_ctx4))) {
+        fprintf(stderr, "[GPU-GATE] no D3D11 fence on this system: the latency mode keeps the GPU limit in"
+                        " the flip (parity's wait)\n");
+        if (d5)
+            ID3D11Device5_Release(d5);
+        return 0;
+    }
+    ID3D11Device5_Release(d5);
+    for (i = 0; i < GT_R; i++)
+        if (!(s_gt_ev[i] = CreateEventW(NULL, FALSE, FALSE, NULL)))
+            return 0;
+    s_gt_kick = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!s_gt_kick)
+        return 0;
+    {
+        HANDLE th = CreateThread(NULL, 0, gt_watch, NULL, 0, NULL);
+        if (!th)
+            return 0;
+        SetThreadPriority(th, THREAD_PRIORITY_HIGHEST);
+        CloseHandle(th);
+    }
+    e = getenv("BW_TEST_LATSLOW");
+    s_gt_slow_ms = e && *e ? (unsigned)atoi(e) : 0u;
+    e = getenv("BW_HIFPS_LATMODE_TS");
+    s_ts_off = e && e[0] == '0';
+    s_gt_on = 1;
+    bwg_gate_live(1);
+    fprintf(stderr, "[GPU-GATE] the GPU's progress is watched (a fence per flip, each frame submitted at its"
+                    " flip)%s%s\n", s_ts_off ? "; no GPU timestamps (BW_HIFPS_LATMODE_TS=0)" : "; GPU timestamps on",
+            s_gt_slow_ms ? "; BW_TEST_LATSLOW: as if the GPU took that long per frame (test aid)" : "");
+    return 1;
+}
+
+static int ts_make(unsigned i)
+{
+    D3D11_QUERY_DESC qd;
+    qd.MiscFlags = 0;
+    qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+    if (!s_ts_dj[i] && FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_ts_dj[i])))
+        return 0;
+    qd.Query = D3D11_QUERY_TIMESTAMP;
+    if (!s_ts_b[i] && FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_ts_b[i])))
+        return 0;
+    if (!s_ts_e[i] && FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_ts_e[i])))
+        return 0;
+    return 1;
+}
+
+/* The frame `flip` starts on the GPU here (after the flip before it). */
+static void ts_begin(uint32_t flip)
+{
+    unsigned i = flip % TS_R;
+    s_ts_cur = ~0u;
+    if (s_ts_off || s_ts_st[i])
+        return;                         /* that slot's data not read yet: this frame goes without */
+    if (!ts_make(i)) {
+        s_ts_off = 1;
+        fprintf(stderr, "[GPU-GATE] GPU timestamp queries couldn't be made: the GPU's time per frame comes"
+                        " from the done events\n");
+        return;
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_ts_dj[i]);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ts_b[i]);
+    s_ts_flip[i] = flip;
+    s_ts_st[i] = 1;
+    s_ts_cur = i;
+}
+
+static void ts_end(uint32_t flip)
+{
+    unsigned i = s_ts_cur;
+    if (i >= TS_R || s_ts_flip[i] != flip || s_ts_st[i] != 1)
+        return;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ts_e[i]);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ts_dj[i]);
+    s_ts_st[i] = 2;
+    s_ts_cur = ~0u;
+}
+
+/* Hand the core every finished frame's timestamps, oldest first. */
+static void ts_read(void)
+{
+    for (;;) {
+        unsigned i, k = TS_R;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        UINT64 b = 0, e = 0;
+        HRESULT hr;
+        for (i = 0; i < TS_R; i++)
+            if (s_ts_st[i] == 2 && (k == TS_R || s_ts_flip[i] - s_ts_flip[k] > 0x80000000u))
+                k = i;
+        if (k == TS_R)
+            return;
+        hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_ts_dj[k], &dj, sizeof dj,
+                                         D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_FALSE)
+            return;                     /* not yet: the next flip looks again */
+        if (hr == S_OK)
+            hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_ts_b[k], &b, sizeof b,
+                                             D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_OK)
+            hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_ts_e[k], &e, sizeof e,
+                                             D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_FALSE)
+            return;
+        s_ts_st[k] = 0;
+        if (hr == S_OK && !dj.Disjoint && dj.Frequency)
+            bwg_gate_gpu_times(s_ts_flip[k], (double)b * 1000.0 / (double)dj.Frequency,
+                               (double)e * 1000.0 / (double)dj.Frequency);
+    }
+}
+
+/* On screen: when DXGI says each present reached the screen (the horizon). */
+static void gate_screen(uint32_t flip)
+{
+    UINT pc = 0;
+    DXGI_FRAME_STATISTICS fs;
+    if (!s_swap || s_gt_on != 1)
+        return;
+    if (SUCCEEDED(IDXGISwapChain1_GetLastPresentCount(s_swap, &pc)))
+        s_gt_pc_flip[pc % 256u] = flip;
+    memset(&fs, 0, sizeof fs);
+    if (SUCCEEDED(IDXGISwapChain1_GetFrameStatistics(s_swap, &fs)) && fs.PresentCount
+            && fs.PresentCount != s_gt_last_spc && pc - fs.PresentCount < 256u) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_gt_last_spc = fs.PresentCount;
+        bwg_gate_screen(s_gt_pc_flip[fs.PresentCount % 256u],
+                        (double)fs.SyncQPCTime.QuadPart * 1000.0 / (double)f.QuadPart);
+    }
+}
+
+/* At the end of every flip, in the latency mode (bw_flip). */
+static void gate_flip(uint32_t flip)
+{
+    double pres, now;
+    if (gt_setup() != 1)
+        return;
+    pres = s_gt_pres_ms > 0.0 ? s_gt_pres_ms : bwg_qpc_ms();
+    s_gt_pres_ms = 0.0;
+    ts_end(flip);
+    if (s_gt_head - s_gt_tail >= GT_R - 1) {
+        s_gt_skipped++;                 /* the watcher is behind: a later mark covers this flip */
+        bwg_gate_submitted(flip, pres);
+    } else {
+        unsigned i = (unsigned)s_gt_head % GT_R;
+        if (FAILED(ID3D11DeviceContext4_Signal(s_gt_ctx4, s_gt_fence, (UINT64)flip))
+            || FAILED(ID3D11Fence_SetEventOnCompletion(s_gt_fence, (UINT64)flip, s_gt_ev[i]))) {
+            s_gt_on = 0;
+            bwg_gate_live(0);
+            fprintf(stderr, "[GPU-GATE] the fence mark failed (flip %u): the latency mode keeps the GPU limit"
+                            " in the flip from now on\n", (unsigned)flip);
+            return;
+        }
+        s_gt_flip[i] = flip;
+        {
+            /* BW_TEST_LATSLOW for the whole run, or BW_TEST_GPUSTALL's stretch
+             * (the core's): a GPU that slow, one frame after another */
+            double st = bwg_gate_test_stall_ms();
+            unsigned slow = s_gt_slow_ms ? s_gt_slow_ms : (unsigned)(st + 0.5);
+            if (slow) {
+                LARGE_INTEGER c, f;
+                QueryPerformanceCounter(&c);
+                QueryPerformanceFrequency(&f);
+                s_gt_sim_last = (s_gt_sim_last > c.QuadPart ? s_gt_sim_last : c.QuadPart)
+                                + f.QuadPart * (LONGLONG)slow / 1000;
+                s_gt_sim[i] = s_gt_sim_last;
+            } else {
+                s_gt_sim[i] = 0;
+            }
+        }
+        bwg_gate_submitted(flip, pres); /* before the watcher can see the mark */
+        InterlockedIncrement(&s_gt_head);
+        SetEvent(s_gt_kick);
+    }
+    ID3D11DeviceContext_Flush(s_ctx);  /* the frame and its mark go to the GPU now */
+    ts_read();
+    ts_begin(flip + 1);
+    now = bwg_qpc_ms();
+    if (bwg_gate_unfinished() && now - s_gt_dev_check >= 50.0) {
+        /* item 28: a lost device never finishes its marks; ask it (as the
+         * limit's wait does every 50 ms) */
+        HRESULT why = BW_GPU_FT("gpuwait", DXGI_ERROR_DEVICE_REMOVED, ID3D11Device_GetDeviceRemovedReason(s_dev));
+        s_gt_dev_check = now;
+        if (FAILED(why))
+            gpu_lost(DXGI_ERROR_DEVICE_REMOVED, "the latency gate's device check");
+    }
+}
+
+/* BW_GPU_FLIPFLUSH=1 (test aid, a Remastered high-frame-rate boot, never in
+ * a preset): parity mode with the frame submitted at every flip, to tell how
+ * much of the measured present -> GPU done is the driver holding the frame
+ * back (off screen nothing else submits it). */
+static int flip_flush_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("BW_GPU_FLIPFLUSH");
+        on = e && e[0] == '1';
+        if (on)
+            fprintf(stderr, "[GPU-GATE] every frame submitted at its flip (BW_GPU_FLIPFLUSH=1, test aid)\n");
+    }
+    return on;
 }
 
 /* P2b: how many flipped frames the GPU still has to finish, and a limit on
@@ -7549,8 +7448,11 @@ static void lat_poll(int flush)
 
 static void lat_flip(void)
 {
-    int max = lat_max();
+    int max;
     unsigned i;
+    if (bwg_gate_mode() && gt_setup() == 1)
+        return;                         /* gfx-lat11: the latency mode holds the limit at its gate */
+    max = lat_max();
     if (!max || !s_ctx)
         return;
     lat_poll(0);
@@ -7586,7 +7488,7 @@ static void lat_flip(void)
     else if (s_lat_capped && !s_lat_env && g_bw_cap_reached && max > s_lat_capped)
         max = s_lat_capped;                     /* lat-q: the cap's limit, while it is reached */
     if (s_lat_head - s_lat_tail > (unsigned)max) {
-        double t0 = qpc_ms(), w;
+        double t0 = bwg_qpc_ms(), w;
         unsigned before = s_lat_head - s_lat_tail, n = 0;
         double t_prog = t0, t_dev = t0, now;
         unsigned tail0 = s_lat_tail;
@@ -7595,21 +7497,21 @@ static void lat_flip(void)
                                                  TIMER_ALL_ACCESS);
         lat_poll(1);                           /* submit what is queued */
         g_bw_present_waiting = 1;               /* lat-q */
-        s_flip_waited = 1;
+        bwg_flip_waited = 1;
         while (s_lat_head - s_lat_tail > (unsigned)max) {
             LARGE_INTEGER due;
             if (++n < 4) {
                 SwitchToThread();
             } else {
                 /* 100 us naps; with the hold, 1 ms ones once the wait is long (lat-q) */
-                due.QuadPart = s_lat_hold && qpc_ms() - t0 >= 20.0 ? -10000 : -1000;
+                due.QuadPart = s_lat_hold && bwg_qpc_ms() - t0 >= 20.0 ? -10000 : -1000;
                 if (s_lat_timer && SetWaitableTimer(s_lat_timer, &due, 0, NULL, NULL, FALSE))
                     WaitForSingleObject(s_lat_timer, 2);
                 else
                     Sleep(0);
             }
             lat_poll(0);
-            now = qpc_ms();
+            now = bwg_qpc_ms();
             if (!s_lat_hold) {
                 if (now - t0 > 100.0)
                     break;                      /* never hang on a lost query (the old wait) */
@@ -7636,20 +7538,20 @@ static void lat_flip(void)
                  * or a lost query; never hang (logged, the first five) */
                 if (++s_lat_st_stall <= 5)
                     fprintf(stderr, "[GPU-LAT] no frame finished in %.0f ms (frame %u, %u unfinished): the wait"
-                                    " gives up%s\n", LAT_STALL_MS, (unsigned)s_gen, s_lat_head - s_lat_tail,
+                                    " gives up%s\n", LAT_STALL_MS, (unsigned)bwg_gen, s_lat_head - s_lat_tail,
                             s_lat_st_stall == 5 ? "; later ones aren't logged" : "");
                 break;
             }
         }
         g_bw_present_waiting = 0;
-        w = qpc_ms() - t0;
+        w = bwg_qpc_ms() - t0;
         if (w > 100.0 && s_lat_hold) {
             static int noted;
             s_lat_st_long++;
             if (!noted++)
                 fprintf(stderr, "[GPU-LAT] the GPU took over 100 ms for a frame (frame %u, waited %.0f ms): the"
                                 " limit holds (BW_GPU_LATENCY_HOLD; =0 gives 0.2.5's 100 ms give-up)\n",
-                        (unsigned)s_gen, w);
+                        (unsigned)bwg_gen, w);
         }
         s_lat_st_waits++;
         s_lat_st_wait_ms += w;
@@ -7662,7 +7564,8 @@ static void lat_flip(void)
 
 static void lat_stats_line(void)
 {
-    pace_stats_line();
+    bwg_pace_stats_line();
+    bwg_gate_stats_line();              /* gfx-lat11: the latency mode only */
     if (!s_lat_max || !s_lat_st_n)
         return;
     fprintf(stderr, "[GPU-LAT] frames in flight %.2f mean, %lu most | waits %lu, %.1f ms (most %.1f)"
@@ -7674,305 +7577,31 @@ static void lat_stats_line(void)
     s_lat_st_wait_ms = s_lat_st_wait_max = 0.0;
 }
 
-/* P2b: even presents at the frame cap (Remastered high frame rate).
- *
- * The flip hold paces the walk on a tick of the host clock at the target
- * rate, but the present itself is made at the FLIP_STALL, before the hold,
- * and a frame that came late is let through at once: so near the cap two
- * presents could come well under one refresh apart (seen: 40% of present
- * intervals under 2.78 ms in a battle at 282 fps, 64% in mission 10 at 335,
- * off screen). On a 360 Hz variable-refresh screen a frame that comes
- * sooner than the screen can refresh tears or waits. Here a present is made
- * no sooner than 1/target s after the previous one (a short wait on the
- * NV2A thread, which holds the walk and so the game, as the hold does).
- * bw_d3d11_pace_config sets the rate; BW_HIFPS_PACE=0 turns it off. */
-static double s_pace_period_ms, s_pace_last_ms, s_pace_st_ms;
-static unsigned s_pace_st_n;
-static HANDLE s_pace_timer;
-/* 0.2.5 (item 64's check): the presents keep to a schedule. Each one used to
- * be timed from the previous present as it actually happened, so every
- * timer's late wake-up (about 0.1 ms) added up and the fixed caps landed
- * 1-2% under (V on RC6: 240 -> 235.5, 144 -> 141.7, 120 -> 118.9, every
- * present paced). Now the next present is due one period after the last
- * one was due; a present a timer woke late for may come a little sooner
- * after it, but never sooner than PACE_FLOOR of a period (at the 360 Hz
- * display's 350 cap that is 2.79 ms, still longer than a refresh), and a
- * frame more than a period late starts the schedule again from now (no
- * catch-up burst). The timer also wakes PACE_SPIN_MS before, not 0.25 ms,
- * so it is rarely late at all. BW_HIFPS_PACE_ABS=0 restores the old timing. */
-#define PACE_FLOOR   0.975
-#define PACE_SPIN_MS 0.4
-static double s_pace_next_ms;
-static int s_pace_abs = 1;
-/* lat-q: BW_HIFPS_PACE_ADAPT=1 (Remastered high frame rate, test switch):
- * when frames come slower than the cap (the GPU or the game the slower
- * side), the schedule's period follows what the frames sustain: the median
- * of the last 32 present intervals times PACE_ADAPT_K, never below the cap's
- * period. Seen on the maintainer's screen with just-in-time frames: presents
- * followed each pass's own work (a pass with a game step takes ~2x one
- * without), so their intervals spread 1.7 -> 3.2 ms; with a steady beat to
- * aim at, JIT starts each pass its own work before the beat instead. */
-#define PACE_ADAPT_K 0.96
-static int s_pace_adapt;
-static float s_pace_iv[32];
-static unsigned s_pace_ivn;
-
-/* lat-q: BW_HIFPS_JIT=4 (the head start, a test switch): the schedule's
- * period follows what the frames sustain. Replayed offline on the quiet
- * slot's JIT logs (tools/bw_headstart.py, inferred): a steady beat at the
- * frames' own rate, each pass started its own work before its beat even
- * while the frame before is still on the NV2A thread, spreads the presents
- * ~1.4 ms instead of JIT's 5.6 (as shipped 2.1). The beat: 2% longer when
- * 4 of the last 32 presents came over a tenth of a period late, 1% shorter
- * after 32 with none late; never under the cap's period or over 100 ms. */
-static int s_beat_auto;
-static double s_beat_T;
-static unsigned char s_bl[32];
-static unsigned s_bl_head, s_bl_n, s_bl_sum;
-static unsigned long s_beat_up, s_beat_down;
-
+/* P2b, lat-q: the present's pacing lives in the core (bwg_pace.c); these
+ * are the names main.c and the high frame rate call. */
 void bw_d3d11_beat_auto(int on)
 {
-    s_beat_auto = on;
+    bwg_beat_auto(on);
 }
-
-static void beat_tune(int late)
-{
-    if (s_beat_T < s_pace_period_ms)
-        s_beat_T = s_pace_period_ms;
-    if (s_bl_n == 32)
-        s_bl_sum -= s_bl[s_bl_head];
-    else
-        s_bl_n++;
-    s_bl[s_bl_head] = (unsigned char)(late != 0);
-    s_bl_sum += late != 0;
-    s_bl_head = (s_bl_head + 1) % 32u;
-    if (s_bl_sum >= 4) {
-        s_beat_T = s_beat_T * 1.02 < 100.0 ? s_beat_T * 1.02 : 100.0;
-        s_bl_n = s_bl_sum = 0;
-        s_beat_up++;
-    } else if (s_bl_n >= 32 && !s_bl_sum) {
-        s_beat_T = s_beat_T * 0.99 > s_pace_period_ms ? s_beat_T * 0.99 : s_pace_period_ms;
-        s_bl_n = 0;
-        s_beat_down++;
-    }
-}
-
-static double pace_period(void)
-{
-    float v[32];
-    unsigned n = s_pace_ivn < 32u ? s_pace_ivn : 32u, i, j;
-    double m;
-    if (s_beat_auto && s_beat_T > s_pace_period_ms)
-        return s_beat_T;
-    if (!s_pace_adapt || n < 16)
-        return s_pace_period_ms;
-    memcpy(v, s_pace_iv, n * sizeof v[0]);
-    for (i = 1; i < n; i++)
-        for (j = i; j > 0 && v[j - 1] > v[j]; j--) {
-            float x = v[j]; v[j] = v[j - 1]; v[j - 1] = x;
-        }
-    m = (double)v[n / 2] * PACE_ADAPT_K;
-    return m > s_pace_period_ms ? m : s_pace_period_ms;
-}
-static double s_pace_st_gap = -1.0;     /* BW_GPU_STATS: the shortest gap between presents */
 
 void bw_d3d11_pace_config(unsigned hz)
 {
-    const char *e = getenv("BW_HIFPS_PACE");
-    s_pace_period_ms = (hz && !(e && e[0] == '0')) ? 1000.0 / (double)hz : 0.0;
-    e = getenv("BW_HIFPS_SCREENWAIT");
-    s_screen_wait_ms = hz && !(e && e[0] == '0') ? 8u : 0u;
-    e = getenv("BW_HIFPS_PACE_ABS");
-    s_pace_abs = !(e && e[0] == '0');
-    s_pace_next_ms = 0.0;
-    e = getenv("BW_HIFPS_PACE_ADAPT");                  /* lat-q */
-    s_pace_adapt = s_pace_abs && e && e[0] == '1';
-    s_pace_ivn = 0;
-    if (s_pace_adapt && s_pace_period_ms > 0.0)
-        fprintf(stderr, "[GPU-PRESENT] the schedule follows the frames' own rate when they come slower"
-                        " than the cap (BW_HIFPS_PACE_ADAPT)\n");
-    if (s_pace_period_ms > 0.0)
-        fprintf(stderr, "[GPU-PRESENT] presents at least %.3f ms apart (%u per second%s; BW_HIFPS_PACE=0 turns it off)\n",
-                s_pace_period_ms, hz, s_pace_abs ? ", on a steady schedule" : ", timed from the last present (BW_HIFPS_PACE_ABS=0)");
+    bwg_pace_config(hz);
 }
-
-/* When the next present is due (host ms, qpc_ms), the one answer for the
- * limiter below and for anything that aims a frame at it (the latency
- * batch's JIT pacing): the schedule, but never sooner than PACE_FLOOR of a
- * period after the last present. */
-static double pace_due_ms(void)
-{
-    if (s_pace_abs && s_pace_next_ms > 0.0) {
-        double floor_ms = s_pace_last_ms + pace_period() * PACE_FLOOR;
-        return s_pace_next_ms > floor_ms ? s_pace_next_ms : floor_ms;
-    }
-    return s_pace_last_ms + s_pace_period_ms;
-}
-
-/* lat-q: is the frame cap being reached? (BW_HIFPS_JIT=3: just-in-time
- * frames only while it is; bw_d3d11_cap_watch turns the watch on). Seen at
- * a 120 cap: just-in-time frames keep the presents even there (spread 0.63
- * ms) with the picture 16.7 -> 7.1 ms old; uncapped they spread the
- * presents 2.2 -> 6.0 ms. Over the last 32 presents: reached when the
- * median gap is within 2% of the cap's period and at most 4 came late (more
- * than a tenth of a period after their slot); no longer reached when the
- * median is 4% over or 12 came late. Each state holds at least 1 s; a
- * release within 10 s of an engage (the cap didn't hold with the frames
- * just in time; seen on a busy PC at a 90 cap: releases ~4 s after each
- * engage, every ~5.5 s) makes the next engage wait 2 s, then 4, 8 ... 30 s
- * (none again once an engage holds 10 s). The first twenty transitions are logged, all
- * are counted (BW_GPU_STATS). */
-static float s_cap_iv[32];
-static unsigned char s_cap_late[32];
-static unsigned s_cap_ivn;
-static double s_cap_since_ms, s_cap_backoff_ms, s_cap_engaged_ms;
-static unsigned long s_cap_on_n, s_cap_off_n, s_cap_st_on, s_cap_st_n, s_cap_st_late;
 
 void bw_d3d11_cap_watch(int on)
 {
-    s_cap_watch = on;
+    bwg_cap_watch(on);
 }
 
-static void cap_watch(double gap, double now, int late)
-{
-    float v[32];
-    unsigned n, i, j, nl = 0;
-    double med, p = s_pace_period_ms;
-    if (!s_cap_watch || p <= 0.0)
-        return;
-    s_cap_st_n++;
-    s_cap_st_on += g_bw_cap_reached != 0;
-    s_cap_st_late += late != 0;
-    s_cap_late[s_cap_ivn % 32u] = (unsigned char)(late != 0);
-    s_cap_iv[s_cap_ivn++ % 32u] = (float)(gap < 1000.0 ? gap : 1000.0);
-    n = s_cap_ivn < 32u ? s_cap_ivn : 32u;
-    if (n < 32 || now - s_cap_since_ms < 1000.0)
-        return;
-    memcpy(v, s_cap_iv, n * sizeof v[0]);
-    for (i = 1; i < n; i++)
-        for (j = i; j > 0 && v[j - 1] > v[j]; j--) {
-            float x = v[j]; v[j] = v[j - 1]; v[j - 1] = x;
-        }
-    for (i = 0; i < n; i++)
-        nl += s_cap_late[i];
-    med = (double)v[n / 2];
-    if (!g_bw_cap_reached) {
-        if (med <= p * 1.02 && nl <= 4 && now - s_cap_since_ms >= s_cap_backoff_ms) {
-            g_bw_cap_reached = 1;
-            s_cap_since_ms = s_cap_engaged_ms = now;
-            if (++s_cap_on_n <= 20)
-                fprintf(stderr, "[GPU-PRESENT] the frame cap is reached (median gap %.2f ms, cap %.2f, %u of 32"
-                                " late): just-in-time frames on (frame %u)\n", med, p, nl, (unsigned)s_gen);
-        }
-    } else {
-        if (now - s_cap_engaged_ms > 10000.0)
-            s_cap_backoff_ms = 0.0;             /* held long enough: no backoff */
-        if (med >= p * 1.04 || nl >= 12) {
-            g_bw_cap_reached = 0;
-            if (now - s_cap_engaged_ms < 10000.0)
-                s_cap_backoff_ms = s_cap_backoff_ms < 2000.0 ? 2000.0
-                                 : s_cap_backoff_ms * 2.0 > 30000.0 ? 30000.0 : s_cap_backoff_ms * 2.0;
-            s_cap_since_ms = now;
-            if (++s_cap_off_n <= 20)
-                fprintf(stderr, "[GPU-PRESENT] the frame cap is no longer reached (median gap %.2f ms, cap %.2f,"
-                                " %u of 32 late, %.1f s on): just-in-time frames off (frame %u; the next engage"
-                                " no sooner than %.0f s)\n", med, p, nl, (now - s_cap_engaged_ms) / 1000.0,
-                        (unsigned)s_gen, (s_cap_backoff_ms > 1000.0 ? s_cap_backoff_ms : 1000.0) / 1000.0);
-        }
-    }
-}
-
-static void pace_present(void)
-{
-    double now, due;
-    int late;
-    if (s_pace_period_ms <= 0.0)
-        return;
-    now = qpc_ms();
-    due = pace_due_ms();
-    late = s_pace_last_ms > 0.0 && now > due + s_pace_period_ms * 0.1;   /* lat-q: cap_watch */
-    if (s_beat_auto && s_pace_last_ms > 0.0 && now < due + pace_period() * 4.0)
-        /* lat-q, BW_HIFPS_JIT=4: a frame over 4 periods late is a stall (a
-         * load, a busy GPU), not a beat a little too fast: not counted, so
-         * the beat doesn't climb through a stall and stay slow after it */
-        beat_tune(now > due + pace_period() * 0.1);
-    if (s_pace_last_ms > 0.0 && now < due) {
-        double t0 = now, spin = s_pace_abs ? PACE_SPIN_MS : 0.25;
-        g_bw_present_waiting = 1;       /* lat-q */
-        g_bw_pace_waiting = 1;
-        s_flip_waited = 1;
-        /* sleep on a high-resolution timer to a little before, then spin
-         * the rest: a timer can only end late, so the gap is never short */
-        if (due - now > spin + 0.1) {
-            LARGE_INTEGER d;
-            if (!s_pace_timer)
-                s_pace_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */,
-                                                      TIMER_ALL_ACCESS);
-            d.QuadPart = -(LONGLONG)((due - now - spin) * 10000.0);
-            if (s_pace_timer && SetWaitableTimer(s_pace_timer, &d, 0, NULL, NULL, FALSE))
-                WaitForSingleObject(s_pace_timer, 20);
-        }
-        while ((now = qpc_ms()) < due)
-            YieldProcessor();
-        g_bw_present_waiting = 0;
-        g_bw_pace_waiting = 0;
-        s_pace_st_ms += now - t0;
-        s_pace_st_n++;
-    }
-    if (s_pace_adapt && s_pace_last_ms > 0.0 && now - s_pace_last_ms < 100.0)
-        s_pace_iv[s_pace_ivn++ % 32u] = (float)(now - s_pace_last_ms);   /* lat-q */
-    if (s_pace_last_ms > 0.0)
-        cap_watch(now - s_pace_last_ms, now, late);                      /* lat-q */
-    if (s_pace_abs) {
-        double p = pace_period();
-        s_pace_next_ms = (s_pace_last_ms > 0.0 && now - due < p) ? due + p : now + p;
-    }
-    if (s_pace_last_ms > 0.0 && (s_pace_st_gap < 0.0 || now - s_pace_last_ms < s_pace_st_gap))
-        s_pace_st_gap = now - s_pace_last_ms;       /* BW_GPU_STATS: the shortest gap */
-    s_pace_last_ms = now;
-    InterlockedIncrement(&g_bw_paced_n);                                 /* lat-q */
-}
-
-/* lat-q: the present pacing's next slot (qpc ms): 1 and *due_ms while the
- * pacing is on and has paced a present; BW_HIFPS_JIT aims each pass at it. */
 int bw_d3d11_present_due(double *due_ms)
 {
-    if (s_pace_period_ms <= 0.0 || s_pace_last_ms <= 0.0)
-        return 0;
-    *due_ms = pace_due_ms();            /* B1's schedule: the one answer */
-    return 1;
+    return bwg_present_due(due_ms);
 }
 
-/* lat-q: the schedule's period now (BW_HIFPS_PACE_ADAPT's, or the cap's) */
 double bw_d3d11_pace_period(void)
 {
-    return pace_period();
-}
-
-static void pace_stats_line(void)
-{
-    if (s_screen_st_n) {
-        fprintf(stderr, "[GPU-PRESENT] waited for the screen %u times, %.1f ms\n", s_screen_st_n, s_screen_st_ms);
-        s_screen_st_n = 0;
-        s_screen_st_ms = 0.0;
-    }
-    if (s_cap_watch && s_cap_st_n) {
-        fprintf(stderr, "[GPU-PRESENT] the frame cap reached for %lu of %lu presents, %lu late | just-in-time"
-                        " frames on %lu times, off %lu this boot\n",
-                s_cap_st_on, s_cap_st_n, s_cap_st_late, s_cap_on_n, s_cap_off_n);
-        s_cap_st_on = s_cap_st_n = s_cap_st_late = 0;
-    }
-    if (s_beat_auto && s_beat_T > 0.0)
-        fprintf(stderr, "[GPU-PRESENT] head start: the beat %.3f ms (%.1f per second), %lu longer and %lu shorter"
-                        " this boot\n", pace_period(), 1000.0 / pace_period(), s_beat_up, s_beat_down);
-    if (!s_pace_st_n)
-        return;
-    fprintf(stderr, "[GPU-PRESENT] paced %u presents, %.1f ms waited, shortest gap %.3f ms\n",
-            s_pace_st_n, s_pace_st_ms, s_pace_st_gap);
-    s_pace_st_n = 0;
-    s_pace_st_ms = 0.0;
-    s_pace_st_gap = -1.0;
+    return bwg_pace_period();
 }
 
 /* ---- BW_LATLOG (lat-m, test aid, every edition) --------------------------
@@ -8081,15 +7710,209 @@ static void lat_present_stats(long k)
 
 static void bw_flip_body(void);
 
+/* ---- I1, the CPU-write latch: this back end's part (core/bwg_latch.c; lane
+ * gfx-regen, docs/gfx/lanes/regen.md) -------------------------------------
+ * upload: the marked guest rows into the surface's GPU copy. In Original
+ * (scale 1, no MSAA, the guest's own format) the bytes go straight into the
+ * texture, as the seed's do. At a render scale, with MSAA or widescreen
+ * (Remastered), the rows become a small texture drawn over the target's
+ * rectangle at its scale with the seed's bilinear stretch; widescreen maps
+ * guest memory to the centre, as the readback does (readback_source). The
+ * binding is restored, and the surface counts as drawn. */
+static void latch_upload(BwgSurf *s, const uint32_t r[4])
+{
+    uint32_t sp = s->cur_pitch ? s->cur_pitch : s->pitch, w = r[2] - r[0], h = r[3] - r[1];
+    const uint8_t *src = GUEST(s->va) + (size_t)r[1] * sp + (size_t)r[0] * s->bpp;
+    if (!s->tex)
+        return;
+    if (!bw_vfx_active() && !s->mtex && s->pw == s->w && s->ph == s->h) {
+        D3D11_BOX box;
+        box.left = r[0]; box.top = r[1]; box.front = 0;
+        box.right = r[2]; box.bottom = r[3]; box.back = 1;
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s->tex, 0, &box, src, sp, 0);
+    } else {
+        D3D11_TEXTURE2D_DESC td;
+        D3D11_SUBRESOURCE_DATA init;
+        D3D11_VIEWPORT vp;
+        ID3D11Texture2D *t = NULL;
+        ID3D11ShaderResourceView *v = NULL;
+        BwSurf *c = bwg_cur;
+        BwDepth *d = bwg_cur_depth;
+        float cw = s->wsk > 1.0f ? (float)s->pw / s->wsk : (float)s->pw;
+        float sx = cw / (float)s->w, sy = (float)s->ph / (float)s->h;
+        memset(&td, 0, sizeof td);
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = surf_format(s->bpp);
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        init.pSysMem = src;
+        init.SysMemPitch = sp;
+        init.SysMemSlicePitch = 0;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, &init, &t))
+                && SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t, NULL, &v))) {
+            vp.TopLeftX = ((float)s->pw - cw) * 0.5f + (float)r[0] * sx;
+            vp.TopLeftY = (float)r[1] * sy;
+            vp.Width = (float)w * sx;
+            vp.Height = (float)h * sy;
+            vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+            bw_vfx_blit_vp(v, w, h, s->mrtv ? s->mrtv : s->rtv, &vp);
+        }
+        if (v) ID3D11ShaderResourceView_Release(v);
+        if (t) ID3D11Texture2D_Release(t);
+        if (c)
+            bind_targets(c, d);
+        else
+            g_bw_ctx_epoch++;
+    }
+    SURF_DRAWN(s);
+}
+
+/* Test aid, BW_GPU_LATCH_SHOTS=<n>[,<n>...] (with RECOMP_FB_DUMP as the
+ * prefix): the surface shown again at those re-presents (1 the first), as a
+ * 32-bit BMP of its GPU copy, latch_<n>.bmp; 8-bit surfaces at the guest's
+ * size only (Original), others are skipped with a line. */
+static void latch_shot(BwgSurf *s, unsigned k)
+{
+    static int init;
+    static unsigned want[16], nw;
+    const char *prefix = getenv("RECOMP_FB_DUMP");
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11Texture2D *stg = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    unsigned i;
+    int hit = 0;
+    if (!init) {
+        const char *e = getenv("BW_GPU_LATCH_SHOTS");
+        init = 1;
+        while (e && *e && nw < 16) {
+            want[nw++] = (unsigned)strtoul(e, (char **)&e, 10);
+            if (*e == ',') e++; else break;
+        }
+    }
+    for (i = 0; i < nw; i++)
+        if (want[i] == k)
+            hit = 1;
+    if (!hit || !prefix || !*prefix || !s->tex)
+        return;
+    {
+        /* the guest-sized 8-bit picture the readback would write: the
+         * surface itself in Original, the suite's box-filtered centre at a
+         * render scale, with MSAA or widescreen (readback_source) */
+        ID3D11Texture2D *src = readback_source(s);
+        D3D11_BOX box;
+        uint32_t cx = s_rb_crop_x;
+        if (!src)
+            return;
+        ID3D11Texture2D_GetDesc(src, &td);
+        if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM || td.SampleDesc.Count != 1) {
+            fprintf(stderr, "[GPU-LATCH] shot %u skipped: surface format %u\n", k, (unsigned)td.Format);
+            return;
+        }
+        td.Width = s->w;
+        td.Height = s->h;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        td.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &stg)))
+            return;
+        box.left = cx; box.top = 0; box.front = 0;
+        box.right = cx + s->w; box.bottom = s->h; box.back = 1;
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)stg, 0, 0, 0, 0,
+                                                  (ID3D11Resource *)src, 0, &box);
+    }
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+        char path[600];
+        FILE *f;
+        _snprintf(path, sizeof path, "%slatch_%04u.bmp", prefix, k);
+        path[sizeof path - 1] = 0;
+        if ((f = fopen(path, "wb")) != NULL) {
+            uint8_t hd[54];
+            uint32_t size = 54 + td.Width * td.Height * 4, y;
+            int32_t hh = -(int32_t)td.Height;
+            memset(hd, 0, sizeof hd);
+            hd[0] = 'B'; hd[1] = 'M';
+            memcpy(hd + 2, &size, 4);
+            hd[10] = 54; hd[14] = 40;
+            memcpy(hd + 18, &td.Width, 4);
+            memcpy(hd + 22, &hh, 4);
+            hd[26] = 1; hd[28] = 32;
+            fwrite(hd, 1, 54, f);
+            for (y = 0; y < td.Height; y++)
+                fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch, 4, td.Width, f);
+            fclose(f);
+            fprintf(stderr, "[GPU-LATCH] shot %s (surface %08X, %ux%u, frame %u, shown again %u)\n", path,
+                    s->va, td.Width, td.Height, bwg_gen, k);
+        }
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stg, 0);
+    }
+    ID3D11Texture2D_Release(stg);
+}
+
+/* represent: the shown surface presented again without a flip (the
+ * front-buffer rule: the loading thread's progress bar), and the plain
+ * window (BW_GPU_PRESENT=0 shows guest memory) told too. */
+static int latch_represent(BwgSurf *s)
+{
+    static unsigned k;
+    uint32_t pitch;
+    int r;
+    if (!s || !s->srv)
+        return 0;
+    r = gpu_present(s);
+    latch_shot(s, ++k);
+    pitch = s->cur_pitch ? s->cur_pitch : s->pitch;
+    xbox_FramebufferWindowSet(s->va, pitch);
+    xbox_FramebufferWindowPresent(s->va, pitch);
+    return r;
+}
+
+/* read_now: the forced read, a waiting readback whatever the mode; the
+ * surface's dirty mark is kept (it still presents at its flip). */
+static void latch_read_now(BwgSurf *s)
+{
+    int d = s->dirty;
+    s->dirty = 1;
+    s_rb_force_sync = 1;
+    readback(s);
+    s_rb_force_sync = 0;
+    s->dirty = d;
+}
+
+/* scanout: the made surface the display scans out, the frame buffer the
+ * title gave AvSetDisplayMode (the runtime records it resolved to the
+ * contiguous window; the title never writes PCRTC_START itself, and with
+ * anti-aliasing it has one scan-out buffer, which D3D's swap resolves into).
+ * The live run only (bwg_latch_idle never runs in a replay). */
+extern uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
+static BwgSurf *latch_scanout(void)
+{
+    uint32_t pitch = 0, fb = xbox_GetDisplayFramebuffer(&pitch);
+    return fb ? bwg_find_surf(fb) : NULL;
+}
+
+static const BwgLatchOps s_latch_ops = { latch_upload, latch_represent, latch_read_now, latch_scanout };
+
+static void latch_init(void)
+{
+    bwg_latch_init(&s_latch_ops);
+}
+
 /* lat-q: counts the flips the back end has finished (g_bw_flips_done) */
 static void bw_flip(void)
 {
     bw_flip_body();
+    if (bwg_gate_mode())
+        gate_flip((uint32_t)g_bw_flips_done + 1);   /* gfx-lat11: the latency mode's GPU side */
+    else if (s_cfg_hifps && s_ctx && flip_flush_on())
+        ID3D11DeviceContext_Flush(s_ctx);           /* BW_GPU_FLIPFLUSH (test aid) */
     InterlockedIncrement(&g_bw_flips_done);
 }
 
 static void bw_flip_body(void)
 {
+    g_bw_ctx_epoch++;                   /* I3: the flip's work sets state of its own */
     int64_t lat_t0 = 0, lat_tp = 0, lat_tp1 = 0, lat_trb = 0;
     long lat_k = 0;
     int lat_res = -1;
@@ -8099,6 +7922,8 @@ static void bw_flip_body(void)
         if (nv2a_pb_exec_flip_dumping())
             bw_lat_ev(BW_LAT_DUMPED, lat_t0, lat_k, ++s_lat_dumps, 0, 0, 0, 0, 0.0, 0.0);
     }
+    if (g_bw_gfxcap)
+        bw_gfxcap_frame(bwg_gen);       /* BW_GFXCAP: the flip in progress (the suite's pictures) */
     stats_tick();
     check_holes();
     s_st_flips++;
@@ -8113,10 +7938,20 @@ static void bw_flip_body(void)
     if (bw_vfx_active() && bw_vfx()->tex_restore)
         bw_tr_frame();                  /* T1: a [TEXRESTORE] summary now and then */
     /* The surface the title just finished is the one it presents. */
-    ft_flip(s_cur);
+    BWG_LATCH_USE(bwg_cur);             /* I1: a CPU write into it since its last use, up first */
+    vshpre_flip_line();                 /* lane gfx-regen: the load-time compile's lines */
+    {
+        static double latch_last;       /* I1's line, once a second when it moved */
+        double now = bwg_qpc_ms();
+        if (now - latch_last >= 1000.0) {
+            latch_last = now;
+            bwg_latch_line();
+        }
+    }
+    ft_flip(bwg_cur);
     if (s_stats > 0) {
         static double last;
-        double now = qpc_ms();
+        double now = bwg_qpc_ms();
         if (last) {
             double ft = now - last;
             if (!s_st_ft_n || ft < s_st_ft_min) s_st_ft_min = ft;
@@ -8126,18 +7961,25 @@ static void bw_flip_body(void)
         }
         last = now;
     }
-    if (s_cur && s_cur->dirty) {
-        BwSurf *shown = s_cur;
-        double t0 = (s_stats > 0 || trc_on()) ? qpc_ms() : 0.0, t1 = 0.0;
+    if (bwg_cur && bwg_cur->dirty) {
+        BwSurf *shown = bwg_cur;
+        double t0 = (s_stats > 0 || trc_on()) ? bwg_qpc_ms() : 0.0, t1 = 0.0;
         unsigned long long fl_t0;
         int fl_pres;
-        s_flip_waited = 0;               /* lat-q: set by the waits below */
-        g_bw_flip_ready_ms = qpc_ms();
-        pace_present();                  /* P2b: no sooner than 1/target after the last */
+        bwg_flip_waited = 0;               /* lat-q: set by the waits below */
+        g_bw_flip_ready_ms = bwg_qpc_ms();
+        bwg_pace_present();              /* P2b: no sooner than 1/target after the last */
         fl_t0 = g_bw_fl_on ? bw_fl_ticks() : 0;
         if (lat_t0)
             lat_tp = bw_lat_now();
+        if (bw_edgeprobe_on())          /* BW_GPU_EDGEPROBE (test aid): after the last draw */
+            bw_edgeprobe_at(BW_EP_LAST, s_ctx, shown->mtex ? (void *)shown->mtex : (void *)shown->tex, bwg_gen);
         fl_pres = gpu_present(shown);    /* before the readback's wait */
+        bwg_latch_flipped(shown);       /* I1: the front-buffer rule's surface and clock */
+        if (bwg_gate_mode())
+            s_gt_pres_ms = bwg_qpc_ms(); /* gfx-lat11: the present call's return */
+        if (bw_edgeprobe_on())          /* BW_GPU_EDGEPROBE (test aid): after the present */
+            bw_edgeprobe_at(BW_EP_POST, s_ctx, shown->mtex ? (void *)shown->mtex : (void *)shown->tex, bwg_gen);
         if (lat_t0) {
             lat_tp1 = bw_lat_now();
             lat_res = s_present_mode ? fl_pres : 2;
@@ -8146,63 +7988,74 @@ static void bw_flip_body(void)
                 lat_present_stats(lat_k);
         }
         if (fl_t0)
-            bw_fl_event(BW_FL_N_FLIP, bw_fl_us_since(fl_t0), s_present_mode ? (unsigned)fl_pres : 2u, s_gen);
+            bw_fl_event(BW_FL_N_FLIP, bw_fl_us_since(fl_t0), s_present_mode ? (unsigned)fl_pres : 2u, bwg_gen);
         if (trc_on()) {
-            double tp = qpc_ms();
+            double tp = bwg_qpc_ms();
             s_trc_pres += tp - t0;
             if (readback_wanted())
                 s_trc_rb -= tp;         /* the readback's time is added below */
         }
         if (s_stats > 0) {
-            t1 = qpc_ms();
+            t1 = bwg_qpc_ms();
             s_st_pres_ms += t1 - t0;
             if (t1 - t0 > s_st_pres_max) s_st_pres_max = t1 - t0;
         }
         if (readback_wanted()) {
-            readback(s_cur);
+            s_gfxcap_rb_rows = 0;
+            readback(bwg_cur);
+            if (g_bw_gfxcap && s_gfxcap_rb_rows)    /* BW_GFXCAP: the flipped surface's hash */
+                bw_gfxcap_flip(bwg_gen, s_gfxcap_rb_va, s_gfxcap_rb_pitch, s_gfxcap_rb_row,
+                               s_gfxcap_rb_rows, bwg_cur->bpp);
             if (trc_on())
-                s_trc_rb += qpc_ms();
+                s_trc_rb += bwg_qpc_ms();
         } else
-            s_cur->dirty = 0;
+            bwg_cur->dirty = 0;
+        if (g_bw_gfxcls) bw_gfxcls_flip(s_ctx, gfxcls_tex(shown), bwg_gen);     /* BW_GFXCAP_CLASSES (test aid) */
+        if (bw_edgeprobe_on()) {        /* BW_GPU_EDGEPROBE (test aid): after the readback, and its measure */
+            bw_edgeprobe_at(BW_EP_END, s_ctx, shown->mtex ? (void *)shown->mtex : (void *)shown->tex, bwg_gen);
+            bw_edgeprobe_flip_end(s_ctx, shown->mtex, shown->tex,
+                                  s_rb_tex && s_rb_w == shown->w && s_rb_h == shown->h ? (void *)s_rb_tex : NULL,
+                                  bwg_gen);
+        }
         if (s_stats > 0) {
-            double t2 = qpc_ms();
+            double t2 = bwg_qpc_ms();
             s_st_rb_ms += t2 - t1;
             if (t2 - t1 > s_st_rb_max) s_st_rb_max = t2 - t1;
         }
         if (lat_t0)
             lat_trb = bw_lat_now();
         lat_flip();                      /* P2b: GPU frames in flight (BW_GPU_LATENCY) */
-        g_bw_last_flip_waited = s_flip_waited;   /* lat-q: BW_HIFPS_JIT=2 */
+        g_bw_last_flip_waited = bwg_flip_waited;   /* lat-q: BW_HIFPS_JIT=2 */
         ws_dump(shown);                 /* widescreen: the wide picture, when dumping */
-        black_watch(s_cur);
-        peek_write(s_cur);
-        flash_watch(s_cur);
+        black_watch(bwg_cur);
+        peek_write(bwg_cur);
+        flash_watch(bwg_cur);
         {
             /* item 38: the latest binding's pitch, the one readback wrote
              * the rows at (the creation pitch can be the AA surface's) */
-            uint32_t pitch = s_cur->cur_pitch ? s_cur->cur_pitch : s_cur->pitch;
-            xbox_FramebufferWindowSet(s_cur->va, pitch);
-            xbox_FramebufferWindowPresent(s_cur->va, pitch);
+            uint32_t pitch = bwg_cur->cur_pitch ? bwg_cur->cur_pitch : bwg_cur->pitch;
+            xbox_FramebufferWindowSet(bwg_cur->va, pitch);
+            xbox_FramebufferWindowPresent(bwg_cur->va, pitch);
         }
     }
-    if (s_ws_k > 1.0f)
-        ws_frame_end();
+    if (bwg_ws_k > 1.0f)
+        bwg_ws_frame_end();
     /* T1: finish the restored textures the worker has ready, within the
      * per-frame budget (never a stalled frame); the next draws use them */
     {
-        double tq = trc_on() ? qpc_ms() : 0.0;
-        if (bw_vfx_active() && bw_vfx()->tex_restore && bw_tr_pump(s_dev, s_ctx) && s_cur)
-            bind_targets(s_cur, s_cur_depth);
+        double tq = trc_on() ? bwg_qpc_ms() : 0.0;
+        if (bw_vfx_active() && bw_vfx()->tex_restore && bw_tr_pump(s_dev, s_ctx) && bwg_cur)
+            bind_targets(bwg_cur, bwg_cur_depth);
         if (trc_on()) {                 /* T1 test aid: this frame's breakdown, if it was slow */
             static double last_end;
-            double now = qpc_ms(), ft = last_end ? now - last_end : 0.0;
+            double now = bwg_qpc_ms(), ft = last_end ? now - last_end : 0.0;
             s_trc_pump += now - tq;
             if (ft > s_trc_on)
                 fprintf(stderr, "[TR-TRACE] f%u %.1f ms: prepare %.1f (shaders %.1f for %u compiles,"
                                 " restore step %.1f, constants map %.1f), draws %.1f (%u), uploads %.1f (%u),"
                                 " present %.1f, readback %.1f, restore finish %.1f, other %.1f;"
                                 " %u restored chains drawn for the first time, %u requested (%.2f ms)\n",
-                        s_gen, ft, s_trc_prep, s_trc_sh, s_trc_nsh, s_trc_trs, s_trc_map, s_trc_draw,
+                        bwg_gen, ft, s_trc_prep, s_trc_sh, s_trc_nsh, s_trc_trs, s_trc_map, s_trc_draw,
                         s_trc_ndraw, s_trc_up, s_trc_nup, s_trc_pres,
                         s_trc_rb, s_trc_pump, ft - s_trc_prep - s_trc_draw - s_trc_pres - s_trc_rb - s_trc_pump,
                         s_trc_first, s_trc_req, s_trc_reqt);
@@ -8210,11 +8063,16 @@ static void bw_flip_body(void)
             s_trc_prep = s_trc_draw = s_trc_up = s_trc_pump = s_trc_pres = s_trc_rb = 0.0;
             s_trc_sh = s_trc_trs = s_trc_map = 0.0;
             s_trc_ndraw = s_trc_nup = s_trc_first = s_trc_req = s_trc_nsh = 0;
-            last_end = qpc_ms();
+            last_end = bwg_qpc_ms();
         }
     }
-    s_gen++;
-    bw_ab_frame(s_gen);              /* BW_GPU_AB: the next frame's parity */
+    bwg_fb_flip();                      /* I5 (BW_GPU_FEEDBACK): its summary line, when set */
+    rb_ring_line();                     /* I2 (BW_GPU_RBRING): its line, when set */
+    sh_line();                          /* I3 (BW_GPU_DELTA): its line, when set */
+    if (g_bw_gfxcap)
+        bw_gfxcap_flip_end(bwg_gen);    /* BW_GFXCAP step B: a mid-scene open is decided here */
+    bwg_gen++;
+    bw_ab_frame(bwg_gen);              /* BW_GPU_AB: the next frame's parity */
     if (lat_t0)
         bw_lat_ev(BW_LAT_FLIP, lat_t0, lat_k, lat_res, lat_tp, lat_tp1, lat_trb, bw_lat_now(), 0.0, 0.0);
 }
@@ -8236,14 +8094,232 @@ static void bw_draw_m(const Nv2aSurface *s, const Nv2aBatch *b)
     draw_cpu_end(c0);
 }
 
+/* ---- BW_GFXCAP step B (lane gfx-capab): this back end's side of a capture
+ * opened mid-scene (bw_gfxcap.h, docs/gfx/capture.md section 5). A test aid:
+ * bw_gfxcap.c calls these only while recording or replaying a capture.
+ *  - live, at the end of the flip before the open: every surface read back
+ *    as the GPU holds it, with its table entry, into the capture; then the
+ *    texture cache dropped, so every texture is read again as the replay will;
+ *  - replay: the frame number, and each surface made again from the capture
+ *    in its table slot, as the live table held it.
+ * Two halves, so they can move apart: the table's (an entry to and from the
+ * capture's record, the texture cache dropped, the frame number), which goes
+ * with the surface table and the texture cache into the API-neutral core; and
+ * the API's (a texture's bytes read, a texture made from bytes), which every
+ * back end has its own of. Original's surfaces are exact this way;
+ * Remastered's multisampled targets are carried as their resolved copy and
+ * made again from it (exact in mission 1, whose frames draw them anew), see
+ * docs/gfx/lanes/capab.md. */
+
+/* -- the table's half -- */
+static void gc_rec_from_entry(const BwSurf *s, uint32_t slot, BwGcSurf *g)
+{
+    memset(g, 0, sizeof *g);
+    g->va = s->va; g->pitch = s->pitch; g->bpp = s->bpp; g->w = s->w; g->h = s->h;
+    g->cur_pitch = s->cur_pitch; g->clamped = (uint32_t)s->clamped; g->dirty = (uint32_t)s->dirty;
+    g->pw = s->pw; g->ph = s->ph; g->aa_x = s->aa_x; g->aa_y = s->aa_y;
+    memcpy(&g->wsk_bits, &s->wsk, 4);
+    g->aa_sx = s->aa_sx; g->used_gen = s->used_gen; g->slot = slot;
+    g->fail_gen = s->fail_gen; g->noaa_epoch = s->noaa_epoch;
+}
+
+/* The entry in slot g->slot, emptied and filled from the record (the
+ * table grows to it); NULL when the slot is out of range. */
+static BwSurf *gc_entry_from_rec(const BwGcSurf *g)
+{
+    BwSurf *s;
+    if (g->slot >= BWG_MAX_SURF)
+        return NULL;
+    s = bwg_surf_slot_at((int)g->slot);     /* the core's table, grown to the slot with zeroed entries */
+    release_surf(s);
+    memset(s, 0, sizeof *s);
+    s->va = g->va; s->pitch = g->pitch; s->bpp = g->bpp; s->w = g->w; s->h = g->h;
+    s->cur_pitch = g->cur_pitch; s->clamped = (int)g->clamped; s->dirty = (int)g->dirty;
+    s->pw = g->pw; s->ph = g->ph; s->aa_x = g->aa_x; s->aa_y = g->aa_y;
+    memcpy(&s->wsk, &g->wsk_bits, 4);
+    s->aa_sx = (uint8_t)g->aa_sx; s->used_gen = g->used_gen;
+    s->fail_gen = g->fail_gen; s->noaa_epoch = g->noaa_epoch;
+    s->epoch = bw_vfx_epoch();
+    return s;
+}
+
+static void gc_drop_textures(void)
+{
+    bwg_tex_drop_all();                 /* the core's cache: its views, and any restored chain, released */
+}
+
+static void gc_set_gen(uint32_t gen)
+{
+    bwg_gen = gen;
+    bw_ab_frame(bwg_gen);               /* BW_GPU_AB: this frame's parity */
+}
+
+/* -- D3D11's half -- */
+/* A surface's texture read back (as the GPU holds it) into the capture. */
+static void gc_tex_read(ID3D11Texture2D *t, BwGcSurf *g)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *stg = NULL;
+    uint32_t bpp;
+    ID3D11Texture2D_GetDesc(t, &td);
+    bpp = (td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT || td.Format == DXGI_FORMAT_R16G16B16A16_UNORM) ? 8u
+        : td.Format == DXGI_FORMAT_B5G6R5_UNORM ? 2u : 4u;     /* the formats surfaces are made in */
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &stg)))
+        return;
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)stg, (ID3D11Resource *)t);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)stg, 0, D3D11_MAP_READ, 0, &m))) {
+        g->pw = td.Width; g->ph = td.Height;
+        g->fmt = (uint32_t)td.Format;
+        g->row_bytes = td.Width * bpp;
+        bw_gfxcap_surface(g, (const uint8_t *)m.pData, m.RowPitch);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)stg, 0);
+    }
+    ID3D11Texture2D_Release(stg);
+}
+
+/* A surface's texture and views made from the capture's bytes. */
+static int gc_tex_make(BwSurf *s, const BwGcSurf *g, const uint8_t *bytes)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA init;
+    memset(&td, 0, sizeof td);
+    td.Width = g->pw; td.Height = g->ph; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = (DXGI_FORMAT)g->fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    init.pSysMem = bytes;
+    init.SysMemPitch = g->row_bytes;
+    init.SysMemSlicePitch = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, &init, &s->tex))) {
+        s->tex = NULL;
+        return 0;
+    }
+    if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s->tex, NULL, &s->rtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s->tex, NULL, &s->srv))) {
+        release_surf(s);
+        return 0;
+    }
+    if (g->msaa > 1) {
+        /* VFX (D9): the live surface had an MSAA target. Its samples aren't
+         * carried; it is made again and filled from the resolved copy, every
+         * sample the same (create_surf_vfx seeds it the same way) */
+        td.SampleDesc.Count = g->msaa;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s->mtex))
+                && SUCCEEDED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s->mtex, NULL, &s->mrtv))) {
+            bw_vfx_blit(s->srv, s->pw, s->ph, s->mrtv, s->pw, s->ph, 0);
+            s->mdirty = 1;
+        } else {
+            if (s->mrtv) ID3D11RenderTargetView_Release(s->mrtv);
+            if (s->mtex) ID3D11Texture2D_Release(s->mtex);
+            s->mrtv = NULL;
+            s->mtex = NULL;
+        }
+    }
+    return 1;
+}
+
+/* -- the interface bw_gfxcap.c calls (BwGfxcapBackend) -- */
+static void gc_open_live(void)
+{
+    int i;
+    for (i = 0; s_dev && i < bwg_surf_count(); i++) {
+        BwSurf *si = bwg_surf_at(i);    /* the core's table */
+        BwGcSurf g;
+        if (!si->tex)
+            continue;
+        surf_resolve(si);               /* VFX (D9): no-op in Original */
+        gc_rec_from_entry(si, (uint32_t)i, &g);
+        if (si->mtex) {                 /* VFX (D9): its MSAA target's sample count */
+            D3D11_TEXTURE2D_DESC md;
+            ID3D11Texture2D_GetDesc(si->mtex, &md);
+            g.msaa = md.SampleDesc.Count;
+        }
+        gc_tex_read(si->tex, &g);
+    }
+    gc_drop_textures();
+}
+
+static int gc_surface(const BwGcSurf *g, const uint8_t *bytes)
+{
+    BwSurf *s;
+    if (!ensure_device() || !g->pw || !g->ph || !(s = gc_entry_from_rec(g)))
+        return 0;
+    return gc_tex_make(s, g, bytes);
+}
+
+static const BwGfxcapBackend s_gcb = { gc_open_live, gc_drop_textures, gc_set_gen, gc_surface };
+
 static const Nv2aBackend s_backend = { bw_clear_m, bw_draw_m, bw_flip };
+
+/* The core's surfaces and depth buffers call these for their objects. */
+static const BwgSurfOps s_surf_ops = { release_surf, create_surf, vfx_surf_forget, release_depth, create_depth };
+/* I5 (BW_GPU_FEEDBACK=copy, lane gfx-ideas): the bound target as it is now,
+ * for a draw that samples it. With MSAA its samples are resolved into s->tex,
+ * which isn't the bound target (s->mtex is), so the draw samples s itself;
+ * otherwise a copy of s->tex, sampled through a record that differs from s
+ * only in its view. Unset, nothing calls this. */
+static BwSurf s_fb_surf;
+static ID3D11Texture2D *s_fb_tex;
+static ID3D11ShaderResourceView *s_fb_srv;
+static D3D11_TEXTURE2D_DESC s_fb_td;
+
+static BwSurf *tex_feedback(BwSurf *s)
+{
+    D3D11_TEXTURE2D_DESC td;
+    if (!s || !s->tex || !s->srv)
+        return NULL;
+    if (s->mtex) {
+        surf_resolve(s);
+        return s;
+    }
+    ID3D11Texture2D_GetDesc(s->tex, &td);
+    if (!s_fb_tex || memcmp(&td, &s_fb_td, sizeof td)) {
+        D3D11_TEXTURE2D_DESC cd = td;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+        if (s_fb_srv) ID3D11ShaderResourceView_Release(s_fb_srv);
+        if (s_fb_tex) ID3D11Texture2D_Release(s_fb_tex);
+        s_fb_srv = NULL;
+        s_fb_tex = NULL;
+        cd.Usage = D3D11_USAGE_DEFAULT;
+        cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        cd.CPUAccessFlags = 0;
+        cd.MiscFlags = 0;
+        ID3D11ShaderResourceView_GetDesc(s->srv, &sd);
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &cd, NULL, &s_fb_tex))
+                || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_fb_tex, &sd, &s_fb_srv))) {
+            if (s_fb_tex) ID3D11Texture2D_Release(s_fb_tex);
+            s_fb_tex = NULL;
+            s_fb_srv = NULL;
+            return NULL;
+        }
+        s_fb_td = td;
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_fb_tex, (ID3D11Resource *)s->tex);
+    s_fb_surf = *s;
+    s_fb_surf.srv = s_fb_srv;
+    return &s_fb_surf;
+}
+
+/* ... and the core's texture cache these. */
+static const BwgTexOps s_tex_ops = { tex_release, tex_create, tex_deblock, surf_resolve, tex_feedback };
 
 void bw_d3d11_register(void)
 {
     const char *e = getenv("BW_GPU");
     if (!e || strcmp(e, "d3d11"))
         return;
+    bwg_surf_set_ops(&s_surf_ops);
+    bwg_tex_set_ops(&s_tex_ops);
     nv2a_backend_register(&s_backend);
+    if (g_bw_gfxcap)
+        bw_gfxcap_backend(&s_gcb);      /* BW_GFXCAP step B: the mid-scene open */
     {
         const char *rc = getenv("BW_GPU_RC");
         if (!(rc && rc[0] == '0'))
