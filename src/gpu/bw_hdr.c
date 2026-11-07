@@ -464,7 +464,7 @@ static HMONITOR s_mon;
 static UINT s_w, s_h;
 static DXGI_FORMAT s_fmt;               /* the swap chain's back buffer now */
 static int s_scrgb;                     /* its colour space is scRGB (G10, P709) */
-static int s_remake;
+static int s_recreate;
 
 static CRITICAL_SECTION s_cs;
 static HANDLE s_wake, s_thread;
@@ -671,17 +671,17 @@ void bw_hdr_follow(UINT w, UINT h)
             log_screen(&s_pr);
         want = (s_pr.s.hdr == 1 && !env_off()) ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
         if (want != s_fmt) {
-            s_remake = 1;
+            s_recreate = 1;
             fprintf(stderr, "[HDR] the screen %s HDR mode: the swap chain is made again (%s)\n",
                     s_pr.s.hdr == 1 ? "entered" : "left", want == DXGI_FORMAT_R16G16B16A16_FLOAT ? "scRGB" : "8-bit");
         }
     }
 }
 
-int bw_hdr_remake(void)
+int bw_hdr_recreate(void)
 {
-    int r = s_remake;
-    s_remake = 0;
+    int r = s_recreate;
+    s_recreate = 0;
     return r;
 }
 

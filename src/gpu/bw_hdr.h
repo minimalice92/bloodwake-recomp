@@ -57,7 +57,7 @@ int bw_hdr_swap_created(IDXGISwapChain1 *swap);
 void bw_hdr_follow(UINT w, UINT h);
 /* swap_ensure: 1 once when the screen entered or left HDR mode and the swap
  * chain should be made again (logged). */
-int bw_hdr_remake(void);
+int bw_hdr_recreate(void);
 /* The swap chain is scRGB and the screen is in HDR mode now. */
 int bw_hdr_scrgb(void);
 const BwHdrScreen *bw_hdr_screen(void);

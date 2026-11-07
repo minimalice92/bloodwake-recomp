@@ -141,6 +141,9 @@ Still stuck? Open an issue: say what you did, what you saw, and your Windows ver
 ### How it works
 The Xbox runs a PC-style x86 processor, so its program can be translated instead of emulated. The [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit turns every function of the game into C, and Microsoft's compiler builds that into a Windows program. The toolkit's runtime stands in for the Xbox's system, memory, sound chip and controllers, and this port's Direct3D 11 back end turns the game's own graphics commands into work for your graphics card.
 
+### Ports
+This project is Windows-only, and ports to other systems are their own projects. There's a community port to Apple Silicon Macs: [BloodWake-AppleSilicon](https://github.com/Tzeentchnet/BloodWake-AppleSilicon), with its own Metal renderer. Notes for anyone porting are in [CONTRIBUTING](CONTRIBUTING.md#forks-and-ports).
+
 ### Made with AI
 The engineering was done by Claude, Anthropic's AI model: a lead session plus **80+ AI agents** working in batches (naming, file formats, stability, fidelity checks, the remaster, the installer). Each batch had a written brief and a written report, and the lead reviewed and re-verified it before merging. The maintainer set the direction, made the calls and played the game.
 

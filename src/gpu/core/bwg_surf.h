@@ -3,7 +3,7 @@
  * buffers by address (bwg_surf.c), lifted verbatim from bw_d3d11.c (lane
  * gfx-core, gate GC): their logical and physical sizes, AA factors,
  * render-scale epochs, the slot tables and their reuse (item 37), the
- * remakes (items 36, 38, 39) and the seed's guest memory (item 38).
+ * recreates (items 36, 38, 39) and the seed's guest memory (item 38).
  *
  * The back end makes and releases the API objects (BwgSurfOps); the core
  * decides when, and holds them in each record without looking inside: it

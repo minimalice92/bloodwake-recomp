@@ -6369,7 +6369,7 @@ static int swap_ensure(void)
                                 " the panel's own pixels\n", dpi, (dpi * 100 + 48) / 96);
         }
         bw_fb_external_present(1);
-    } else if (bw_hdr_remake()) {
+    } else if (bw_hdr_recreate()) {
         /* 0.2.5 item 97: the screen entered or left HDR mode (bw_hdr.c,
          * logged there): the swap chain is made again in the format that
          * suits it, as the resize-failure path does below. Nothing may hold
