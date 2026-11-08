@@ -1,7 +1,7 @@
 {
  "format": 1,
  "game": "Blood Wake",
- "made": "2026-11-05",
+ "made": "2026-11-07",
  "toolkit_commit": "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b",
  "python": "3.13.15",
  "capstone": "5.0.9",
@@ -9,32 +9,32 @@
  "names": "none: functions keep their sub_ names (names/bw_names.json is not public)",
  "runs": [
   {
-   "seconds": 550,
-   "pipeline_seconds": 550,
-   "total_sha256": "720f81a60961f5bc24ac49861bf9d551e35bd4cbe837343fe270f5d4b7c9a50a"
+   "seconds": 546,
+   "pipeline_seconds": 546,
+   "total_sha256": "cd866a5c8db1696ccefab09aa2df86d1a2032aac123d6654b12a40d2619ea20c"
   },
   {
-   "seconds": 551,
-   "pipeline_seconds": 550,
-   "total_sha256": "720f81a60961f5bc24ac49861bf9d551e35bd4cbe837343fe270f5d4b7c9a50a"
+   "seconds": 548,
+   "pipeline_seconds": 548,
+   "total_sha256": "cd866a5c8db1696ccefab09aa2df86d1a2032aac123d6654b12a40d2619ea20c"
   }
  ],
  "inputs": {
   "tools/run_pipeline.py": "7a822ff9361f64833e61ddaee547da07ca4a8e4b141f9fe6a822a2a7b2b79358",
-  "tools/xbr_patches.py": "8395b61776f84ea2500d7317a890dff1d5d1c1b693a5e5501d45a77b872162f3",
+  "tools/xbr_patches.py": "1dce4487a10603aeab7f19b2770e06e209839ab3f368ff1ca5cf2518738edd54",
   "names/icall_seeds.json": "fdcefa05897c424a4587d8c4ce6d85019df5acb71a77361dd37d21ebf079eaf6",
   "src/recomp_manual.c": "7b242284296a5be494addcbb279c6c81c84f1eb4e25ac658e23e359e72e5cb4b",
   "src/bw_audio_hooks.c": "dfc39cbea4c411ddad491edb3f7e876afdb6ab6447a7be77b41bbf19ca1bedd6",
   "src/bw_cheat_hooks.c": "fdffe54b13973ddff6c6ba9839b9835f10ff5f675363d5f5020831761a722c3f",
   "src/bw_fix_hooks.c": "dd5cea23d69e1b9e65a6bec762f458064a065b2a64fd5dcf569a876d51435c16",
-  "src/bw_hifps_hooks.c": "47a39836e60b24afa279552dd279bca52b4ae8c27d03524ef731ee35dce2303a",
-  "src/bw_menu_hooks.c": "ad474e06fd7d25003fbd8f2318448c8204ecc5745059a2d3076fdbd6342c577a",
+  "src/bw_hifps_hooks.c": "4b43dc32bdf2dbe297910555260e109fcdceb0b297a0c719eef9bfd4d2159a3f",
+  "src/bw_menu_hooks.c": "3ea542fc4d0a8d5001beb5711677dfc7713517ba49179928ace286f06f018eb4",
   "src/bw_remaster_hooks.c": "0c6c7876c502765eed09098f9ef3fe621b38dc2e4869d837958e9fca11eb15ad",
-  "src/bw_visextra_hooks.c": "d4d0f9b4240f8adc039d94668480417b04afac8421d2bd500a86a864f27a211d"
+  "src/bw_visextra_hooks.c": "367f455f17ed868a99e9690266e45a848f72c4722a379ce0560aac6c0eb7b66c"
  },
  "file_count": 37,
- "total_bytes": 33267007,
- "total_sha256": "720f81a60961f5bc24ac49861bf9d551e35bd4cbe837343fe270f5d4b7c9a50a",
+ "total_bytes": 33267182,
+ "total_sha256": "cd866a5c8db1696ccefab09aa2df86d1a2032aac123d6654b12a40d2619ea20c",
  "files": {
   "recomp_0000.c": {
    "size": 1005003,
@@ -181,8 +181,8 @@
    "sha256": "0ceef6d52bdea2ac14f21208ac9d2f703cd3d32f52b8f685462a3e385669dbaa"
   },
   "recomp_types.h": {
-   "size": 76308,
-   "sha256": "a14e666bb81bbb3c77d0f337e8c0e1bf3ba625d4483ea87b79603cca3a9991ef"
+   "size": 76483,
+   "sha256": "c568af1bf9e9c66760e1a7fbf25334177d55cc613dd5ea7de13b9a126e7917e2"
   }
  },
  "manual_scan": {

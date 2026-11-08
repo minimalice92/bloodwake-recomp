@@ -4504,6 +4504,165 @@ static int ors_prepare(BwDepth *d)
     return 1;
 }
 
+/* BW_GPU_TEST_EYE=1 (test aid, lane gfx-rtwater S0: HIFPS_EYE's effect
+ * measured on recorded frames, docs/gfx/lanes/rtwater.md). For each vertex
+ * program that reads an eye constant, c[146] (the world eye) or c[156] (the
+ * eye in the mesh's own space), that constant's x, y and z are replaced by the
+ * camera centre of the matrix the program's oPos is made with: the constant
+ * rows of the dp4s writing oPos.x, .y, .z and .w, M; the centre is
+ * inverse(M) (0, 0, 1, 0) divided by its w (clip x = y = w = 0). On recorded
+ * high-frame-rate frames that is the drawn camera, which HIFPS_EYE gives the
+ * game live; on Original frames it is c[146] to rounding. Off by default;
+ * replays and live runs alike, any edition. */
+static unsigned long s_st_eyetest, s_st_eyetest_miss;
+
+static void eye_test_summary(void)
+{
+    fprintf(stderr, "[GPU-D3D11] test aid BW_GPU_TEST_EYE: %lu draws' eye constants replaced, %lu left"
+                    " (no oPos matrix found)%c", s_st_eyetest, s_st_eyetest_miss, 10);
+}
+
+/* BW_GPU_TEST_EYE=2: the same centre, compared and not replaced: a line a
+ * second with how many eye constants were more than 1 mm from their draw's
+ * camera, and the largest distance, per register (HIFPS_EYE's live check). */
+static int eye_test_on(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("BW_GPU_TEST_EYE");
+        v = (e && (e[0] == '1' || e[0] == '2')) ? e[0] - '0' : 0;
+        if (v == 1) {
+            fprintf(stderr, "[GPU-D3D11] test aid: eye constants c[146]/c[156] from each draw's own"
+                            " oPos matrix (BW_GPU_TEST_EYE=1)%c", 10);
+            atexit(eye_test_summary);
+        } else if (v == 2)
+            fprintf(stderr, "[GPU-D3D11] test aid: eye constants c[146]/c[156] checked against each"
+                            " draw's own oPos matrix (BW_GPU_TEST_EYE=2)%c", 10);
+    }
+    return v;
+}
+
+static unsigned long s_ec_n[2], s_ec_far[2];
+static double s_ec_max[2];
+
+static void eye_check(int which, const float *have, const double *want)
+{
+    static ULONGLONG last;
+    ULONGLONG now = GetTickCount64();
+    double dx = have[0] - want[0], dy = have[1] - want[1], dz = have[2] - want[2];
+    double d = sqrt(dx * dx + dy * dy + dz * dz);
+    s_ec_n[which]++;
+    if (d > 1e-3)
+        s_ec_far[which]++;
+    if (d > s_ec_max[which])
+        s_ec_max[which] = d;
+    if (!last)
+        last = now;
+    if (now - last >= 1000) {
+        fprintf(stderr, "[GPU-D3D11] eye check: c[146] %lu draws, %lu over 1 mm from the drawn camera, max %.4f m;"
+                        " c[156] %lu draws, %lu over 1 mm, max %.4f m%c", s_ec_n[0], s_ec_far[0], s_ec_max[0],
+                s_ec_n[1], s_ec_far[1], s_ec_max[1], 10);
+        s_ec_n[0] = s_ec_n[1] = s_ec_far[0] = s_ec_far[1] = 0;
+        s_ec_max[0] = s_ec_max[1] = 0.0;
+        last = now;
+    }
+}
+
+static int inv4d(const double m[16], double o[16])
+{
+    double a[4][8];
+    int i, j, k, p;
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 8; j++)
+            a[i][j] = j < 4 ? m[4 * i + j] : (j - 4 == i);
+    for (k = 0; k < 4; k++) {
+        p = k;
+        for (i = k + 1; i < 4; i++)
+            if (fabs(a[i][k]) > fabs(a[p][k]))
+                p = i;
+        if (!(fabs(a[p][k]) > 1e-30))
+            return 0;
+        if (p != k)
+            for (j = 0; j < 8; j++) {
+                double t = a[k][j];
+                a[k][j] = a[p][j];
+                a[p][j] = t;
+            }
+        for (j = 7; j >= k; j--)
+            a[k][j] /= a[k][k];
+        for (i = 0; i < 4; i++)
+            if (i != k)
+                for (j = 7; j >= k; j--)
+                    a[i][j] -= a[i][k] * a[k][j];
+    }
+    for (i = 0; i < 4; i++)
+        for (j = 0; j < 4; j++)
+            o[4 * i + j] = a[i][j + 4];
+    return 1;
+}
+
+static void eye_test(const BwXVsBatch *b, float k[192][4])
+{
+    int rows[4] = { -1, -1, -1, -1 }, eye = -1;
+    uint32_t i;
+    double M[16], I[16], c[4];
+    if (!b->program || !b->ninstr)
+        return;
+    for (i = 0; i < b->ninstr && i < 136; i++) {
+        const uint32_t *w = b->program[i];
+        uint32_t mac = (w[1] >> 21) & 15, ilu = (w[1] >> 25) & 7;
+        uint32_t ma = (w[2] >> 26) & 3, mb = (w[2] >> 11) & 3, mc = (w[3] >> 28) & 3;
+        uint32_t ci = (w[1] >> 13) & 0xFF, rel = (w[3] >> 1) & 1;
+        int reads_c = (mac && ma == 3) || ((mac == 2 || (mac >= 4 && mac <= 12)) && mb == 3)
+                      || ((mac == 3 || mac == 4 || ilu) && mc == 3);
+        if (reads_c && !rel && (ci == 146 || ci == 156))
+            eye = (int)ci;
+        if (mac == 7 && !rel && (ma == 3 || mb == 3)) {         /* dp4 with a constant */
+            uint32_t omask = (w[3] >> 12) & 15, to_o = (w[3] >> 11) & 1, oaddr = (w[3] >> 3) & 0xFF;
+            uint32_t o_ilu = (w[3] >> 2) & 1, tdst = (w[3] >> 20) & 15, macm = (w[3] >> 24) & 15;
+            uint32_t m = 0;
+            if (omask && !o_ilu && to_o && oaddr == 0)
+                m = omask;
+            else if (macm && tdst == 12)
+                m = macm;
+            if (m == 8) rows[0] = (int)ci;
+            else if (m == 4) rows[1] = (int)ci;
+            else if (m == 2) rows[2] = (int)ci;
+            else if (m == 1) rows[3] = (int)ci;
+        }
+        if (w[3] & 1)
+            break;
+    }
+    if (eye < 0)
+        return;
+    if (rows[0] < 0 || rows[1] < 0 || rows[2] < 0 || rows[3] < 0) {
+        s_st_eyetest_miss++;
+        return;
+    }
+    for (i = 0; i < 16; i++)
+        M[i] = k[rows[i / 4]][i % 4];
+    if (!inv4d(M, I)) {
+        s_st_eyetest_miss++;
+        return;
+    }
+    for (i = 0; i < 4; i++)
+        c[i] = I[4 * i + 2];                        /* inverse(M) (0, 0, 1, 0) */
+    if (!(fabs(c[3]) > 1e-30)) {
+        s_st_eyetest_miss++;
+        return;
+    }
+    for (i = 0; i < 3; i++)
+        c[i] /= c[3];
+    if (eye_test_on() == 2) {
+        eye_check(eye == 156, k[eye], c);
+        return;
+    }
+    k[eye][0] = (float)c[0];
+    k[eye][1] = (float)c[1];
+    k[eye][2] = (float)c[2];
+    s_st_eyetest++;
+}
+
 static int bw_xdraw_vsh(const Nv2aSurface *s, const BwXVsBatch *b)
 {
     BwVsh *v;
@@ -4583,13 +4742,15 @@ static int bw_xdraw_vsh(const Nv2aSurface *s, const BwXVsBatch *b)
             const char *e = getenv("BW_GPU_KGEN");
             kgen_on = !(e && e[0] == '0');
         }
-        if (kgen_on && s_kvalid && kgen_ok && b->consts_gen == kgen
+        if (kgen_on && s_kvalid && kgen_ok && b->consts_gen == kgen && !eye_test_on()
                 && !memcmp(vsinfo, s_kshadow.vsinfo, sizeof vsinfo)
                 && !memcmp(foginfo, s_kshadow.foginfo, sizeof foginfo)) {
             s_st_kskip++;
             goto bw_kdone;
         }
         memcpy(k.k, b->consts, sizeof k.k);
+        if (eye_test_on())
+            eye_test(b, k.k);               /* BW_GPU_TEST_EYE (test aid, below) */
         memcpy(k.vsinfo, vsinfo, sizeof vsinfo);
         memcpy(k.foginfo, foginfo, sizeof foginfo);
         kgen_ok = 0;
@@ -4992,6 +5153,82 @@ static int ffp_upload(ID3D11Buffer *buf, void *shadow, int *ok, const void *data
     return 1;
 }
 
+/* BW_GPU_TEST_EYE=2, the sky: a fixed-function draw without a depth test
+ * (Sky_Render's dome and sun) is centred on the eye's x and y by the game.
+ * The camera's centre in the draw's own space, inverse(composite) (0, 0, 1, 0)
+ * over its w, should then sit on its z axis; its distance from that axis
+ * times the draw's scale (the model-view's first column) is how far the dome
+ * is off the drawn camera, in metres, and over the dome's radius (its farthest
+ * vertex from the axis, scaled) times the focal length (the projection's y
+ * scale, logical pixels) about how far its picture moves, in pixels of the
+ * 480-line logical surface. A line a second: the largest of each. */
+static void sky_check(const BwXVsBatch *b)
+{
+    /* per kind of draw (its vertex count), the largest of each this second */
+    static struct { uint32_t nv; unsigned long n; double m, r, px; } kind[8];
+    static ULONGLONG last;
+    double C[16], I[16], MV[16], MVI[16], c[4], s, r = 0.0, f;
+    ULONGLONG now = GetTickCount64();
+    const BwXFfp *ff = b->ffp;
+    int i, j, k = ff->in[BW_FFP_POS];
+    uint32_t v;
+    if (b->xb.state && b->xb.state->depth_test_enable)
+        return;
+    for (i = 0; i < 16; i++) {
+        C[i] = ff->composite[i];
+        MV[i] = ff->modelview[i];
+    }
+    if (k < 0 || !inv4d(C, I) || !inv4d(MV, MVI))
+        return;
+    for (i = 0; i < 4; i++)
+        c[i] = I[4 * i + 2];
+    if (!(fabs(c[3]) > 1e-30))
+        return;
+    s = sqrt(MV[0] * MV[0] + MV[4] * MV[4] + MV[8] * MV[8]);
+    for (v = 0; v < b->nverts && v < 4096; v++) {
+        float p[3] = { 0, 0, 0 };
+        if (b->nstreams) {
+            const BwXVsInput *in = &b->in[k];
+            const BwXVsStream *st = &b->streams[in->stream];
+            if ((in->conv >> 4) != BW_XVS_FLOAT || (uint64_t)v * st->stride + in->offset + 12 > st->bytes)
+                break;
+            memcpy(p, (const uint8_t *)st->data + (size_t)v * st->stride + in->offset, 12);
+        } else if (b->inputs)
+            memcpy(p, b->inputs + ((size_t)v * b->ninputs + (uint32_t)k) * 4, 12);
+        else
+            break;
+        if (sqrt((double)p[0] * p[0] + (double)p[1] * p[1]) > r)
+            r = sqrt((double)p[0] * p[0] + (double)p[1] * p[1]);
+    }
+    /* the projection P = C inverse(MV); its y row's y term is the focal length */
+    f = 0.0;
+    for (j = 0; j < 4; j++)
+        f += C[4 * 1 + j] * MVI[4 * j + 1];
+    {
+        double off = sqrt(c[0] * c[0] + c[1] * c[1]) / fabs(c[3]) * s, rw = r * s;
+        double px = rw > 0 ? off / rw * fabs(f) : 0.0;
+        for (i = 0; i < 8; i++)
+            if (kind[i].nv == b->nverts || !kind[i].n) {
+                kind[i].nv = b->nverts;
+                kind[i].n++;
+                if (off > kind[i].m) kind[i].m = off;
+                if (rw > kind[i].r) kind[i].r = rw;
+                if (px > kind[i].px) kind[i].px = px;
+                break;
+            }
+    }
+    if (!last)
+        last = now;
+    if (now - last >= 1000) {
+        for (i = 0; i < 8 && kind[i].n; i++)
+            fprintf(stderr, "[GPU-D3D11] sky check: %lu draws of %u vertices without a depth test: the camera"
+                            " off their axis by up to %.4f m, radius %.1f m, picture moved up to %.3f logical"
+                            " pixels%c", kind[i].n, kind[i].nv, kind[i].m, kind[i].r, kind[i].px, 10);
+        memset(kind, 0, sizeof kind);
+        last = now;
+    }
+}
+
 static int bw_xdraw_ffp(const Nv2aSurface *s, const BwXVsBatch *b)
 {
     static BwVshConsts k, kshadow;
@@ -5005,6 +5242,8 @@ static int bw_xdraw_ffp(const Nv2aSurface *s, const BwXVsBatch *b)
 
     if (!ffp_on() || !gpu_vsh_on() || !b || !b->ffp || !b->nindices || !ensure_device())
         return 0;
+    if (eye_test_on() == 2)
+        sky_check(b);                       /* BW_GPU_TEST_EYE=2 (test aid) */
     if (bwg_ws_needs_positions()) {
         s_st_fdecl++;
         s_ffp_decl++;

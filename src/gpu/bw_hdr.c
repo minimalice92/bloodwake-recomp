@@ -39,6 +39,14 @@ typedef struct {
     UINT32 sig[4];              /* the target's advanced-colour state (watcher) */
     int hdr_supported;          /* DisplayConfig: the screen can do HDR (or the EDID says PQ) */
     WCHAR friendly[64], devpath[160];
+    /* a partial read of this screen held off (hold(), lane hdr-reprobe):
+     * since when (GetTickCount64; 0 none), and the partial reads so far */
+    ULONGLONG hold_t0;
+    unsigned hold_n;
+    /* a read that doesn't find the screen among DXGI's outputs: the GDI name
+     * Windows gives the monitor handle (GetMonitorInfoW), so hold() can tell
+     * the same screen missing for a moment from another one */
+    WCHAR miss_gdi[32];
 } BwHdrProbe;
 
 /* The DisplayConfig advanced-colour info: own copy of the structure; type 15
@@ -389,15 +397,112 @@ static void choose(BwHdrProbe *p)
     }
 }
 
+/* ---- lane hdr-reprobe's test aids (0.3.3; unset: no change) -----------------
+ * They change what this program believes about the screen, never Windows'
+ * HDR or display settings. For hold() below:
+ *   BW_HDR_TEST_EDID_FAIL=<s>[,<n>[,d]]  that many seconds after the first
+ *       look at the screen the watcher reads it again, and that read and the
+ *       next <n>-1 (1 if not given) come back partial the way the one seen
+ *       did: no EDID, and DXGI's figures (peak, black, full-frame,
+ *       primaries) 0 with its colour space and bits as they are, so the HDR
+ *       mode is the screen's own. With ",d" DXGI's description fails as
+ *       well (no colour space: the mode reads unknown, -1).
+ *   BW_HDR_TEST_NOT_FOUND=<s>[,<n>]  the same, but that read and the next
+ *       <n>-1 don't find the screen among DXGI's outputs at all ("not found
+ *       among the GPU outputs", -2), the way lane rtshadow3 saw one mid-run;
+ *       Windows' own view of the monitor (its handle, GDI name and
+ *       DisplayConfig path) is as it is. Ignored when BW_HDR_TEST_EDID_FAIL
+ *       is set.
+ *   BW_HDR_TEST_HOLD=<s>[,<tick s>]  how long partial reads are held off
+ *       before what is read is accepted (30 s; 0: none, each partial read is
+ *       accepted at once, as before), and the watcher's tick (2 s;
+ *       0.05 to 2), so a short replay can show the retries, the recovery
+ *       and the give-up. */
+static ULONGLONG s_hold_ms = 30000, s_tick_ms = 2000;  /* hold()'s window; the watcher's tick */
+static int s_f_n, s_f_armed;            /* BW_HDR_TEST_EDID_FAIL: the reads made partial (0: no aid) */
+static int s_f_desc;                    /* ...and DXGI's description fails in them (",d") */
+static int s_f_miss;                    /* BW_HDR_TEST_NOT_FOUND: the screen missing from DXGI's outputs instead */
+static const char *s_f_var = "test aid BW_HDR_TEST_EDID_FAIL";
+static ULONGLONG s_f_at, s_f_t0;        /* when (ms after s_f_t0, the first look) */
+static volatile LONG s_f_left;          /* partial reads still to make */
+
+static void aids_read(void)             /* once, at the first look (before the watcher starts) */
+{
+    static int done;
+    const char *e;
+    char *end;
+    if (done)
+        return;
+    done = 1;
+    s_f_t0 = GetTickCount64();
+    if ((e = getenv("BW_HDR_TEST_EDID_FAIL")) != NULL && *e) {
+        double at = strtod(e, &end);
+        int ok = end != e, n = 1, desc = 0;
+        if (*end == ',') {
+            n = (int)strtol(end + 1, &end, 10);
+            desc = end[0] == ',' && end[1] == 'd';
+        }
+        if (ok && at >= 0.0 && n > 0) {
+            s_f_at = (ULONGLONG)(at * 1000.0);
+            s_f_n = n;
+            s_f_desc = desc;
+            fprintf(stderr, "[HDR] test aid BW_HDR_TEST_EDID_FAIL=%s: %.2f s after the first look the screen is"
+                            " read again, and %d read%s come%s back partial (no EDID, %s; Windows' settings"
+                            " untouched)\n", e, at, n, n == 1 ? "" : "s", n == 1 ? "s" : "",
+                    desc ? "DXGI's description failed" : "DXGI's figures 0");
+        }
+    } else if ((e = getenv("BW_HDR_TEST_NOT_FOUND")) != NULL && *e) {
+        double at = strtod(e, &end);
+        int ok = end != e, n = *end == ',' ? (int)strtol(end + 1, NULL, 10) : 1;
+        if (ok && at >= 0.0 && n > 0) {
+            s_f_at = (ULONGLONG)(at * 1000.0);
+            s_f_n = n;
+            s_f_miss = 1;
+            s_f_var = "test aid BW_HDR_TEST_NOT_FOUND";
+            fprintf(stderr, "[HDR] test aid BW_HDR_TEST_NOT_FOUND=%s: %.2f s after the first look the screen is"
+                            " read again, and %d read%s find%s it missing from DXGI's outputs (Windows' settings"
+                            " untouched)\n", e, at, n, n == 1 ? "" : "s", n == 1 ? "s" : "");
+        }
+    }
+    if ((e = getenv("BW_HDR_TEST_HOLD")) != NULL && *e) {
+        double w = strtod(e, &end), t = *end == ',' ? strtod(end + 1, NULL) : 0.0;
+        if (end != e && w >= 0.0)
+            s_hold_ms = (ULONGLONG)(w * 1000.0);
+        if (t > 0.0)
+            s_tick_ms = t < 0.05 ? 50 : t > 2.0 ? 2000 : (ULONGLONG)(t * 1000.0);
+        fprintf(stderr, "[HDR] test aid BW_HDR_TEST_HOLD=%s: partial reads held off for %.2f s, the watcher's"
+                        " tick %.2f s\n", e, s_hold_ms / 1000.0, s_tick_ms / 1000.0);
+    }
+}
+
+static int test_fail_read(void)         /* probe(): 1 when this read is made partial */
+{
+    return s_f_left > 0 && InterlockedDecrement(&s_f_left) >= 0;
+}
+
+static int test_fail_due(void)          /* the watcher: 1 once, at the aid's time; arms the partial reads */
+{
+    if (!s_f_n || s_f_armed || GetTickCount64() - s_f_t0 < s_f_at)
+        return 0;
+    s_f_armed = 1;
+    InterlockedExchange(&s_f_left, s_f_n);
+    fprintf(stderr, "[HDR] %s: %.2f s after the first look, the screen is read again;"
+                    " this read and the next %d come back %s\n", s_f_var,
+            (GetTickCount64() - s_f_t0) / 1000.0, s_f_n - 1, s_f_miss ? "without it" : "partial");
+    return 1;
+}
+
 /* Look at the screen `mon` now: DXGI (a fresh factory, so its outputs read
  * the screen as it is now), DisplayConfig, the EDID and the profile. */
 static void probe(HMONITOR mon, BwHdrProbe *p)
 {
     IDXGIFactory1 *fac = NULL;
     UINT a, o;
-    int found = 0;
+    int found = 0, fail;
     uint8_t edid[2048];
     DWORD el = sizeof edid;
+    aids_read();
+    fail = test_fail_read();            /* BW_HDR_TEST_EDID_FAIL: this read made partial */
     memset(p, 0, sizeof *p);
     p->mon = mon;
     p->s.hdr = -2;
@@ -415,13 +520,14 @@ static void probe(HMONITOR mon, BwHdrProbe *p)
                 DXGI_OUTPUT_DESC1 d1;
                 if (IDXGIAdapter1_EnumOutputs(ad, o, &out) != S_OK)
                     break;
-                if (SUCCEEDED(IDXGIOutput_GetDesc(out, &od)) && od.Monitor == mon) {
+                if (SUCCEEDED(IDXGIOutput_GetDesc(out, &od)) && od.Monitor == mon
+                        && !(fail && s_f_miss)) {   /* BW_HDR_TEST_NOT_FOUND: as if not listed */
                     found = 1;
                     p->s.hdr = -1;
                     memcpy(p->s.name, od.DeviceName, sizeof p->s.name);
                     p->s.name[31] = 0;
                     if (SUCCEEDED(IDXGIOutput_QueryInterface(out, &IID_IDXGIOutput6, (void **)&o6))) {
-                        if (SUCCEEDED(IDXGIOutput6_GetDesc1(o6, &d1))) {
+                        if (!(fail && s_f_desc) && SUCCEEDED(IDXGIOutput6_GetDesc1(o6, &d1))) {
                             p->dxgi_ok = 1;
                             p->s.hdr = d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
                             p->d_cs = d1.ColorSpace;
@@ -447,13 +553,205 @@ static void probe(HMONITOR mon, BwHdrProbe *p)
         find_target(p);
         if (!target_sig(p, p->sig, &p->hdr_supported))
             p->tgt_ok = p->tgt_ok ? 1 : 0;
-        if (p->devpath[0] && edid_read(p->devpath, edid, &el))
+        if (p->devpath[0] && !fail && edid_read(p->devpath, edid, &el))
             edid_parse(p, edid, el);
         if (p->edid_eotfs & 4)
             p->hdr_supported = 1;
         profile_read(p);                /* reported always; used only for what the EDID lacks */
+    } else {
+        /* Not among DXGI's outputs: who the handle is in Windows' own view, for
+         * hold()'s "same screen" only (the read stays "not found", -2): its GDI
+         * name, and DisplayConfig's device path for that name when it has one. */
+        MONITORINFOEXW mi;
+        memset(&mi, 0, sizeof mi);
+        mi.cbSize = sizeof mi;
+        if (mon && GetMonitorInfoW(mon, (MONITORINFO *)&mi) && mi.szDevice[0]) {
+            BwHdrProbe t;
+            wcsncpy(p->miss_gdi, mi.szDevice, 31);
+            p->miss_gdi[31] = 0;
+            memset(&t, 0, sizeof t);
+            memcpy(t.s.name, p->miss_gdi, sizeof t.s.name);
+            find_target(&t);
+            if (t.tgt_ok)
+                memcpy(p->devpath, t.devpath, sizeof p->devpath);
+        }
+    }
+    if (fail && p->dxgi_ok) {           /* the test aid: DXGI's figures as in the partial read seen */
+        p->d_peak = p->d_black = p->d_maxfall = 0.0f;
+        memset(p->d_prim, 0, sizeof p->d_prim);
     }
     choose(p);
+}
+
+/* ---- a partial read of the same screen (lane hdr-reprobe, 0.3.3) ---------------
+ * A look at the screen can come back partial while Windows is busy with it.
+ * Once in several hundred runs the watcher read the same screen mid-run as
+ * "EDID not readable" with DXGI's figures all 0 (seen; the screen in the
+ * middle of a change, inferred), and before 0.3.3 it published the
+ * standards' fallbacks from that read (peak 1000 "none", so reference white
+ * 203 cd/m2 instead of the screen's 254) until the screen next changed. The
+ * rule now, for every look after the first:
+ *   - a worse read of the same screen never replaces a good one's values
+ *     (peak, black, full-frame, primaries and their sources). Worse is: the
+ *     EDID or the calibration profile was read before and isn't now; or
+ *     DXGI's description fails where it read before; or DXGI reads peak 0
+ *     where it gave one before, in the same HDR mode (its figures may differ
+ *     between modes: inferred, so a mode switch is never judged by them);
+ *   - the HDR mode (the desktop's colour space) is the new read's at once
+ *     when the read gives one, and a move to another screen is never held:
+ *     neither waits on the rule. A read that gives no colour space (DXGI's
+ *     description failed, -1) isn't a mode: it is a worse read, and the last
+ *     known mode is kept with the values (a hiccup would otherwise make the
+ *     swap chain twice, a visible blink);
+ *   - the watcher reads the screen again at each tick (2 s) while a read is
+ *     held off; the first full read ends the hold and is used as before,
+ *     whether its values changed or not;
+ *   - after 30 s of worse reads, what is read is accepted, with a line.
+ * Each step is logged once: the read kept, the first retry (then a count),
+ * and the recovery or the give-up.
+ *
+ * "The same screen", from what a partial read still gives: the device path
+ * when both reads have it (DisplayConfig's monitorDevicePath: the monitor
+ * itself on its connector, the name its EDID is kept under; another screen
+ * always has another one), else the same monitor handle and the same GDI
+ * name. The handle alone isn't enough: Windows may give the same screen a
+ * new one when it re-reads the monitor, just when partial reads happen, and
+ * may hand an old one on after a change of displays (both inferred). A read
+ * that lacks the device path lacks it because DisplayConfig found no path
+ * for the GDI name, so then the handle and the name decide.
+ *
+ * A read that doesn't find the screen among DXGI's outputs at all ("not
+ * found", -2; seen once mid-run by lane rtshadow3, then "entered HDR mode"
+ * and a second swap chain at the next read) is a worse read too, under the
+ * same rule, when it is still the same screen in Windows' own view: the
+ * monitor handle's GDI name (GetMonitorInfoW) and DisplayConfig's device
+ * path for that name, taken by probe() for such a read. So the last good
+ * values and mode are kept, the screen is read again each tick, a full read
+ * ends the hold, and after the window the "not found" read is accepted (SDR,
+ * as before). A window that really left the screen goes at once: another
+ * screen has another device path, or another handle and GDI name; a handle
+ * Windows no longer knows (GetMonitorInfoW fails) gives neither, so it
+ * isn't the same screen. */
+static int same_screen(const BwHdrProbe *n, const BwHdrProbe *g)
+{
+    const WCHAR *nn = n->s.name[0] ? n->s.name : n->miss_gdi;   /* a "not found" read: Windows' GDI name */
+    if (n->devpath[0] && g->devpath[0])
+        return !wcscmp(n->devpath, g->devpath);
+    return n->mon && n->mon == g->mon && nn[0] && !wcscmp(nn, g->s.name);
+}
+
+/* What n lacks that g had, in words (empty: nothing); returns how many. */
+static int worse_read(const BwHdrProbe *n, const BwHdrProbe *g, char *why, size_t len)
+{
+    const char *w[4];
+    int k = 0, i;
+    size_t at = 0;
+    if (n->s.hdr == -2 && g->s.hdr != -2) {     /* missing from DXGI's outputs: that says it all */
+        _snprintf(why, len, "not found among the GPU outputs");
+        why[len - 1] = 0;
+        return 1;
+    }
+    if (g->edid_ok && !n->edid_ok)
+        w[k++] = "EDID not readable";
+    if (g->prof_ok && !n->prof_ok)
+        w[k++] = "calibration profile not readable";
+    if (g->dxgi_ok && !n->dxgi_ok)
+        w[k++] = "DXGI's description failed";
+    else if (g->dxgi_ok && g->d_peak > 0.0f && n->d_peak <= 0.0f && n->s.hdr == g->s.hdr)
+        w[k++] = "DXGI reads peak 0";
+    why[0] = 0;
+    for (i = 0; i < k && at + 1 < len; i++) {
+        int m = _snprintf(why + at, len - at, "%s%s", i ? "; " : "", w[i]);
+        if (m < 0)
+            break;
+        at += (size_t)m;
+    }
+    why[len - 1] = 0;
+    return k;
+}
+
+static void vals_text(char *b, size_t len, const BwHdrScreen *s)
+{
+    _snprintf(b, len, "peak %.0f cd/m2 (%s), black %.4f (%s), full-frame %.0f (%s), primaries (%s)",
+              s->peak, s->peak_src, s->black, s->black_src, s->maxfall, s->maxfall_src, s->prim_src);
+    b[len - 1] = 0;
+}
+
+static const char *mode_text(int hdr)
+{
+    return hdr == 1 ? "on" : hdr == 0 ? "off" : "unknown";
+}
+
+/* n: a fresh read of the window's screen; was: the view it would replace;
+ * cause: why the screen was read. When n is a worse read of the same screen
+ * inside the window, n becomes was's values with n's HDR mode (if it read
+ * one) and handles (returns 1); otherwise n stays as read (returns 0),
+ * ending any hold. */
+static int hold(BwHdrProbe *n, const BwHdrProbe *was, const char *cause)
+{
+    char why[160], v[200];
+    ULONGLONG now = GetTickCount64(), t0;
+    BwHdrProbe k;
+    int same = same_screen(n, was);
+    const WCHAR *nm = n->s.name[0] ? n->s.name : was->s.name;  /* a "not found" read has no DXGI name */
+    if (!same || !worse_read(n, was, why, sizeof why)) {
+        if (was->hold_t0 && !same)
+            fprintf(stderr, "[HDR] screen %ls: the window's screen is now %ls, read at once; the values kept for"
+                            " %ls end after %u partial read%s in %.1f s\n", was->s.name,
+                    n->s.name[0] ? n->s.name : L"(not found among the GPU outputs)", was->s.name, was->hold_n,
+                    was->hold_n == 1 ? "" : "s", (now - was->hold_t0) / 1000.0);
+        else if (was->hold_t0) {
+            int kept = n->s.peak == was->s.peak && n->s.black == was->s.black && n->s.maxfall == was->s.maxfall
+                       && !memcmp(n->s.prim, was->s.prim, sizeof n->s.prim);
+            vals_text(v, sizeof v, &n->s);
+            fprintf(stderr, "[HDR] screen %ls: a full read again after %u partial read%s in %.1f s (%u retr%s):"
+                            " %s (%s)\n", n->s.name, was->hold_n, was->hold_n == 1 ? "" : "s",
+                    (now - was->hold_t0) / 1000.0, was->hold_n - 1, was->hold_n - 1 == 1 ? "y" : "ies",
+                    kept ? "the values kept are the screen's own" : "its values differ from those kept and are used",
+                    v);
+        }
+        return 0;
+    }
+    t0 = was->hold_t0 ? was->hold_t0 : now;
+    if (now - t0 >= s_hold_ms) {
+        vals_text(v, sizeof v, &n->s);
+        fprintf(stderr, "[HDR] screen %ls: still a partial read (%s) after %u read%s in %.1f s: what is read is"
+                        " accepted (%s)\n", nm, why, was->hold_n + 1, was->hold_n ? "s" : "",
+                (now - t0) / 1000.0, v);
+        return 0;
+    }
+    k = *was;                           /* the good read: its values, and what it read (judges the next) */
+    k.mon = n->mon;                     /* the screen as it is now: its handle, name, HDR mode, state */
+    if (n->s.name[0])                   /* (a "not found" read has none: the good read's is kept) */
+        memcpy(k.s.name, n->s.name, sizeof k.s.name);
+    if (n->s.hdr >= 0)                  /* a colour space read: a real switch goes at once */
+        k.s.hdr = n->s.hdr;             /* (none read, -1, or not found, -2, isn't a mode: the last known one is kept) */
+    if (n->dxgi_ok) {
+        k.d_cs = n->d_cs;
+        k.s.bits = n->s.bits;
+    }
+    if (n->tgt_ok) {
+        k.tgt_ok = 1;
+        k.src_adapter = n->src_adapter;
+        k.src_id = n->src_id;
+        k.tgt_adapter = n->tgt_adapter;
+        k.tgt_id = n->tgt_id;
+        memcpy(k.sig, n->sig, sizeof k.sig);
+    }
+    k.hold_t0 = t0;
+    k.hold_n = was->hold_n + 1;
+    if (k.hold_n == 1) {
+        vals_text(v, sizeof v, &was->s);
+        fprintf(stderr, "[HDR] screen %ls \"%ls\": a partial read (%s; read because %s): the last full read's"
+                        " values are kept (%s); HDR mode %s, %s; the screen is read again every %.2f s, for up to"
+                        " %.0f s\n", nm, k.friendly[0] ? k.friendly : L"?", why, cause, v,
+                mode_text(k.s.hdr), n->s.hdr >= 0 ? "as read now" : "kept (no colour space read)",
+                s_tick_ms / 1000.0, s_hold_ms / 1000.0);
+    } else if (k.hold_n == 2)
+        fprintf(stderr, "[HDR] screen %ls: retry 1 is a partial read too (%s); the values stay kept, and further"
+                        " retries are counted\n", nm, why);
+    *n = k;
+    return 1;
 }
 
 /* ---- the swap chain and the watcher ------------------------------------------- */
@@ -484,8 +782,9 @@ static DWORD WINAPI watch(LPVOID arg)
         HWND w;
         HMONITOR m;
         UINT32 sig[4];
-        int again;
-        WaitForSingleObject(s_wake, 2000);
+        const char *again;              /* why the screen is read again (NULL: it isn't) */
+        int forced;
+        WaitForSingleObject(s_wake, (DWORD)s_tick_ms);
         if (InterlockedExchange(&s_reset, 0)) {
             EnterCriticalSection(&s_cs);
             cur = s_pub;
@@ -493,13 +792,19 @@ static DWORD WINAPI watch(LPVOID arg)
         }
         if (!(w = s_whwnd))
             continue;
+        forced = test_fail_due();       /* lane hdr-reprobe's test aid, at its time */
         m = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
-        again = m != cur.mon || !target_sig(&cur, sig, NULL) || memcmp(sig, cur.sig, sizeof sig);
+        again = m != cur.mon ? "the window's monitor handle changed"
+              : !target_sig(&cur, sig, NULL) ? "DisplayConfig's colour state couldn't be read"
+              : memcmp(sig, cur.sig, sizeof sig) ? "DisplayConfig's colour state changed"
+              : cur.hold_t0 ? "a partial read is held off"
+              : forced ? s_f_var : NULL;    /* a test aid (BW_HDR_TEST_EDID_FAIL or _NOT_FOUND) */
         if (again) {
             BwHdrProbe n;
             probe(m, &n);
+            hold(&n, &cur, again);      /* a worse read of the same screen keeps cur's values */
             if (n.s.hdr != cur.s.hdr || n.mon != cur.mon || n.s.peak != cur.s.peak || n.s.black != cur.s.black
-                    || wcscmp(n.s.name, cur.s.name)) {
+                    || wcscmp(n.s.name, cur.s.name) || n.hold_t0 != cur.hold_t0 || n.hold_n != cur.hold_n) {
                 EnterCriticalSection(&s_cs);
                 s_pub = n;
                 LeaveCriticalSection(&s_cs);
@@ -584,11 +889,22 @@ static int env_off(void)
     return v;
 }
 
+/* The device thread's own looks (the first, and each swap chain made again)
+ * keep to hold()'s rule against the view they replace; the watcher, started
+ * or re-aimed from that view, carries on any hold. */
+static void probe_view(HMONITOR mon, const char *cause)
+{
+    BwHdrProbe n;
+    probe(mon, &n);
+    hold(&n, &s_pr, cause);
+    s_pr = n;
+}
+
 DXGI_FORMAT bw_hdr_swap_format(HWND hwnd, DXGI_FORMAT sdr)
 {
     s_hwnd = hwnd;
     s_mon = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : NULL;
-    probe(s_mon, &s_pr);
+    probe_view(s_mon, "a swap chain is made");
     return (s_pr.s.hdr == 1 && !env_off()) ? DXGI_FORMAT_R16G16B16A16_FLOAT : sdr;
 }
 
@@ -597,7 +913,7 @@ int bw_hdr_window_hdr(HWND hwnd)
     POINT pt = { 0, 0 };
     HMONITOR m = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
                       : MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
-    probe(m, &s_pr);
+    probe_view(m, "the visual suite asks before its first render targets");
     return env_off() ? 0 : s_pr.s.hdr;
 }
 

@@ -159,7 +159,7 @@
  /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
   * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
   * gpu_present.c; both presenters letterbox to any size.) */
-@@ -250,13 +363,57 @@
+@@ -250,13 +363,122 @@
      }
  }
  
@@ -171,6 +171,10 @@
 +static volatile LONG s_bw_mx = -1, s_bw_my = -1, s_bw_cw, s_bw_ch;
 +static volatile LONG s_bw_moves, s_bw_wheel, s_bw_wheel_rest;
 +static volatile LONG s_bw_lclicks, s_bw_rclicks;
++/* 0.3.3: the pointer's last place on the screen, to tell a move from a
++ * pointer at rest (this window's thread only). */
++static POINT s_bw_last_pt;
++static int s_bw_have_pt;
 +
 +/* Left and right button presses since the last call (each press counted once,
 + * however short). */
@@ -181,7 +185,8 @@
 +}
 +
 +/* The cursor in client pixels and the client size; *moves counts the
-+ * WM_MOUSEMOVEs so far (a caller tells a moved mouse from one at rest).
++ * pointer's real moves over the window so far (a caller tells a moved mouse
++ * from one at rest; WM_MOUSEMOVE below).
 + * 0 when the cursor isn't over the window. */
 +int bw_fb_mouse(int *x, int *y, int *cw, int *ch, int *moves)
 +{
@@ -204,6 +209,66 @@
 + * window's own cursor as always (Original, MENU_MOUSE off). */
 +extern int bw_menu_cursor_wanted(void);
 +
++/* Blood Wake carried patch (0.3.3): the display stays awake while the game is
++ * in front. The Xbox never slept, so a screen that goes dark during pad play
++ * (no keyboard or mouse input for the display-off time) is the port's doing.
++ * While this window's top-level window (the play host's, in a host) is the
++ * foreground window and isn't minimised, this thread holds
++ * ES_CONTINUOUS | ES_DISPLAY_REQUIRED; it lets go when the window goes to the
++ * back, is minimised or closes, and Windows drops it when the process ends
++ * (a reboot of the game). Each change is logged once. No Windows setting is
++ * changed. Test runs (BW_UNATTENDED) leave the display's own timer alone;
++ * BW_DISPLAY_AWAKE=1 holds it there too (tests of this), 0 never holds it. */
++static int s_bw_awake_held;
++
++static int bw_awake_wanted(void)
++{
++    static int on = -1;
++    if (on < 0) {
++        const char *e = getenv("BW_DISPLAY_AWAKE");
++        if (e && *e)
++            on = e[0] != '0';
++        else
++            on = getenv("BW_UNATTENDED") == NULL;
++        fprintf(stderr, "  [POWER] the display stays awake while the game is in front: %s\n",
++                on ? "on" : (e && *e) ? "off (BW_DISPLAY_AWAKE=0)"
++                   : "off in a test run (BW_UNATTENDED; BW_DISPLAY_AWAKE=1 holds it)");
++    }
++    return on;
++}
++
++static void bw_awake_set(int hold, const char *why)
++{
++    static int logged;
++    EXECUTION_STATE prev;
++    if (hold == s_bw_awake_held)
++        return;
++    prev = SetThreadExecutionState(hold ? (ES_CONTINUOUS | ES_DISPLAY_REQUIRED) : ES_CONTINUOUS);
++    s_bw_awake_held = hold;
++    if (logged++ < 64)
++        fprintf(stderr, "  [POWER] %s: %s%s\n", hold ? "display kept awake" : "display may sleep again",
++                why, prev ? "" : " (the call failed)");
++    else if (logged == 65)
++        fprintf(stderr, "  [POWER] further changes not logged\n");
++}
++
++/* Each pass of the window's loop. */
++static void bw_awake_tick(HWND h)
++{
++    HWND top;
++    if (!bw_awake_wanted())
++        return;
++    top = GetAncestor(h, GA_ROOT);
++    if (!top)
++        top = h;
++    if (IsIconic(top))
++        bw_awake_set(0, "the window is minimised");
++    else if (GetForegroundWindow() != top)
++        bw_awake_set(0, "the window is in the back");
++    else
++        bw_awake_set(1, "the game is in front");
++}
++
  static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
  {
      /* First press only (bit 30: the key was already down), and with Alt held
@@ -218,8 +283,11 @@
          return 0;
      }
      if (m == WM_SYSKEYDOWN && w == VK_RETURN)
-@@ -275,9 +432,21 @@
+@@ -273,11 +495,24 @@
+          * would otherwise be skipped. RECOMP_CLOSE_KEEPS_RUNNING=1 only
+          * closes the window, as before. */
          InterlockedExchange(&s_fb_running, 0);
++        bw_awake_set(0, "the game is closing");     /* Blood Wake (0.3.3) */
          if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
              fprintf(stderr, "  [FBWIN] window closed: exiting\n");
 +            /* Blood Wake carried patch (0.2.5 item 74): a pad left rumbling
@@ -240,7 +308,7 @@
              TerminateProcess(GetCurrentProcess(), 0);
          }
          return 0;
-@@ -285,6 +454,8 @@
+@@ -285,6 +520,8 @@
      case WM_KEYDOWN:
      case WM_SYSKEYDOWN:
          xbox_InputKeySet((int)w, 1);
@@ -249,7 +317,7 @@
          /* A Shift, Ctrl or Alt is also its side's key, for bindings to
           * "lshift" and the like; wParam stays the either-side one. */
          {
-@@ -339,6 +510,10 @@
+@@ -339,6 +576,10 @@
              int vk = xbox_InputWin32MouseVk(m, (uint32_t)w, &down);
              if (vk)
                  xbox_InputKeySet(vk, down);
@@ -260,7 +328,7 @@
              if (down)
                  SetCapture(h);
              else if (!(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON | MK_XBUTTON1 | MK_XBUTTON2)))
-@@ -346,14 +521,155 @@
+@@ -346,14 +587,169 @@
          }
          return m == WM_XBUTTONDOWN || m == WM_XBUTTONUP ? TRUE : 0;
  
@@ -269,15 +337,29 @@
 +    case WM_MOUSEMOVE:
 +        {
 +            RECT c;
++            POINT pt;
 +            LONG nx = (LONG)(short)LOWORD(l), ny = (LONG)(short)HIWORD(l);
 +            GetClientRect(h, &c);
 +            InterlockedExchange(&s_bw_cw, c.right - c.left);
 +            InterlockedExchange(&s_bw_ch, c.bottom - c.top);
-+            /* Windows also sends WM_MOUSEMOVE at an unchanged position (a
-+             * window appearing under a resting cursor): only a real move
-+             * counts, so a resting cursor never takes the highlight back. */
-+            if (nx != s_bw_mx || ny != s_bw_my)
++            /* Windows also sends WM_MOUSEMOVE with the pointer at rest: when
++             * the window appears under it, and when the window moves, resizes
++             * or is uncovered under it. Only a real move counts, so a resting
++             * pointer never takes the highlight: the pointer's place on the
++             * screen has to change, and the window's first mouse message is
++             * only where the pointer starts (0.3.3; the 0.3.1 gate's finding
++             * 12: a window opening under a resting pointer counted a move, as
++             * s_bw_mx started at -1, and took the main menu's highlight). */
++            pt.x = nx;
++            pt.y = ny;
++            ClientToScreen(h, &pt);
++            if (s_bw_have_pt && (pt.x != s_bw_last_pt.x || pt.y != s_bw_last_pt.y))
 +                InterlockedIncrement(&s_bw_moves);
++            else if (!s_bw_have_pt && getenv("BW_MENU_MOUSE_TRACE"))
++                fprintf(stderr, "[MENU] mouse trace: the window's first mouse message, at %ld,%ld"
++                        " in the window: where the pointer starts, not a move\n", (long)nx, (long)ny);
++            s_bw_last_pt = pt;
++            s_bw_have_pt = 1;
 +            InterlockedExchange(&s_bw_mx, nx);
 +            InterlockedExchange(&s_bw_my, ny);
 +            {
@@ -416,7 +498,7 @@
  /* The display formats an Xbox front buffer is actually set to. The pitch says
   * how wide a row is in bytes, so pitch/width gives the pixel size; the exact
   * component layout only matters for 16-bit, where 5:6:5 and 1:5:5:5 differ. */
-@@ -435,6 +751,19 @@
+@@ -435,6 +831,19 @@
      return 0;
  }
  
@@ -436,7 +518,7 @@
  /* GDI: the frame letterboxed into the client area, like the D3D11
   * presenter; the borders are cleared when the size changes. */
  static void gdi_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
-@@ -455,6 +784,33 @@
+@@ -455,6 +864,33 @@
      } else {
          h = ch; w = (LONG)((long long)ch * s_fb_width / s_fb_height);
      }
@@ -470,7 +552,7 @@
      SetStretchBltMode(hdc, HALFTONE);
      SetBrushOrgEx(hdc, 0, 0, NULL);     /* HALFTONE wants it after the mode */
      StretchDIBits(hdc, (cw - w) / 2, (ch - h) / 2, w, h,
-@@ -466,9 +822,15 @@
+@@ -466,9 +902,15 @@
   * for vsync, so returns 1 when the loop is already paced), else GDI. */
  static int fb_show(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
  {
@@ -486,7 +568,7 @@
      return 0;
  }
  
-@@ -483,13 +845,21 @@
+@@ -483,13 +925,21 @@
      (void)unused;
  
      {
@@ -510,7 +592,7 @@
      }
      {
          /* RECOMP_WINDOW_SCALE (1-8, default 2, as in the SDL window): the
-@@ -506,11 +876,26 @@
+@@ -506,11 +956,26 @@
          for (;; scale--) {
              r.left = 0; r.top = 0;
              r.right = (LONG)s_fb_width * scale; r.bottom = (LONG)s_fb_height * scale;
@@ -537,7 +619,7 @@
          hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                 work.left + ((work.right - work.left) - (r.right - r.left)) / 2,
-@@ -523,9 +908,10 @@
+@@ -523,9 +988,10 @@
          return 0;
      }
      hdc = GetDC(hwnd);
@@ -549,7 +631,7 @@
              fb_toggle_fullscreen(hwnd);
      }
  
-@@ -547,13 +933,11 @@
+@@ -547,13 +1013,12 @@
          gpu_present_init(hwnd, s_fb_width, s_fb_height);
  
      while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
@@ -561,13 +643,14 @@
 -        }
 -        if (s_present_idx >= 0 && s_rgb) {
 +        fb_pump();
++        bw_awake_tick(hwnd);            /* Blood Wake (0.3.3): the display stays awake in front */
 +        if ((s_bw_external || bw_fb_nocopy()) && bw_fb_copy_needed() == 0) {
 +            /* Blood Wake: the GPU back end presents; nothing to copy here */
 +        } else if (s_present_idx >= 0 && s_rgb) {
              /* A finished frame, published by the flip. Copied into s_rgb so
               * the dump path and GDI see one consistent image even if the
               * next flip lands mid-blit. */
-@@ -604,19 +988,42 @@
+@@ -604,19 +1069,43 @@
              if (now - t0 >= 1000) {
                  LONG f = s_flips;
                  wchar_t tb[128];
@@ -611,6 +694,7 @@
 +            fb_wait(16);                /* Blood Wake (item 75): wakes for input */
      }
  
++    bw_awake_set(0, "the window closed");      /* Blood Wake (0.3.3) */
      gpu_present_shutdown();
 +    s_bw_hwnd = NULL;
      ReleaseDC(hwnd, hdc);

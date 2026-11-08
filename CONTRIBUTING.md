@@ -26,7 +26,8 @@ Ports to other systems are welcome. They're the fork's own work, and this projec
   - `play.cmd`.
 - **Portable as it stands:** the game's own code (the generated C, made on your PC), our hooks and edition fixes (`src/*.c`, registered in `src/bw_fixes.def`), and the sound chip's DSP interpreter (`src/xemu_dsp/`, Clang-clean since 0.3.2).
 - **Check your generation:** `fingerprints/generated.json` records the public generation's file hashes, with the toolkit commit, Python and capstone versions pinned. If yours match, you're building the same game code we test.
-- **Keep the guard on.** `tools/git-hooks/pre-commit` is executable since 0.3.2, so `core.hooksPath` works on macOS and Linux too.
+  - The hashes are of the files as written on Windows, with CRLF line endings. On other systems, convert LF to CRLF before you compare.
+- **Keep the guard on.** `tools/git-hooks/pre-commit` is executable since 0.3.2, so `core.hooksPath` works on macOS and Linux too. Since 0.3.3 it also keeps build output (`build/`, `build-*/`) out of commits.
 
 ## Takedown
 If you represent the rights holders, see the [README](README.md#contact-and-takedown).

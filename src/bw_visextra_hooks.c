@@ -215,7 +215,7 @@ static void split_summary(void)
  * five stack arguments (centre x, y, z, half size, LOD factor), ret 0x14; it
  * calls itself for the four children with the same factor. */
 extern void sub_00038720_gen(void);
-void sub_00038720(void)
+static void ocean_cull(void)
 {
     uint32_t ocean, ra;
     float f;
@@ -252,6 +252,23 @@ void sub_00038720(void)
             split_report("5 s");
         }
     }
+}
+
+/* HIFPS_EYE (bw_hifps_hooks.c): Ocean_Render copies the eye to the ocean's
+ * +0x30 just before this walk; the walk picks the tiles by it, and the pass
+ * constants (c[146] in Ocean_SetPass1Constants and _SetPass2Constants) are made
+ * from it after. So the outermost walk runs with the step's eye, as before,
+ * and the drawn eye is back for the constants. */
+int bw_hifps_eye_ocean(uint32_t ocean, int to_step);
+void sub_00038720(void)
+{
+    uint32_t ocean = g_ecx;
+    if (V_MEM32(g_esp) == RA_OCEAN_CULL && bw_hifps_eye_ocean(ocean, 1)) {
+        ocean_cull();
+        bw_hifps_eye_ocean(ocean, 0);
+        return;
+    }
+    ocean_cull();
 }
 
 /* AnimLib_CheckSplitScreen 0x00026040 (seen): thiscall on the library, no

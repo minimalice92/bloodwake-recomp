@@ -263,6 +263,21 @@ static float    s_cam_wrote[MAX_VIEWS][16];
 static uint8_t  s_scam_saved[MAX_VIEWS][64];   /* simulation view 0x1CE4A8 + 0x40*n */
 static unsigned s_scam_written;
 static unsigned s_cam_written;
+/* HIFPS_EYE (lane gfx-rtwater S0, docs/gfx/lanes/rtwater.md R4): the eye the
+ * view was built from, written into each blended view's simulation record
+ * (CAM_EYE) for the drawn frame and put back after it. The frame's own code
+ * reads that eye: Render_SetFrameConstants 0x33EB0 uploads it as c[146] and
+ * copies it to 0x1C26C0, which Mesh_SetupAndDrawLOD 0x36960 takes into each
+ * mesh's space as c[156]; Ocean_Render 0x38EC0 copies it for the sea's own
+ * c[146] (bw_hifps_eye_ocean below); Sky_Render 0x347A0 centres the dome and
+ * the sun on its x and y (seen in the generated C). Before, it stayed the
+ * step's: up to about a metre off the drawn camera (tools/hifps_camsweep.py,
+ * BW_GPU_TEST_EYE=2). */
+static int      s_eye = 1;                       /* HIFPS_EYE and BW_HIFPS_EYE */
+static uint8_t  s_eye_step[MAX_VIEWS][12];       /* the step's eye, put back */
+static float    s_eye_drawn[MAX_VIEWS][3];       /* the eye this frame's view was built from */
+static unsigned s_eye_written;
+static unsigned long s_st_eye, s_st_eyeover, s_st_eyeocean;
 static unsigned long s_st_cam, s_st_camover;
 static unsigned s_nviews, s_nviews_prev, s_rcam_n;
 static unsigned long s_st_frames, s_st_steps, s_st_lerped, s_st_snapped, s_st_zero;
@@ -430,6 +445,9 @@ unsigned bw_hifps_boot(int gameplay)
                     s_pred_guard_rise, hz);
     }
     s_lightning = env_u("BW_HIFPS_LIGHTNING", 1) != 0;
+    s_eye = bw_fix_enabled(BW_FIX_HIFPS_EYE) && env_u("BW_HIFPS_EYE", 1) != 0;
+    if (!s_eye)
+        fprintf(stderr, "[BW] hifps: drawn frames keep the step's camera position (HIFPS_EYE off)\n");
     s_randsplit = env_u("BW_HIFPS_RAND", 1) != 0;
     s_log = env_u("BW_HIFPS_LOG", 0) == 1;
     s_oceanrate = env_u("BW_HIFPS_OCEANRATE", 1) != 0;
@@ -2230,6 +2248,15 @@ static void apply_interp(float t)
             memcpy(s_cam_wrote[n], m, sizeof m);
             s_cam_written |= 1u << n;
             s_st_cam++;
+            if (s_eye && n < MAX_VIEWS) {
+                /* HIFPS_EYE: the eye this view was built from, for the frame */
+                uint32_t ev = CAM_VA + n * CAM_STRIDE + CAM_EYE;
+                memcpy(s_eye_step[n], HP(ev), 12);
+                memcpy(s_eye_drawn[n], eye, sizeof s_eye_drawn[n]);
+                memcpy(HP(ev), eye, 12);
+                s_eye_written |= 1u << n;
+                s_st_eye++;
+            }
         }
     }
     if (s_plog)
@@ -2254,9 +2281,66 @@ static void restore_interp(void)
         if ((s_scam_written & (1u << n)) && !memcmp(HP(CAM_VA + 8u + 0x40u * n), s_cam_wrote[n], 64))
             memcpy(HP(CAM_VA + 8u + 0x40u * n), s_scam_saved[n], 64);
     }
+    /* HIFPS_EYE: the step's eye back, unless the frame wrote one itself
+     * (counted with the cameras: BW_HIFPS_LOG "eyes ... overwritten") */
+    for (n = 0; n < MAX_VIEWS; n++)
+        if (s_eye_written & (1u << n)) {
+            uint32_t ev = CAM_VA + n * CAM_STRIDE + CAM_EYE;
+            if (!memcmp(HP(ev), s_eye_drawn[n], 12))
+                memcpy(HP(ev), s_eye_step[n], 12);
+            else
+                s_st_eyeover++;
+        }
+    s_eye_written = 0;
     s_cam_written = 0;
     s_scam_written = 0;
     s_rcam_n = 0;
+}
+
+/* HIFPS_EYE: the parts of a drawn frame that keep state of their own read the
+ * step's eye, as before: the rain (Weather_RenderRain spawns and wraps its
+ * drops around the eye) and the lightning bolt (Sky_BuildLightningBolt, from
+ * Sky_UpdateLightning, aims it by target minus eye), both kept from frame to
+ * frame. to_step 1 puts the step's eye in, 0 the drawn one back. */
+static void eye_swap(int to_step)
+{
+    unsigned n;
+    for (n = 0; n < MAX_VIEWS; n++)
+        if (s_eye_written & (1u << n))
+            memcpy(HP(CAM_VA + n * CAM_STRIDE + CAM_EYE),
+                   to_step ? (const void *)s_eye_step[n] : (const void *)s_eye_drawn[n], 12);
+}
+
+/* HIFPS_EYE, for the ocean: Ocean_Render 0x38EC0 copies the eye to the
+ * ocean's +0x30..+0x38 just before its quadtree walk (Ocean_CullQuadtree
+ * 0x38720), which picks the tiles by it; Ocean_SetPass1Constants 0x38A60 and
+ * Ocean_SetPass2Constants 0x38C60 then upload it (z negated) as the sea's
+ * c[146] (seen in the generated C). The walk's wrapper (bw_visextra_hooks.c)
+ * calls this around its outermost call: to_step 1 before it, when the copy is
+ * a drawn eye (1 is returned), so the tiles stay the step's (the high frame
+ * rate's water reuse and blending work per step's tiles); 0 after it, the
+ * drawn eye back for the constants. */
+static int s_eye_ocean_view = -1;
+int bw_hifps_eye_ocean(uint32_t ocean, int to_step)
+{
+    unsigned n;
+    if (!to_step) {
+        n = (unsigned)s_eye_ocean_view;
+        s_eye_ocean_view = -1;
+        if (n < MAX_VIEWS && (s_eye_written & (1u << n)) && !memcmp(HP(ocean + 0x30u), s_eye_step[n], 12))
+            memcpy(HP(ocean + 0x30u), s_eye_drawn[n], 12);
+        return 0;
+    }
+    if (!s_eye_written || ocean < 0x00010000u)
+        return 0;
+    for (n = 0; n < MAX_VIEWS; n++)
+        if ((s_eye_written & (1u << n)) && !memcmp(HP(ocean + 0x30u), s_eye_drawn[n], 12)) {
+            memcpy(HP(ocean + 0x30u), s_eye_step[n], 12);
+            s_eye_ocean_view = (int)n;
+            s_st_eyeocean++;
+            return 1;
+        }
+    return 0;
 }
 
 /* ---- the drawn frame's own dice ---------------------------------------- */
@@ -2950,7 +3034,9 @@ void sub_0002E530(void)
     uint32_t k_bits, i_bits, sky = g_ecx;
     float dt;
     if (!s_on || !s_rain || HU8(g_esp + 4) != 0) {
+        eye_swap(1);                        /* HIFPS_EYE: the rain keeps the step's eye */
         sub_0002E530_gen();
+        eye_swap(0);
         rain_count(sky);
         return;
     }
@@ -2961,7 +3047,9 @@ void sub_0002E530(void)
         HF32(RAIN_FALL_K) = HF32(RAIN_FALL_K) * dt * 30.0f;
     if (s_steps_since_draw == 0)
         HF32(RAIN_INTENSITY) = 0.0f;
+    eye_swap(1);                            /* HIFPS_EYE: the rain keeps the step's eye */
     sub_0002E530_gen();
+    eye_swap(0);
     HU32(RAIN_FALL_K) = k_bits;
     HU32(RAIN_INTENSITY) = i_bits;
     rain_count(sky);
@@ -5612,6 +5700,10 @@ static void hifps_frame(void)
             s_st_water = s_st_waterbad = s_st_hud = s_st_hudmoved = s_st_hudtouched = 0;
             s_st_hudlerp = s_st_hudsnap = 0;
             s_st_oblerp = s_st_obprev = 0;
+            if (s_st_eye || s_st_eyeover)          /* HIFPS_EYE */
+                fprintf(stderr, "[BW] hifps: eyes blended %lu (overwritten by the frame %lu),"
+                        " ocean tiles picked by the step's eye %lu\n", s_st_eye, s_st_eyeover, s_st_eyeocean);
+            s_st_eye = s_st_eyeover = s_st_eyeocean = 0;
             s_st_alpha = 0.0;
             if (s_st_pg || s_st_pgover)
                 fprintf(stderr, "[BW] hifps: particle growth by the frame time: %lu emitter frames"
@@ -5723,7 +5815,9 @@ void sub_00030250(void)
         g_esp += 4;                         /* the function's own `ret` */
         return;
     }
+    eye_swap(1);                            /* HIFPS_EYE: the bolt keeps the step's eye */
     sub_00030250_gen();
+    eye_swap(0);
 }
 
 /* WaterWorld_EvaluateVertexBatch 0x00098130 (thiscall, this = WaterWorld

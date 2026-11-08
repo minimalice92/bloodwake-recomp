@@ -15,6 +15,7 @@ The same game, with the **original art and sound**, looking, running and soundin
 - **HUD in the corners** in widescreen (or in the middle, where the console had it).
 - **Native resolution**: drawn at your screen's own resolution, up to 4K, or a fixed 720p, 1080p or 1440p for slower graphics cards.
 - **Higher frame rate**: 60, 120, 144 or 240 frames a second, or your display's refresh rate. The game still runs its own 30 steps a second, so it plays at the same speed; the extra frames are drawn in between, which makes it look smoother. Vertical sync optional; variable refresh (G-Sync/FreeSync) works.
+- **Low-latency frames** (on by default): each frame is started just in time, so the picture answers your controls sooner and more evenly, at the cost of some frame rate. Untick it for the most frames a second.
 
 ### Graphics
 - **Anti-aliasing** (2x, 4x, 8x) and **texture filtering** (up to 16x), which keeps the water and distant cliffs sharp.

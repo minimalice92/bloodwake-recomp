@@ -115,6 +115,26 @@ static const BwSetting s_set[] = {
       "off", "remastered",
       { { "off", "Off", "" },
         { "on", "On", "env:BW_HIFPS_VSYNC=1" } } },
+    /* 0.3.3 (lane fix033-launcher; 0.3.1's gate, docs/gfx/rc031.md finding
+     * 13): the latency mode (gfx-lat11, BW_HIFPS_LATMODE in
+     * src/bw_hifps_hooks.c), one checkbox, Remastered and later, on by
+     * default, never in a preset (D-027: the picture's responsiveness comes
+     * before the frame count, so no preset trades it away; like vsync, it is
+     * how frames are paced, not the picture). On sets nothing: the game's own
+     * default (mode 2, the head start through the gate) stands, so a file
+     * from 0.3.2 or before, which has no such line, plays exactly as before.
+     * Off is parity mode (BW_HIFPS_LATMODE=0, every wait in the flip, as
+     * before 0.3.1), for the most frames a second: the mode costs about 5-20%
+     * of them in mission 1 (rc031 finding 10), inside D-027's 30%. It acts at
+     * the high frame rate only (a cap above 30); Original never reads it
+     * (rc031 row 7b). */
+    { "Display", "display", "latency_mode", "Low-latency frames",
+      "Each frame is started just in time, so the picture answers your controls sooner "
+      "and more evenly. Turn it off for the most frames a second.",
+      "on", "remastered",
+      { { "on", "On", "" },
+        { "off", "Off", "env:BW_HIFPS_LATMODE=0" } },
+      "check" },
     /* QOS-2 (the maintainer) and QOS-3 (the lead, 0.3.1, lane ui031): High
      * Priority Mode, one checkbox, every edition, on by default, never in a
      * preset (it is the PC's power, not the picture). It groups the

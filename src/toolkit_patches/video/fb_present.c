@@ -371,6 +371,10 @@ static void bw_key_delay_note(void);    /* Blood Wake (item 75), below */
 static volatile LONG s_bw_mx = -1, s_bw_my = -1, s_bw_cw, s_bw_ch;
 static volatile LONG s_bw_moves, s_bw_wheel, s_bw_wheel_rest;
 static volatile LONG s_bw_lclicks, s_bw_rclicks;
+/* 0.3.3: the pointer's last place on the screen, to tell a move from a
+ * pointer at rest (this window's thread only). */
+static POINT s_bw_last_pt;
+static int s_bw_have_pt;
 
 /* Left and right button presses since the last call (each press counted once,
  * however short). */
@@ -381,7 +385,8 @@ void bw_fb_mouse_clicks_take(int *left, int *right)
 }
 
 /* The cursor in client pixels and the client size; *moves counts the
- * WM_MOUSEMOVEs so far (a caller tells a moved mouse from one at rest).
+ * pointer's real moves over the window so far (a caller tells a moved mouse
+ * from one at rest; WM_MOUSEMOVE below).
  * 0 when the cursor isn't over the window. */
 int bw_fb_mouse(int *x, int *y, int *cw, int *ch, int *moves)
 {
@@ -403,6 +408,66 @@ int bw_fb_mouse_wheel_take(void)
 /* src/bw_menu_hooks.c: 1 show the arrow over the window, 0 hide it, -1 the
  * window's own cursor as always (Original, MENU_MOUSE off). */
 extern int bw_menu_cursor_wanted(void);
+
+/* Blood Wake carried patch (0.3.3): the display stays awake while the game is
+ * in front. The Xbox never slept, so a screen that goes dark during pad play
+ * (no keyboard or mouse input for the display-off time) is the port's doing.
+ * While this window's top-level window (the play host's, in a host) is the
+ * foreground window and isn't minimised, this thread holds
+ * ES_CONTINUOUS | ES_DISPLAY_REQUIRED; it lets go when the window goes to the
+ * back, is minimised or closes, and Windows drops it when the process ends
+ * (a reboot of the game). Each change is logged once. No Windows setting is
+ * changed. Test runs (BW_UNATTENDED) leave the display's own timer alone;
+ * BW_DISPLAY_AWAKE=1 holds it there too (tests of this), 0 never holds it. */
+static int s_bw_awake_held;
+
+static int bw_awake_wanted(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("BW_DISPLAY_AWAKE");
+        if (e && *e)
+            on = e[0] != '0';
+        else
+            on = getenv("BW_UNATTENDED") == NULL;
+        fprintf(stderr, "  [POWER] the display stays awake while the game is in front: %s\n",
+                on ? "on" : (e && *e) ? "off (BW_DISPLAY_AWAKE=0)"
+                   : "off in a test run (BW_UNATTENDED; BW_DISPLAY_AWAKE=1 holds it)");
+    }
+    return on;
+}
+
+static void bw_awake_set(int hold, const char *why)
+{
+    static int logged;
+    EXECUTION_STATE prev;
+    if (hold == s_bw_awake_held)
+        return;
+    prev = SetThreadExecutionState(hold ? (ES_CONTINUOUS | ES_DISPLAY_REQUIRED) : ES_CONTINUOUS);
+    s_bw_awake_held = hold;
+    if (logged++ < 64)
+        fprintf(stderr, "  [POWER] %s: %s%s\n", hold ? "display kept awake" : "display may sleep again",
+                why, prev ? "" : " (the call failed)");
+    else if (logged == 65)
+        fprintf(stderr, "  [POWER] further changes not logged\n");
+}
+
+/* Each pass of the window's loop. */
+static void bw_awake_tick(HWND h)
+{
+    HWND top;
+    if (!bw_awake_wanted())
+        return;
+    top = GetAncestor(h, GA_ROOT);
+    if (!top)
+        top = h;
+    if (IsIconic(top))
+        bw_awake_set(0, "the window is minimised");
+    else if (GetForegroundWindow() != top)
+        bw_awake_set(0, "the window is in the back");
+    else
+        bw_awake_set(1, "the game is in front");
+}
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -430,6 +495,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * would otherwise be skipped. RECOMP_CLOSE_KEEPS_RUNNING=1 only
          * closes the window, as before. */
         InterlockedExchange(&s_fb_running, 0);
+        bw_awake_set(0, "the game is closing");     /* Blood Wake (0.3.3) */
         if (!getenv("RECOMP_CLOSE_KEEPS_RUNNING")) {
             fprintf(stderr, "  [FBWIN] window closed: exiting\n");
             /* Blood Wake carried patch (0.2.5 item 74): a pad left rumbling
@@ -526,15 +592,29 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_MOUSEMOVE:
         {
             RECT c;
+            POINT pt;
             LONG nx = (LONG)(short)LOWORD(l), ny = (LONG)(short)HIWORD(l);
             GetClientRect(h, &c);
             InterlockedExchange(&s_bw_cw, c.right - c.left);
             InterlockedExchange(&s_bw_ch, c.bottom - c.top);
-            /* Windows also sends WM_MOUSEMOVE at an unchanged position (a
-             * window appearing under a resting cursor): only a real move
-             * counts, so a resting cursor never takes the highlight back. */
-            if (nx != s_bw_mx || ny != s_bw_my)
+            /* Windows also sends WM_MOUSEMOVE with the pointer at rest: when
+             * the window appears under it, and when the window moves, resizes
+             * or is uncovered under it. Only a real move counts, so a resting
+             * pointer never takes the highlight: the pointer's place on the
+             * screen has to change, and the window's first mouse message is
+             * only where the pointer starts (0.3.3; the 0.3.1 gate's finding
+             * 12: a window opening under a resting pointer counted a move, as
+             * s_bw_mx started at -1, and took the main menu's highlight). */
+            pt.x = nx;
+            pt.y = ny;
+            ClientToScreen(h, &pt);
+            if (s_bw_have_pt && (pt.x != s_bw_last_pt.x || pt.y != s_bw_last_pt.y))
                 InterlockedIncrement(&s_bw_moves);
+            else if (!s_bw_have_pt && getenv("BW_MENU_MOUSE_TRACE"))
+                fprintf(stderr, "[MENU] mouse trace: the window's first mouse message, at %ld,%ld"
+                        " in the window: where the pointer starts, not a move\n", (long)nx, (long)ny);
+            s_bw_last_pt = pt;
+            s_bw_have_pt = 1;
             InterlockedExchange(&s_bw_mx, nx);
             InterlockedExchange(&s_bw_my, ny);
             {
@@ -935,6 +1015,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         int paced = 0;
         fb_pump();
+        bw_awake_tick(hwnd);            /* Blood Wake (0.3.3): the display stays awake in front */
         if ((s_bw_external || bw_fb_nocopy()) && bw_fb_copy_needed() == 0) {
             /* Blood Wake: the GPU back end presents; nothing to copy here */
         } else if (s_present_idx >= 0 && s_rgb) {
@@ -1022,6 +1103,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             fb_wait(16);                /* Blood Wake (item 75): wakes for input */
     }
 
+    bw_awake_set(0, "the window closed");      /* Blood Wake (0.3.3) */
     gpu_present_shutdown();
     s_bw_hwnd = NULL;
     ReleaseDC(hwnd, hdc);

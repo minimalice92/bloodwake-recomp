@@ -5,7 +5,8 @@
 # (tools/preflight.py --fix does this). Runs under Git Bash on Windows.
 #
 # Checks every staged file for:
-#   1. protected paths (game/, reference/, src/recomp/gen/, analysis/, runs/, ghidra/)
+#   1. protected paths (game/, reference/, src/recomp/gen/, analysis/, runs/, ghidra/,
+#      and build output: build/, build-*/)
 #   2. game/asset/disc file types
 #   3. size over 5 MB (nothing we write by hand is that big)
 #   4. content: an XBE header, or the recompiler's generated-code markers
@@ -31,6 +32,9 @@ while IFS= read -r -d '' f; do
         game/.keep|reference/.keep) ;;
         game/*|reference/*|src/recomp/gen/*|analysis/*|runs/*|ghidra/*|*/xbe_flat.bin)
             block "$f" "protected path (game data, references, generated C or analysis output)"; continue ;;
+        build/*|build-*/*)
+            # 0.3.3: build output can hold the generated C's objects and the game's exe (a fork's finding)
+            block "$f" "protected path (build output)"; continue ;;
     esac
 
     case "$lower" in

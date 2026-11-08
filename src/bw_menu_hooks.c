@@ -441,9 +441,9 @@ static int m_boat_up(uint32_t state)
     return 0;
 }
 
-static void m_boat_frame(int inside, double gx, double gy, int moves, int l, int r, int *wheel_steps)
+static void m_boat_frame(int inside, double gx, double gy, int moved, int l, int r, int *wheel_steps)
 {
-    static int last_moves = -1, target = -1;
+    static int target = -1;
     static DWORD next_ok;
     uint32_t bs = M_MEM32(FE_BOATSELECT);
     int row, hovered = -1, pad = 0, side = 0;
@@ -462,7 +462,7 @@ static void m_boat_frame(int inside, double gx, double gy, int moves, int l, int
         if (hovered >= 0 && gx >= 200.0)
             side = gx < 320.0 ? -1 : 1;
     }
-    if (m_trace() && (l || r || (hovered >= 0 && moves != last_moves)))
+    if (m_trace() && (l || r || (hovered >= 0 && moved)))
         fprintf(stderr, "[MENU] mouse trace: boat select, row %d, at %.0f,%.0f (row %d side %d) pad %d clicks %d/%d wheel %d\n",
                 row, gx, gy, hovered, side, pad, l, r, *wheel_steps);
     if (m_trace()) {
@@ -472,9 +472,8 @@ static void m_boat_frame(int inside, double gx, double gy, int moves, int l, int
             fprintf(stderr, "[MENU] mouse trace: boat select class %u boat %u\n", v >> 16, v & 0xFFFFu);
         last_v = v;
     }
-    if (hovered >= 0 && moves != last_moves && hovered != row)
+    if (hovered >= 0 && moved && hovered != row)
         target = hovered;
-    last_moves = moves;
     if ((LONG)(now - next_ok) < 0)
         return;                                 /* the last press is still on the pad */
     if (inside && (r || (l && m_on_back_prompt(4u, gx, gy)))) {
@@ -536,9 +535,9 @@ static uint32_t m_slots_screen(uint32_t state)
     return M_OK(s) && M_OK(M_MEM32(s + 0x38C184u)) ? s : 0;
 }
 
-static void m_slots_frame(uint32_t cg, int inside, double gx, double gy, int moves, int l, int *wheel_steps)
+static void m_slots_frame(uint32_t cg, int inside, double gx, double gy, int moved, int l, int *wheel_steps)
 {
-    static int last_moves = -1, target = -2, click_pending, lr_pending, steps_left;
+    static int target = -2, click_pending, lr_pending, steps_left;
     static DWORD last_step, click_at;
     uint32_t list = M_MEM32(cg + 0x38C184u);
     int row = (int)M_MEM32(cg), idx = (int)M_MEM32(list + 0x8Cu);
@@ -555,16 +554,15 @@ static void m_slots_frame(uint32_t cg, int inside, double gx, double gy, int mov
         if (first + r < count)
             hovered = first + r;
     }
-    if (m_trace() && (l || (hovered > -2 && moves != last_moves)))
+    if (m_trace() && (l || (hovered > -2 && moved)))
         fprintf(stderr, "[MENU] mouse trace: save slots, row %d index %d of %d, at %.0f,%.0f (item %d side %d) clicks %d\n",
                 row, idx, count, gx, gy, hovered, side, l);
     if (M_MEM32(FE_NAV) != 0)
         target = -2;
-    else if (hovered > -2 && moves != last_moves) {
+    else if (hovered > -2 && moved) {
         target = hovered;
         steps_left = 2 * count + 4;
     }
-    last_moves = moves;
 
     if (l && hovered == -1 && side) {
         lr_pending = side;
@@ -618,9 +616,30 @@ static void m_slots_frame(uint32_t cg, int inside, double gx, double gy, int mov
     }
 }
 
+/* Whether the pointer really moved since the front end's last frame (the
+ * carried fb_present.c counts only real moves). A first position is only a
+ * baseline, never a move (0.3.3; the 0.3.1 gate's finding 12): the front
+ * end's first frame, and its first after it stopped for over a second (play,
+ * a load), start from where the pointer rests. Every screen's code reads this
+ * one answer, so a screen shown again can't take a move made before it. */
+static int m_moved(int moves, DWORD now)
+{
+    static int have, last;
+    static DWORD last_at;
+    int fresh = !have || now - last_at > 1000u;
+    int moved = !fresh && moves != last;
+    if (fresh && m_trace())
+        fprintf(stderr, "[MENU] mouse trace: the front end's first frame%s: the pointer starts where it is"
+                " (real moves so far %d), not a move\n", have ? " after a pause" : "", moves);
+    have = 1;
+    last = moves;
+    last_at = now;
+    return moved;
+}
+
 static void m_mouse_frame(void)
 {
-    static int last_moves = -1, target = -1, click_pending, wheel_steps, last_sel = -1;
+    static int target = -1, click_pending, wheel_steps, last_sel = -1;
     static int lr_pending, lr_item = -1, steps_left, held_side;
     static const m_layout_t *last_lay, *last_lay_traced;
     static int last_wheel_traced;
@@ -630,7 +649,7 @@ static void m_mouse_frame(void)
     static DWORD click_at, last_step, last_lr, press_at;
     uint32_t state = M_MEM32(FE_VA);
     m_hover_t h;
-    int x, y, cw, ch, moves, inside, l, r, hovered = -1, hover_screen, sel = -1, side = 0, picker = 0;
+    int x, y, cw, ch, moves, moved, inside, l, r, hovered = -1, hover_screen, sel = -1, side = 0, picker = 0;
     double gx = -1.0, gy = -1.0;
     DWORD now = GetTickCount();
 
@@ -639,6 +658,8 @@ static void m_mouse_frame(void)
     InterlockedExchange(&s_fe_tick, (LONG)now);
     wheel_steps += bw_fb_mouse_wheel_take();
     bw_fb_mouse_clicks_take(&l, &r);
+    inside = bw_fb_mouse(&x, &y, &cw, &ch, &moves);
+    moved = m_moved(moves, now);                /* every front-end frame, movies too */
     if (state < 2u && l) {
         /* The intro movies and the prologue (seen: IntroMovies_HandleInput,
          * PrologueScreen_UpdateActive read accept and start): a click skips,
@@ -654,7 +675,6 @@ static void m_mouse_frame(void)
     }
     if (wheel_steps > 8) wheel_steps = 8;
     if (wheel_steps < -8) wheel_steps = -8;
-    inside = bw_fb_mouse(&x, &y, &cw, &ch, &moves);
     if (inside) {
         double s = (double)cw / 640.0 < (double)ch / 480.0 ? (double)cw / 640.0 : (double)ch / 480.0;
         gx = (x - (cw - 640.0 * s) / 2.0) / s;
@@ -669,7 +689,7 @@ static void m_mouse_frame(void)
             if (l && inside && m_on_back_prompt(state, gx, gy))
                 r = 1;                           /* handled below as back */
             else {
-                m_slots_frame(cg, inside, gx, gy, moves, l, &wheel_steps);
+                m_slots_frame(cg, inside, gx, gy, moved, l, &wheel_steps);
                 l = 0;
             }
             if (r && inside) {
@@ -682,7 +702,7 @@ static void m_mouse_frame(void)
         }
     }
     if (m_boat_up(state)) {
-        m_boat_frame(inside, gx, gy, moves, l, r, &wheel_steps);
+        m_boat_frame(inside, gx, gy, moved, l, r, &wheel_steps);
         target = -1;
         click_pending = lr_pending = 0;
         return;
@@ -716,9 +736,9 @@ static void m_mouse_frame(void)
         if (sel != last_sel)
             fprintf(stderr, "[MENU] mouse trace: screen %u (%s), highlight on item %d\n", (unsigned)state,
                     hover_screen ? h.lay->name : "-", sel);
-        if (l || r || wheel_steps != last_wheel_traced || (hovered >= 0 && moves != last_moves))
-            fprintf(stderr, "[MENU] mouse trace: screen %u at %.0f,%.0f (item %d side %d) clicks %d/%d wheel %d\n",
-                    (unsigned)state, gx, gy, hovered, side, l, r, wheel_steps);
+        if (l || r || wheel_steps != last_wheel_traced || (hovered >= 0 && moved))
+            fprintf(stderr, "[MENU] mouse trace: screen %u at %.0f,%.0f (item %d side %d) clicks %d/%d wheel %d moved %d (%d)\n",
+                    (unsigned)state, gx, gy, hovered, side, l, r, wheel_steps, moved, moves);
     }
     last_sel = sel;
     last_wheel_traced = wheel_steps;
@@ -735,12 +755,11 @@ static void m_mouse_frame(void)
 
     if (M_MEM32(FE_NAV) != 0)
         target = -1;                            /* the pad or keys moved it: theirs */
-    else if (hovered >= 0 && moves != last_moves && hovered != sel
+    else if (hovered >= 0 && moved && hovered != sel
              && !(h.lay == &L_MISSIONS && hovered == 0)) {
         target = hovered;                       /* the mouse moved onto another item */
         steps_left = 2 * (hover_screen ? h.lay->n + 2 : 8) + (h.list ? (int)M_MEM32(h.list + 0x88u) : 0);
     }
-    last_moves = moves;
 
     /* The wheel: over a picker's value area left/right, else up/down. */
     if (wheel_steps && hovered >= 0 && side && (hovered == sel || (h.lay == &L_MISSIONS && hovered == 0))) {

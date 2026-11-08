@@ -14,8 +14,10 @@ The runner uses the second form for its recomp step (cwd = the toolkit).
 Other scripts can `import xbr_patches; xbr_patches.apply()` after putting the
 toolkit on sys.path.
 """
+import builtins
 import hashlib
 import inspect
+import io
 import os
 import runpy
 import sys
@@ -159,6 +161,87 @@ def _tk33_muldiv_apply(original):
     Lifter._lift_muldiv = _lift_muldiv
 
 
+# TK-83 (0.3.3; a finding of the Apple Silicon fork, docs/next/FORK_APPLE_SILICON.md):
+# the runtime header's MMX_PMADDWD adds its two int32 products in int32. Each
+# product fits, but their sum doesn't for one input, all four words 0x8000
+# (2^30 + 2^30 = 2^31): signed overflow, undefined behaviour in C. x86 gives
+# 0x80000000 there, and MSVC's code does too in practice (our A/Bs are exact),
+# but a compiler may assume it never happens. Summed in int64_t and kept as
+# the lane's unsigned 32-bit pattern, every input gives x86's result with
+# nothing undefined. The game's 82 uses are libjpeg's MMX IDCTs and colour
+# conversion (D3DX's JPEG decoder: the front end's background pictures).
+#
+# The pipeline copies the header from the toolkit's template
+# (BatchTranslator.translate_batch_split: read it, compare it with the copy in
+# the generated folder, write it if different). This fix gives that one read
+# the corrected text, so the toolkit's own compare-and-write runs as before
+# (an unchanged header isn't rewritten, so builds stay incremental). It
+# refuses, stopping the pipeline, unless the template's function is exactly
+# the text below.
+
+_PMADDWD_OLD = (
+    "static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {\n"
+    "    RecompMmx r;\n"
+    "    r.d[0] = (int32_t)a.w[0] * b.w[0] + (int32_t)a.w[1] * b.w[1];\n"
+    "    r.d[1] = (int32_t)a.w[2] * b.w[2] + (int32_t)a.w[3] * b.w[3];\n"
+    "    return r;\n"
+    "}\n")
+_PMADDWD_NEW = (
+    "static inline RecompMmx MMX_PMADDWD(RecompMmx a, RecompMmx b) {\n"
+    "    /* summed in int64_t: all four words 0x8000 sum to 2^31, past int32_t\n"
+    "     * (signed overflow); the lane keeps x86's 32-bit pattern (TK-83) */\n"
+    "    RecompMmx r;\n"
+    "    r.ud[0] = (uint32_t)((int64_t)a.w[0] * b.w[0] + (int64_t)a.w[1] * b.w[1]);\n"
+    "    r.ud[1] = (uint32_t)((int64_t)a.w[2] * b.w[2] + (int64_t)a.w[3] * b.w[3]);\n"
+    "    return r;\n"
+    "}\n")
+
+
+def _tk83_header(text):
+    """The template's text with TK-83's MMX_PMADDWD (refuses any other text)."""
+    if text.count(_PMADDWD_OLD) != 1:
+        raise RuntimeError(
+            "xbr_patches TK-83: templates/runtime/recomp_types.h's MMX_PMADDWD is not the code this fix "
+            "was written for. The toolkit changed: re-check this fix against docs/TOOLKIT_ISSUES.md.")
+    return text.replace(_PMADDWD_OLD, _PMADDWD_NEW)
+
+
+def _tk83_target():
+    from tools.recomp.translator import BatchTranslator
+    return BatchTranslator.__dict__["translate_batch_split"]
+
+
+def _tk83_apply(original):
+    from tools.recomp import translator as T
+    from tools.recomp.translator import BatchTranslator
+    template = os.path.normcase(os.path.abspath(os.path.join(
+        os.path.dirname(T.__file__), "..", "..", "templates", "runtime", "recomp_types.h")))
+
+    def _open(file, mode="r", *args, **kwargs):
+        if isinstance(file, str) and "r" in mode and "b" not in mode and "+" not in mode \
+                and os.path.normcase(os.path.abspath(file)) == template:
+            with builtins.open(file, mode, *args, **kwargs) as f:
+                return io.StringIO(_tk83_header(f.read()))
+        return builtins.open(file, mode, *args, **kwargs)
+
+    def translate_batch_split(self, *args, **kwargs):
+        # the module's own `open` for this call only (its name lookup finds
+        # the module's before the builtin); every other file reads as usual
+        had = T.__dict__.get("open")
+        T.open = _open
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            if had is None:
+                del T.open
+            else:
+                T.open = had
+
+    translate_batch_split.__doc__ = original.__doc__
+    translate_batch_split.xbr_fix = "TK-83"
+    BatchTranslator.translate_batch_split = translate_batch_split
+
+
 FIXES = [
     {"id": "TK-2",
      "what": "fcmov after add/sub/shift: declare and compute _cf (toolkit misses fcmov in its carry check)",
@@ -178,6 +261,12 @@ FIXES = [
      "sha256": "1dd6c5ba8621df535e59d1b43c51ac1ccef591af809ff3610b048138e693ddd4",
      "get": _tk33_muldiv_target,
      "apply": _tk33_muldiv_apply},
+    {"id": "TK-83",
+     "what": "MMX_PMADDWD summed in int64_t, no signed overflow (the runtime header the pipeline copies)",
+     "target": "tools.recomp.translator.BatchTranslator.translate_batch_split",
+     "sha256": "9fff44b7960da3d2e0533a7d2101c3045f6fe1b94f782e482c23f0442f8ec0c7",
+     "get": _tk83_target,
+     "apply": _tk83_apply},
 ]
 
 _applied = []

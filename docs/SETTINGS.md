@@ -120,6 +120,17 @@ Applies to: Remastered. Default: **Off**.
 | Off (default) | (no switch) |
 | On | `env:BW_HIFPS_VSYNC=1` |
 
+### Low-latency frames
+
+Each frame is started just in time, so the picture answers your controls sooner and more evenly. Turn it off for the most frames a second.
+
+Applies to: Remastered. Default: **On**.
+
+| Choice | Under the hood |
+|---|---|
+| On (default) | (no switch) |
+| Off | `env:BW_HIFPS_LATMODE=0` |
+
 ### High Priority Mode
 
 Full speed and precise timing, even when the game's window is behind other windows or minimized. Turn it off to save power on a laptop running on battery.

@@ -141,7 +141,10 @@ static BOOL load_xbe(const wchar_t *path, void **out_data, size_t *out_size);
  *
  *   BW_UNATTENDED=1          no message boxes and no Windows error dialogs:
  *                            errors go to stderr, and a crash ends the
- *                            process at once with the exception code
+ *                            process at once with the exception code;
+ *                            the display isn't kept awake in front (the
+ *                            carried fb_present.c, 0.3.3; BW_DISPLAY_AWAKE=1
+ *                            keeps it awake there too, 0 never)
  *   BW_RUN_SECONDS=<n>       end the run after n seconds: dump the evidence,
  *                            print "[BW] run limit", exit with code 124
  *   BW_ICALL_DUMP_EVERY=<n>  rewrite the indirect-call dump every n seconds

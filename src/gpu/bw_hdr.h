@@ -26,7 +26,14 @@
  * A watcher thread follows the window to other screens and Windows HDR being
  * switched (2 s poll of DisplayConfig's advanced-colour state, woken at once
  * by a monitor or size change); the device thread never waits on Windows'
- * display configuration after the swap chain is made. */
+ * display configuration after the swap chain is made. A worse read of the
+ * same screen (its EDID or profile lost, DXGI's description failed or its
+ * peak 0, or the screen missing from DXGI's outputs for a moment) never
+ * replaces a good read's values: they are kept and the screen
+ * read again at each tick, for up to 30 s, then what is read is accepted
+ * (0.3.3, lane hdr-reprobe; bw_hdr.c hold()). A real switch of the HDR mode
+ * and a move to another screen are taken at once; a read with no colour
+ * space at all keeps the last known mode too. */
 #ifndef BW_HDR_H
 #define BW_HDR_H
 
